@@ -2809,10 +2809,15 @@ async function startRun(
  * 时点沿用 Go 侧默认（`scheduler.go`）：签到 9/21、活跃上报 10。
  * 改时点只改这张表，**不需要重新部署 wrangler 配置**。
  */
-const SCHEDULE_UTC8: Record<number, 'daily' | 'growth'> = {
-  9: 'daily', // 签到
-  10: 'growth', // 活跃上报 / 任务扫描
-  21: 'daily', // 签到（第二趟）
+interface ScheduleJob {
+  plan: 'daily' | 'growth'
+  includeRealChat?: boolean
+}
+
+const SCHEDULE_UTC8: Record<number, ScheduleJob> = {
+  1: { plan: 'growth', includeRealChat: true }, // 北京时间凌晨 1 点：完整的 Buddy 每日任务（签到 + 活动 + 全部成长任务 + 真实对话 + 自动领奖）
+  9: { plan: 'daily' }, // 签到
+  21: { plan: 'daily' }, // 签到（第二趟）
 }
 
 /** 取当前 UTC+8 小时。用固定偏移，不依赖 `Intl`/本机时区（Workers 恒 UTC）。 */
@@ -2928,11 +2933,11 @@ async function scheduled(event: ScheduledController, env: Env): Promise<void> {
   }
 
   const hour = hourUtc8(now)
-  const plan = SCHEDULE_UTC8[hour]
+  const job = SCHEDULE_UTC8[hour]
 
   // 非任务时点：**续期已经做过了**，这里再返回。
   // ⚠️ 注意：续期在 return **之前** —— 这正是「非任务时点也保持登录态」的关键。
-  if (plan === undefined) {
+  if (job === undefined) {
     console.log(`[cron] ${event.cron} UTC+8 ${hour} 时点无任务，已做完续期扫描`)
     return
   }
@@ -2941,17 +2946,25 @@ async function scheduled(event: ScheduledController, env: Env): Promise<void> {
   const stub = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
   const accounts = await stub.listAccounts(realm, now)
 
-  console.log(`[cron] ${event.cron} UTC+8 ${hour} 时点 → plan=${plan}，扇出 ${accounts.length} 个账号`)
+  console.log(
+    `[cron] ${event.cron} UTC+8 ${hour} 时点 → plan=${job.plan} includeRealChat=${job.includeRealChat ?? false}，扇出 ${accounts.length} 个账号`,
+  )
 
   for (const account of accounts) {
     if (account.disabled) continue
+    const isBuddy = (account.provider ?? DEFAULT_PROVIDER) === DEFAULT_PROVIDER
+    // 只有 Buddy 账号支持完整的成长与对话任务；其余账号若遇 growth 自动降级为 daily 签到
+    const planToRun = job.plan === 'growth' && !isBuddy ? 'daily' : job.plan
+    const includeRealChat = isBuddy ? (job.includeRealChat ?? false) : false
+
     try {
       await startRun(env, {
         uid: account.uid,
         nickname: account.nickname,
         realm: account.realm,
         accessToken: '',
-        plan,
+        plan: planToRun,
+        includeRealChat,
       })
     } catch (error) {
       // 单个账号失败不影响其他账号；如实记录原因（不静默）
