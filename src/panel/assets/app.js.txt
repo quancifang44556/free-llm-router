@@ -762,20 +762,220 @@ async function loadPackages() {
 
 // ─────────────────────────── 模型 ───────────────────────────
 
+let cachedModels = []
+let activeModelFilter = 'all' // 'all' | 'free'
+
+function getModelProbeCache() {
+  try {
+    return JSON.parse(localStorage.getItem('model_probe_cache') || '{}')
+  } catch {
+    return {}
+  }
+}
+
+function saveModelProbeCache(cache) {
+  try {
+    localStorage.setItem('model_probe_cache', JSON.stringify(cache))
+  } catch {}
+}
+
+async function probeSingleModel(modelId, btnElement) {
+  if (btnElement) {
+    btnElement.disabled = true
+    btnElement.textContent = '测试中…'
+  }
+  const res = await api('/admin/models/probe', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model: modelId }),
+  })
+  if (btnElement) {
+    btnElement.disabled = false
+    btnElement.textContent = '测资费'
+  }
+  const cache = getModelProbeCache()
+  if (res.ok && res.body) {
+    cache[modelId] = res.body
+  } else {
+    cache[modelId] = {
+      model: modelId,
+      ok: false,
+      isFree: false,
+      status: '不可用',
+      error: res.body?.error || res.body?.message || '请求失败',
+    }
+  }
+  saveModelProbeCache(cache)
+  renderModelsTable()
+  return cache[modelId]
+}
+
+async function probeAllFreeModels() {
+  if (!cachedModels || cachedModels.length === 0) {
+    await loadModels()
+  }
+  if (!cachedModels || cachedModels.length === 0) return
+
+  const probeBtn = $('probe-models-free')
+  if (probeBtn) probeBtn.disabled = true
+  const statusEl = $('probe-status-text')
+
+  const cache = getModelProbeCache()
+  let checked = 0
+  let freeCount = 0
+
+  for (let i = 0; i < cachedModels.length; i++) {
+    const m = cachedModels[i]
+    if (statusEl) {
+      statusEl.textContent = '正在检测 (' + (i + 1) + '/' + cachedModels.length + ')：' + m.id + '…'
+    }
+    const res = await api('/admin/models/probe', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: m.id }),
+    })
+    checked++
+    if (res.ok && res.body) {
+      cache[m.id] = res.body
+      if (res.body.isFree) freeCount++
+    } else {
+      cache[m.id] = {
+        model: m.id,
+        ok: false,
+        isFree: false,
+        status: '不可用',
+        error: res.body?.error || '请求失败',
+      }
+    }
+    saveModelProbeCache(cache)
+    renderModelsTable()
+  }
+
+  if (probeBtn) probeBtn.disabled = false
+  if (statusEl) {
+    statusEl.textContent = '检测完毕！共扫描 ' + checked + ' 个模型，已发现 ' + freeCount + ' 个完全免费 (0积分) 模型'
+  }
+}
+
+function renderModelsTable() {
+  const box = $('models')
+  if (!box) return
+  clear(box)
+
+  const cache = getModelProbeCache()
+  let list = cachedModels || []
+  if (activeModelFilter === 'free') {
+    list = list.filter((m) => cache[m.id] && cache[m.id].isFree === true)
+  }
+
+  if (list.length === 0) {
+    const p = document.createElement('p')
+    p.className = 'hint'
+    p.textContent = activeModelFilter === 'free'
+      ? '暂未检测到免费模型，或尚未执行检测（可点击上方「一键检测免费模型 ⚡」开始扫描）'
+      : '暂无模型数据'
+    box.appendChild(p)
+    return
+  }
+
+  const table = document.createElement('table')
+  const thead = document.createElement('tr')
+  ;['模型 ID', '名称', '平台', '资费状态', '操作'].forEach((h) => {
+    const th = document.createElement('th')
+    th.textContent = h
+    thead.appendChild(th)
+  })
+  table.appendChild(thead)
+
+  for (const m of list) {
+    const tr = document.createElement('tr')
+
+    // ID
+    const tdId = document.createElement('td')
+    const code = document.createElement('code')
+    code.textContent = m.id
+    tdId.appendChild(code)
+    tr.appendChild(tdId)
+
+    // 名称
+    const tdName = document.createElement('td')
+    tdName.textContent = m.name || m.id
+    tr.appendChild(tdName)
+
+    // 平台
+    const tdProv = document.createElement('td')
+    const prov = m.id.startsWith('workbuddy/')
+      ? '国际版 (workbuddy)'
+      : (m.id.startsWith('buddy/') ? '国内版 (buddy)' : (m.owned_by || '-'))
+    tdProv.textContent = prov
+    tr.appendChild(tdProv)
+
+    // 资费状态
+    const tdStatus = document.createElement('td')
+    const info = cache[m.id]
+    if (!info) {
+      const tag = document.createElement('span')
+      tag.className = 'tag'
+      tag.textContent = '⚪ 未检测'
+      tdStatus.appendChild(tag)
+    } else if (info.ok && info.isFree) {
+      const tag = document.createElement('span')
+      tag.className = 'tag ok'
+      tag.textContent = '🟢 免费 (0积分)'
+      tdStatus.appendChild(tag)
+    } else if (info.ok && !info.isFree) {
+      const tag = document.createElement('span')
+      tag.className = 'tag warn'
+      tag.textContent = '🟡 消耗 ' + info.credit + ' 积分'
+      tdStatus.appendChild(tag)
+    } else {
+      const tag = document.createElement('span')
+      tag.className = 'tag err'
+      tag.textContent = '🔴 ' + (info.status || '不可用')
+      if (info.error) tag.title = info.error
+      tdStatus.appendChild(tag)
+    }
+    tr.appendChild(tdStatus)
+
+    // 操作
+    const tdAct = document.createElement('td')
+    const testBtn = document.createElement('button')
+    testBtn.className = 'ghost small'
+    testBtn.textContent = '测资费'
+    testBtn.onclick = () => probeSingleModel(m.id, testBtn)
+    tdAct.appendChild(testBtn)
+    tr.appendChild(tdAct)
+
+    table.appendChild(tr)
+  }
+  box.appendChild(wrapTable(table))
+
+  const note = document.createElement('p')
+  note.className = 'hint'
+  const freeTotal = (cachedModels || []).filter((m) => cache[m.id] && cache[m.id].isFree).length
+  note.textContent = '共 ' + cachedModels.length + ' 个模型（当前展示 ' + list.length + ' 个；已检测出 ' + freeTotal + ' 个完全免费模型）'
+  box.appendChild(note)
+}
+
 async function loadModels() {
   const box = $('models')
   clear(box)
-  const p = document.createElement('p'); p.className = 'hint'; p.textContent = '加载中…'
+  const p = document.createElement('p')
+  p.className = 'hint'
+  p.textContent = '正在加载模型目录…'
   box.appendChild(p)
 
   const res = await api('/v1/models')
-  clear(box)
-  if (!res.ok) { const e = document.createElement('p'); e.className = 'hint'; e.textContent = '加载失败'; box.appendChild(e); return }
-  const data = (res.body && res.body.data) || []
-  box.appendChild(wrapTable(buildTable(['id', '名称'], data.map((m) => [m.id, m.name || '']))))
-  const note = document.createElement('p'); note.className = 'hint'
-  note.textContent = '共 ' + data.length + ' 个模型（来自上游 /v3/config）'
-  box.appendChild(note)
+  if (!res.ok) {
+    clear(box)
+    const e = document.createElement('p')
+    e.className = 'hint'
+    e.textContent = '加载失败'
+    box.appendChild(e)
+    return
+  }
+  cachedModels = (res.body && res.body.data) || []
+  renderModelsTable()
 }
 
 // ─────────────────────────── 供应商 ───────────────────────────
@@ -1626,6 +1826,25 @@ $('clear-usage').onclick = async () => {
 }
 $('refresh-packages').onclick = loadPackages
 $('load-models').onclick = loadModels
+$('probe-models-free').onclick = probeAllFreeModels
+$('filter-models-all').onclick = (e) => {
+  $('filter-models-all').classList.add('active')
+  $('filter-models-free').classList.remove('active')
+  activeModelFilter = 'all'
+  renderModelsTable()
+}
+$('filter-models-free').onclick = (e) => {
+  $('filter-models-free').classList.add('active')
+  $('filter-models-all').classList.remove('active')
+  activeModelFilter = 'free'
+  renderModelsTable()
+}
+$('clear-model-cache').onclick = () => {
+  if (confirm('确定清空已检测的模型资费缓存吗？')) {
+    localStorage.removeItem('model_probe_cache')
+    renderModelsTable()
+  }
+}
 $('refresh-providers').onclick = async () => {
   await loadProviders()
   await loadProviderCredits() // 刷新时才真查上游余额

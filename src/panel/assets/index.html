@@ -108,7 +108,16 @@
 
   <!-- ───────── 模型 ───────── -->
   <section class="view" id="view-models" hidden>
-    <h2>模型目录 <button class="ghost" id="load-models">加载</button></h2>
+    <h2>模型目录
+      <button class="ghost" id="load-models">刷新目录</button>
+      <button id="probe-models-free" style="background: #1e5b3a; border-color: #34c77b; color: #fff;">一键检测免费模型 ⚡</button>
+    </h2>
+    <div style="display: flex; gap: 8px; align-items: center; margin: 10px 0 14px; flex-wrap: wrap;">
+      <button class="ghost small active" id="filter-models-all">全部模型</button>
+      <button class="ghost small" id="filter-models-free">仅看免费模型 🟢</button>
+      <button class="ghost small" id="clear-model-cache">清除检测缓存</button>
+      <span id="probe-status-text" class="hint" style="margin-left: 8px;"></span>
+    </div>
     <div id="models" class="out"></div>
   </section>
 

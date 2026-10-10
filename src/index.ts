@@ -2079,6 +2079,65 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
     return json({ ok: true, provider: providerId, changed: ids.length, disabledCount: size })
   }
 
+  // ── 模型资费探针（发送 1-token 极简请求，检查上游返回的 usage.credit 判定是否免费） ──
+  if (path === '/admin/models/probe' && request.method === 'POST') {
+    const body = (await request.json().catch(() => ({}))) as { model?: string }
+    const model = body.model ?? ''
+    if (model === '') return jsonError(400, 'model 必填', 'invalid_request')
+
+    try {
+      const probeReq = new Request('https://internal/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          authorization: `Bearer ${env.API_KEY}`,
+        },
+        body: JSON.stringify({
+          model,
+          messages: [{ role: 'user', content: '1' }],
+          max_tokens: 1,
+          stream: false,
+        }),
+      })
+
+      const gatewayResult = await handleChatCompletions(probeReq, env, 'cn', ctx)
+      const res = gatewayResult.response
+      if (!res.ok) {
+        const errJson = (await res.json().catch(() => ({}))) as { error?: { message?: string } }
+        return json({
+          model,
+          ok: false,
+          isFree: false,
+          credit: -1,
+          error: errJson.error?.message ?? `HTTP ${res.status}`,
+          status: '不可用',
+        })
+      }
+
+      const reply = (await res.json().catch(() => ({}))) as {
+        usage?: { credit?: number }
+      }
+      const credit = typeof reply.usage?.credit === 'number' ? reply.usage.credit : 0
+      const isFree = credit === 0
+      return json({
+        model,
+        ok: true,
+        isFree,
+        credit,
+        status: isFree ? '免费 (0积分)' : `消耗 ${credit} 积分`,
+      })
+    } catch (error) {
+      return json({
+        model,
+        ok: false,
+        isFree: false,
+        credit: -1,
+        error: error instanceof Error ? error.message : String(error),
+        status: '检测失败',
+      })
+    }
+  }
+
   // ── 清除模型级冷却（「解冻」） ──
   // ⚠️ 必须有的运维入口：模型级退避 6h 起步，而有些失败其实是**我方**问题
   // （如模型名带前缀被上游判为「没有这个模型」），修好代码后不该再等 6 小时。
