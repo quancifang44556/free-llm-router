@@ -93,7 +93,7 @@ function openInfo(title, nodes) {
   const body = $('info-body')
   clear(body)
   if (nodes.length === 0) {
-    const p = document.createElement('p'); p.className = 'muted'; p.textContent = '（无）'
+    const p = document.createElement('p'); p.className = 'hint'; p.textContent = '（无）'
     body.appendChild(p)
   } else for (const n of nodes) body.appendChild(n)
   $('info-modal').hidden = false
@@ -262,7 +262,7 @@ async function showCoolingDetail() {
   })
   const nodes = []
   const tip = document.createElement('p')
-  tip.className = 'muted'
+  tip.className = 'hint'
   tip.textContent = '这些账号因连续失败被自动退避，到期后会自动恢复，无需人工干预。'
   nodes.push(tip)
   // ⚠️ 这两张表（冷却中 / 模型限流）列多且含长 uid、长原因，手机上最易横向溢出。
@@ -305,7 +305,7 @@ async function showModelThrottleDetail() {
   }
   const nodes = []
   const tip = document.createElement('p')
-  tip.className = 'muted'
+  tip.className = 'hint'
   tip.textContent = '这些「账号 + 模型」组合被上游限流，只会影响该组合，同一账号的其它模型仍可用。'
   nodes.push(tip)
   if (rows.length > 0) nodes.push(wrapTable(buildTable(['供应商', '账号', '模型', '剩余', '原因'], rows, [])))
@@ -2233,10 +2233,6 @@ $('run-daily-all').onclick = runDailyAll
 $('refresh-status').onclick = () => { loadTaskStatus(false); invalidateCredits() }
 $('refresh-usage').onclick = loadUsage
 $('load-models').onclick = loadModels
-$('refresh-providers').onclick = async () => {
-  await loadProviders()
-  await loadProviderCredits() // 刷新时才真查上游余额
-}
 $('refresh-logs').onclick = loadLogs
 $('clear-logs').onclick = async () => {
   if (!confirm('清空日志？')) return

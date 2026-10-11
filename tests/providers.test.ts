@@ -18,6 +18,7 @@ import {
   EXPIRY_NEVER,
   EXPIRY_UNUSABLE,
   buildVirtualModels,
+  AGGREGATE_ALLOWED_KEYS,
   expiryLabel,
   pickSoonestProvider,
   rankCandidates,
@@ -1500,16 +1501,20 @@ test('⚠️ 到期标签：查不到 / 长期 / 已过期 三者语义不同', 
 })
 
 test('⚠️ 脏目录不得让聚合整体失败（空 id 必须丢弃）', () => {
+  // ⚠️ 夹具必须用**白名单内**的规范名：`buildVirtualModels` 现在只输出
+  // `AGGREGATE_ALLOWED_KEYS` 里的键（用户要求「聚合只保留那两个模型」）。
+  // 用任意名字（如原先的 `good-model`）会让本用例**因白名单而空**，
+  // 于是断言 `length === 1` 失败 —— 那是夹具过时，不是「丢弃脏数据」失效。
   const vms = buildVirtualModels([
     { provider: 'x', models: [
       { id: '', name: '' },
       { id: '   ', name: 'blank' },
-      { id: 'good-model', name: '' },
+      { id: 'deepseek-v4-1-flash', name: '' },
     ] },
   ])
   assert.equal(vms.length, 1, '⚠️ 空/空白 id 必须丢弃，否则会产出无效目录')
   // 展示名为空时回落到 id
-  assert.equal(vms[0].candidates[0].realId, 'good-model')
+  assert.equal(vms[0].candidates[0].realId, 'deepseek-v4-1-flash')
 })
 
 // ─────────────────── Gemini（Cloud Code Assist） ───────────────────
@@ -2114,4 +2119,53 @@ test('Gemini 能力声明：login=false 必须给出可读原因，checkin=false
     assert.ok(model.contextWindow > 0, '⚠️ contextWindow 必须用参考实现记录的值，不得为 0 或编造')
     assert.ok(model.maxOutput > 0)
   }
+})
+
+test('🔴 聚合只暴露白名单里的两个规范名（用户要求：其它用不上）', () => {
+  // 用户原话：「aggregate 只保留 deepseek-v4-1-flash 和 glm-5-3-flash 就行了，
+  // 其它的用不上」。
+  //
+  // ⚠️ 为什么用**白名单**而不是黑名单：各渠道模型池会随上游增删，
+  // 黑名单意味着「上游每加一个新模型，聚合目录就自动多一行」——
+  // 那正是用户不想要的。
+  const cats = [
+    { provider: 'buddy', models: [
+      { id: 'deepseek-v4.1-flash', name: 'DeepSeek-V4.1-Flash' },
+      { id: 'glm-5.3-flash', name: 'GLM-5.3-Flash' },
+      // 这两个都**不在**白名单，必须被过滤掉
+      { id: 'kimi-k2.5', name: 'Kimi-K2.5' },
+      { id: 'gpt-5.3-astro', name: 'GPT-5.3-Astro' },
+    ] },
+  ]
+  const vms = buildVirtualModels(cats)
+  const keys = vms.map((v) => v.key).sort()
+  assert.deepEqual(keys, ['deepseek-v4-1-flash', 'glm-5-3-flash'],
+    `⚠️ 聚合只应暴露白名单里的两个键，实际 ${JSON.stringify(keys)}`)
+  // 白名单本身也要能被测试引用（防止有人改成一个空集合让上面「碰巧通过」）
+  assert.equal(AGGREGATE_ALLOWED_KEYS.size, 2, '白名单应恰好 2 个键')
+  assert.ok(AGGREGATE_ALLOWED_KEYS.has('deepseek-v4-1-flash'), '应含 deepseek-v4-1-flash')
+  assert.ok(AGGREGATE_ALLOWED_KEYS.has('glm-5-3-flash'), '应含 glm-5-3-flash')
+})
+
+test('⚠️ 聚合白名单必须在 buildVirtualModels 里收口（覆盖目录与 chat 两条路径）', () => {
+  // ## 为什么强调「收口点」
+  //
+  // 聚合有**两条独立入口**：
+  //   1. `/v1/models` 的目录（`src/index.ts`）；
+  //   2. 聚合 **chat** 的实际路由（`src/gateway/server.ts` 的 `loadAggregateCatalog`）。
+  //
+  // ⚠️ 只在入口 1 过滤 ⇒ 「目录里看不到、却仍然能调通」，
+  // 等于没关掉。本项目已多次吃过「同一个 bug 只修一半」的教训。
+  //
+  // 两条路径**都**调用 `buildVirtualModels`，故过滤必须放在那里。
+  const agg = readFileSync('src/gateway/aggregate.ts', 'utf8')
+  const fn = agg.slice(agg.indexOf('export function buildVirtualModels'))
+  const body = fn.slice(0, fn.indexOf('\n}'))
+  assert.ok(/AGGREGATE_ALLOWED_KEYS\.has\(key\)/.test(body),
+    '⚠️ 白名单过滤必须在 buildVirtualModels 内（否则两条路径只堵住一条）')
+  // 两个调用点确实都存在
+  const server = readFileSync('src/gateway/server.ts', 'utf8')
+  const idx = readFileSync('src/index.ts', 'utf8')
+  assert.ok(server.includes('buildVirtualModels'), 'chat 路径应走 buildVirtualModels')
+  assert.ok(idx.includes('buildVirtualModels'), '/v1/models 路径应走 buildVirtualModels')
 })

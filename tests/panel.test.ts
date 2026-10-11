@@ -1701,3 +1701,54 @@ test('⚠️ /v1/models 的每个条目都应有 name（aggregate 曾是整列�
   assert.ok(/m\.name \|\| m\.id/.test(js),
     '⚠️ 前端名称缺失时应回落到 id（防御性）')
 })
+
+test('⚠️ 供应商页不得再有「刷新」按钮（用户要求删除）', () => {
+  // 用户原话：「供应商与账号的刷新按钮没啥用，删了」。
+  //
+  // ⚠️ 删按钮时**必须连 JS 绑定一起删** —— `$('refresh-providers')` 在按钮不存在时
+  // 返回 `null`，紧接着 `.onclick = …` 抛 `TypeError`，而它在**顶层脚本流**里
+  // ⇒ 从这里往后的所有绑定全部失效（表现为「面板一半按钮都不好使」）。
+  const html = panelAsset('/panel/')?.body ?? ''
+  const js = stripJsComments(panelAsset('/panel/app.js')?.body ?? '')
+  assert.ok(!html.includes('refresh-providers'), '⚠️ 刷新按钮应已从 HTML 删除')
+  assert.ok(!js.includes("$('refresh-providers')"),
+    '⚠️ JS 里不得再引用它（否则 null.onclick 抛错，后续绑定全失效）')
+  // ⚠️ 但 `loadProviderCredits` 必须留着 —— 首次进视图（`creditsLoaded`）仍在用它
+  assert.ok(/if \(!creditsLoaded\) void loadProviderCredits\(\)/.test(js),
+    '首次进视图仍应自动拉一次积分（不能因删按钮而丢掉）')
+})
+
+test('🔴 二级弹窗不得使用无 CSS 定义的类名（.muted 曾是死类名）', () => {
+  // ## 实测缺陷
+  // 二级弹窗（`openInfo`）用了 3 处 `class="muted"`，而**全站 CSS 里
+  // `.muted` 定义数为 0** ⇒ 那几段说明文字**完全没有样式**（既不是 dim 色、
+  // 也没有字号约束），与主面板的 `.hint` 观感不一致。
+  //
+  // 用户要求「把二级弹窗的 UI 也统一一下」⇒ 统一到 `.hint`。
+  const js = stripJsComments(panelAsset('/panel/app.js')?.body ?? '')
+  const css = stripCssComments(panelAsset('/panel/style.css')?.body ?? '')
+  assert.ok(!/className = 'muted'/.test(js),
+    "⚠️ 不得再用 .muted（它没有 CSS 定义，文字会完全无样式）")
+  assert.ok(/\.hint\s*\{/.test(css), '.hint 必须有定义（二级弹窗统一用它）')
+  // ⚠️ 弹窗观感要与新卡片系统一致（16px 圆角 + 阴影）
+  const box = css.slice(css.indexOf('.modal-box {'))
+  const body = box.slice(0, box.indexOf('}'))
+  assert.ok(/border-radius:\s*16px/.test(body),
+    '⚠️ .modal-box 圆角应与 .panel/.kpi 一致（16px）')
+  assert.ok(/box-shadow/.test(body), '⚠️ .modal-box 应有阴影（与卡片系统一致）')
+})
+
+test('🔴 聚合只暴露白名单两个模型（用户要求）', () => {
+  // 用户原话：「aggregate 只保留 deepseek-v4-1-flash 和 glm-5-3-flash 就行了，
+  // 其它的用不上」。
+  const src = readFileSync('src/gateway/aggregate.ts', 'utf8')
+  assert.ok(/AGGREGATE_ALLOWED_KEYS/.test(src), '应有白名单常量')
+  // ⚠️ 必须是白名单（只放认过的），不是黑名单 ——
+  // 黑名单会让「上游每加一个模型，聚合目录就多一行」。
+  assert.ok(/'deepseek-v4-1-flash'/.test(src) && /'glm-5-3-flash'/.test(src),
+    '白名单应含这两个规范名')
+  // ⚠️ 过滤必须在 buildVirtualModels 内收口（聚合有目录 + chat 两条路径）
+  const fn = src.slice(src.indexOf('export function buildVirtualModels'))
+  assert.ok(/AGGREGATE_ALLOWED_KEYS\.has\(key\)/.test(fn.slice(0, fn.indexOf('\n}'))),
+    '⚠️ 白名单必须在 buildVirtualModels 内收口，否则两条路径只堵住一条')
+})

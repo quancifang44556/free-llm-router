@@ -68,6 +68,37 @@ export interface ProviderCatalog {
 }
 
 /**
+ * 聚合路由**只暴露这几个规范名**（用户要求：其它的用不上）。
+ *
+ * ## 为什么用白名单而不是黑名单
+ *
+ * 各家渠道的模型池会**随时增删**（上游上架/下架一个模型就会多/少一个规范键）。
+ * 黑名单意味着「上游每加一个新模型，聚合目录就自动多一行」——
+ * 那正是用户不想要的（他只想看自己真会用的那两个）。
+ * 白名单则是「只放我认过的」，上游怎么变都不会溢出。
+ *
+ * ⚠️ **必须在 `buildVirtualModels` 里过滤，而不是在 `/v1/models` 处过滤** ——
+ * 聚合有**两条独立入口**：`/v1/models` 的目录（`src/index.ts`）
+ * 与聚合 **chat** 的实际路由（`src/gateway/server.ts` 的 `loadAggregateCatalog`）。
+ * 只过滤一处会让「目录里看不到、却仍然能调通」——
+ * 本项目已经吃过「同一个 bug 只修一半」的教训。
+ * 两条路径**都**经过 `buildVirtualModels`，故这里是唯一的收口点。
+ *
+ * ⚠️ **`aggregate/auto` 也会被连带收窄**（这一点我第一版写错了，实测代码后改正）：
+ * `handleAggregateChat` 里 `auto` 的候选是**遍历 `virtuals` 取并集**得来的
+ * （`src/gateway/server.ts`），而 `virtuals` 就是本函数过滤后的结果
+ * ⇒ `auto` 只会在白名单这两个模型的各渠道之间挑。
+ *
+ * ⚠️ 这是**有意的**，不是副作用：用户要的就是「聚合只留这两个模型」。
+ * 若 `auto` 仍能选到别的模型，那「其它的用不上」就没落到实处 ——
+ * 目录里看不到、却能通过 `auto` 调出去，等于没关。
+ */
+export const AGGREGATE_ALLOWED_KEYS: ReadonlySet<string> = new Set([
+  'deepseek-v4-1-flash',
+  'glm-5-3-flash',
+])
+
+/**
  * 构建虚拟模型表（**纯函数**，便于单测）。
  *
  * 算法（对齐参考实现，顺序不可改）：
@@ -102,6 +133,10 @@ export function buildVirtualModels(catalogs: readonly ProviderCatalog[]): Virtua
 
   const out: VirtualModel[] = []
   for (const [key, candidates] of groups) {
+    // ⚠️ 白名单收口（见 `AGGREGATE_ALLOWED_KEYS` 的说明）——
+    // 放在这里而不是更早：早于分组的话，「某个键的候选」会被拆散，
+    // 反而不好理解。这里整组丢弃，语义最清楚。
+    if (!AGGREGATE_ALLOWED_KEYS.has(key)) continue
     candidates.sort((a, b) => (a.provider === b.provider
       ? a.realId.localeCompare(b.realId)
       : a.provider.localeCompare(b.provider)))
