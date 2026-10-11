@@ -677,8 +677,16 @@ test('⚠️ 计数块的「单列」断点必须 ≤360px（420px 会覆盖几�
   //（844 高的屏上已过半；667 高的机型直接落到首屏之外）。
   // 逐宽度实测每行几个：375→1、390→1、412→1，仅 430 及以上为 2 列。
   const css = panelAsset('/panel/style.css')?.body ?? ''
-  const m = /@media\s*\(max-width:\s*(\d+)px\)\s*\{[^@]*?\.count\s*\{[^}]*flex:\s*1\s+1\s+100%/.exec(css)
-  assert.notEqual(m, null, '应存在把计数块收成一列的断点')
+  // ⚠️ 判据写成「断点里把 .counts 收成**一列**」，**不绑死实现方式**。
+  // 本项目 `.counts` 从 `flex-wrap` 改成了 `grid`（用户报「6 个卡片在电脑上太窄」），
+  // 旧断言匹配的 `flex: 1 1 100%`（写在 `.count` 上）随之失效 ——
+  // 但**它要守的结论没变**（单列断点必须 ≤360px）。
+  // ⇒ 改为匹配 grid 语境下的单列声明，同时容忍两种写法。
+  // ⚠️ 块内内容用 `[^@]*`（不允许再出现 `@media`）—— 否则 `[\s\S]*?` 会
+  // **跨越到下一个断点**去匹配，把 720px 那个块误报成「单列断点」
+  //（我第一版就是这么错的：720 块里没有 1fr，但匹配一路走到了 360 块）。
+  const m = /@media\s*\(max-width:\s*(\d+)px\)\s*\{[^@]*?\.counts\s*\{[^}]*grid-template-columns:\s*1fr/.exec(css)
+  assert.notEqual(m, null, '应存在把计数块收成一列的断点（grid-template-columns: 1fr）')
   assert.ok(Number(m?.[1]) <= 360, `单列断点应在 ≤360px，实际 ${m?.[1]}px（会误伤 375/390/412 的机型）`)
 })
 
@@ -1507,4 +1515,69 @@ test('⚠️ 嵌套面必须有视觉差异（不得「框里套框」）', () =
   const css = stripCssComments(panelAsset('/panel/style.css')?.body ?? '')
   assert.ok(/\.panel\s*>\s*\.out\s*\{[^}]*border:\s*0/.test(css),
     '⚠️ .panel 内的 .out 必须去掉边框（否则框里套框）')
+})
+
+test('🔴 视图网格的**每一层**子元素都必须能收缩（否则手机上挤出屏幕）', () => {
+  // ## 用户报：「配置与状态页面在手机上挤出屏幕了」
+  //
+  // 根因（我自己上一轮引入的回归）：把 `section.view` 改成 `display: grid`
+  //（为拿统一下间距）之后，它的子元素成了**网格项** ——
+  // 而网格项默认 `min-width: auto`（「不小于内容的最小宽度」）。
+  // 配置页表格按 `max-content` 取宽 ⇒ 这个最小值跟着变大 ⇒ 网格轨道被撑开
+  // ⇒ 整个页面横向溢出。
+  //
+  // ⚠️ 项目**早已**为 `main` 记录过这个陷阱（`main > * { min-width: 0 }`），
+  // 但那只覆盖 main 的**直接**子元素，对**再下一层**无效 —— 这是同一陷阱的第二层。
+  //
+  // ⚠️ 纪律：**每引入一个新的 grid/flex 容器，就要给它的子元素加 `min-width: 0`。**
+  const css = stripCssComments(panelAsset('/panel/style.css')?.body ?? '')
+  assert.ok(/main\s*>\s*\*\s*\{[^}]*min-width:\s*0/.test(css),
+    'main 的直接子元素要能收缩（既有规则，不得回退）')
+  assert.ok(/section\.view\s*>\s*\*\s*\{[^}]*min-width:\s*0/.test(css),
+    '⚠️ section.view 是 grid，其子元素也必须 min-width: 0（否则长表格撑破页面）')
+})
+
+test('⚠️ 计数卡在桌面上必须铺满（不得只占一角）', () => {
+  // 用户报：「配置与账号下面 6 个卡片在电脑上太窄了」。
+  // 原先是 `flex-wrap` + `.count { min-width: 92px }`：6 张只占 602px，
+  // 而桌面容器 1200px ⇒ 右侧空出近 600px，又窄又挤在一角。
+  //
+  // ⚠️ 不能简单给 flex 加 `flex-grow: 1` —— 项目记录过那个坑：奇数个时
+  // 最后一张会被拉成整行宽，看着像「被选中的高亮项」。
+  // ⇒ 用 grid + `auto-fit`：所有轨道等宽、自动铺满，且空轨道会被折叠。
+  const css = stripCssComments(panelAsset('/panel/style.css')?.body ?? '')
+  const i = css.indexOf('.counts {')
+  assert.ok(i > 0, '应有 .counts 规则')
+  const body = css.slice(i, css.indexOf('}', i))
+  assert.ok(/display:\s*grid/.test(body), '⚠️ .counts 应用 grid（否则卡片铺不满、只占一角）')
+  assert.ok(/auto-fit/.test(body), '⚠️ 应用 auto-fit（轨道等宽且自动铺满）')
+  // ⚠️ 网格项也要能收缩
+  assert.ok(/minmax\(\s*0|minmax\(\s*\d+px/.test(body), '列定义应能收缩')
+})
+
+test('⚠️ 表格单元格必须能断行（长 token 会撑破窄屏）', () => {
+  // 配置页的值含 `AES-GCM（密钥来自 CREDENTIAL_KEY secret）` 这类长 token；
+  // 单元格默认不折行 ⇒ 「值」列按最长内容取宽 ⇒ 表格变宽 ⇒ 撑破页面。
+  const css = stripCssComments(panelAsset('/panel/style.css')?.body ?? '')
+  const m = /th,\s*td\s*\{([^}]*)\}/g
+  let hasWrap = false
+  let b
+  while ((b = m.exec(css)) !== null) {
+    if (/overflow-wrap:\s*anywhere/.test(b[1] ?? '')) hasWrap = true
+  }
+  assert.ok(hasWrap, '⚠️ th/td 必须有 overflow-wrap: anywhere')
+  // ⚠️ 且不得用 break-all（项目单测禁止：会截断正常英文单词）
+  assert.ok(!/word-break:\s*break-all/.test(css), '不得使用 break-all')
+})
+
+test('⚠️ uid / provider id 这类长串必须能断行', () => {
+  // 它们形如 `raccoon:raccoon-9696afc62b16c498`，窄屏会撑破卡片。
+  const css = stripCssComments(panelAsset('/panel/style.css')?.body ?? '')
+  for (const sel of ['.card .uid', '.prov-card .prov-id', '.rank-name']) {
+    const i = css.indexOf(sel)
+    assert.ok(i > 0, `应有 ${sel} 规则`)
+    const body = css.slice(i, css.indexOf('}', i))
+    assert.ok(/overflow-wrap:\s*anywhere/.test(body),
+      `⚠️ ${sel} 必须能断行（长串会撑破容器）`)
+  }
 })

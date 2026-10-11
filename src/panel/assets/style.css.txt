@@ -89,6 +89,22 @@ main { padding: 20px; max-width: 1240px; margin: 0 auto; display: grid; gap: 16p
  *（容器不再有 padding，间距得自己给）。
  */
 section.view { min-width: 0; display: grid; gap: 14px; align-content: start; }
+/*
+ * ⚠️⚠️ **`section.view` 的子元素也必须能收缩**（用户报「配置与状态页面在手机上
+ * 挤出屏幕了」）。
+ *
+ * 根因：上一轮我把 `section.view` 改成 `display: grid`（为拿统一下间距），
+ * 于是它的子元素成了**网格项** —— 而网格项默认 `min-width: auto`
+ *（「不小于内容的最小宽度」）。配置页的表格按 `max-content` 取宽后，
+ * 这个最小值跟着变大 ⇒ 网格轨道被撑开 ⇒ **整个页面横向溢出**。
+ *
+ * ⚠️ `main > * { min-width: 0 }` 只覆盖了 main 的**直接**子元素（即 section.view），
+ * 对**再下一层**无效。这是同一个陷阱的第二层，必须逐层清。
+ *
+ * ⚠️ 纪律：**每当引入一个新的 grid/flex 容器，就要给它的子元素加 `min-width: 0`。**
+ * 项目此前已经为 `main` 和 `.count` 各踩过一次，这是第三次。
+ */
+section.view > * { min-width: 0; }
 
 .auth { display: flex; gap: 8px; align-items: center; }
 input, select, textarea, button {
@@ -171,8 +187,27 @@ button:disabled { opacity: .5; cursor: not-allowed; }
 }
 .banner button { background: transparent; border-color: #7a3a3a; color: #ffd9d9; }
 
-/* ⚠️ 下边距归零：它是视图/面板的直接子元素，间距由容器的 gap 给。 */
-.counts { display: flex; flex-wrap: wrap; gap: 10px; }
+/*
+ * 计数卡片组（账号总数 / 可用 / 冷却中 / 模型限流 / 已禁用 / 供应商）。
+ *
+ * ## 🔴 为什么用 grid 而不是 flex（用户报「6 个卡片在电脑上太窄了」）
+ *
+ * 原先是 `flex-wrap` + `.count { min-width: 92px }`：6 张卡只占 **602px**，
+ * 而桌面容器有 1200px ⇒ **右侧空出近 600px**，卡片又窄又挤在一角。
+ *
+ * ⚠️ 也不能简单地给 flex 加 `flex-grow: 1` —— 项目此前记录过那个坑：
+ * 卡片个数为奇数时（曾经是 5 个），`grow` 会让**最后一张被拉伸成整行宽**，
+ * 看起来像被选中的高亮项。
+ *
+ * ⇒ 改用 `grid` + `auto-fit`：**所有轨道等宽**，卡片自动铺满整行，
+ *   且因为 `auto-fit` 会折叠空轨道，**不存在「最后一张被拉宽」**的问题
+ *  （奇数个时最后一行只是左侧对齐、宽度与上面一致）。
+ *   这与 `.kpi-grid` 是同一套做法，观感统一。
+ */
+.counts {
+  display: grid; gap: 10px;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+}
 .count {
   background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
   padding: 9px 13px; min-width: 92px;
@@ -206,7 +241,11 @@ button:disabled { opacity: .5; cursor: not-allowed; }
      不是一套。 */
   box-shadow: 0 1px 2px rgba(0,0,0,.03);
 }
-.card .uid { font-family: ui-monospace, monospace; font-size: 12px; color: var(--dim); }
+/* ⚠️ uid 是长串（如 `raccoon:raccoon-9696afc62b16c498`），窄屏会撑破卡片 */
+.card .uid {
+  font-family: ui-monospace, monospace; font-size: 12px; color: var(--dim);
+  overflow-wrap: anywhere;
+}
 .card .grow { flex: 1 1 220px; }
 .tag { font-size: 11px; padding: 2px 7px; border-radius: 999px; border: 1px solid var(--line); }
 .tag.ok { color: var(--ok); border-color: #1e5b3a; }
@@ -233,12 +272,28 @@ html[data-theme='light'] .err-msg { background: #fdecec; border-color: #f0a0a0; 
 
 table { border-collapse: collapse; width: 100%; font-size: 12px; }
 th, td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--line); }
+/*
+ * ⚠️ 表格单元格必须能断行。
+ *
+ * 配置页的值里有 `AES-GCM（密钥来自 CREDENTIAL_KEY secret）`、
+ * `每小时 1 次（0 * * * *）` 这类**含长 token 的句子**。单元格默认不折行，
+ * 于是「值」这一列按最长内容取宽 ⇒ 表格变宽 ⇒ 配合网格项的
+ * `min-width: auto` 直接撑破页面（用户报「配置与状态页面在手机上挤出屏幕了」）。
+ *
+ * ⚠️ 用 `overflow-wrap: anywhere`（不是 `word-break: break-all` ——
+ * 后者会把正常英文单词也拦腰截断，项目单测明确禁止）。
+ */
+th, td { overflow-wrap: anywhere; }
 th { color: var(--dim); font-weight: 500; }
 td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 
 .bars { display: flex; flex-direction: column; gap: 3px; }
 .bar-row { display: flex; align-items: center; gap: 8px; font-size: 11px; }
-.bar-label { width: 78px; color: var(--dim); font-family: ui-monospace, monospace; }
+/* ⚠️ 时段标签是 `10-03 20:00` 这类固定宽度文本，断行会破坏对齐 ⇒ 用 nowrap */
+.bar-label {
+  width: 78px; color: var(--dim); font-family: ui-monospace, monospace;
+  white-space: nowrap;
+}
 .bar-track { flex: 1; background: #10131a; border-radius: 3px; height: 14px; position: relative; overflow: hidden; }
 .bar-fill { background: var(--accent); height: 100%; }
 .bar-fill.bad { background: var(--err); }
@@ -495,7 +550,11 @@ html[data-theme='light'] .trend-track { background: #e8ebf0; }
 }
 .prov-card:hover { border-color: var(--accent); }
 .prov-card .prov-name { font-weight: 600; font-size: 13px; }
-.prov-card .prov-id { font-family: ui-monospace, monospace; font-size: 11px; color: var(--dim); margin-bottom: 6px; }
+/* ⚠️ 同上（provider id 也是长串）；顺带补断行 */
+.prov-card .prov-id {
+  font-family: ui-monospace, monospace; font-size: 11px; color: var(--dim);
+  margin-bottom: 6px; overflow-wrap: anywhere;
+}
 .prov-card .caps { display: flex; flex-wrap: wrap; gap: 4px; }
 .cap { font-size: 10px; padding: 1px 6px; border-radius: 999px; border: 1px solid var(--line); color: var(--dim); }
 .cap.on { color: var(--ok); border-color: #1e5b3a; }
@@ -775,13 +834,20 @@ main > * { min-width: 0; }
   header { flex-wrap: wrap; gap: 8px; padding: 8px 12px; }
 
   /* ── 计数卡片：手机上 2 列，比「一列太长、三列太窄」都好读 ── */
-  .counts { gap: 8px; }
+  /*
+   * 计数卡：手机上**两列**。
+   *
+   * ⚠️ 这里曾经写 `flex: 0 1 calc(50% - 4px)` —— 那是 `.counts` 还是
+   * `flex` 容器时代的写法。现已改成 `grid`，**flex 属性在网格项上完全不生效**
+   *（会成为需要一并清理的死代码）。改用 `grid-template-columns` 显式两列。
+   *
+   * ⚠️ 「两列」不是拍脑袋：项目此前**实测**过一列时 5 张卡纵排要占 344px，
+   * 把首个供应商卡片推到 578px（在 667 高的机型上直接落到首屏之外），
+   * 而卡片才是本页主要内容。两列能把这段压回约一半。
+   */
+  .counts { gap: 8px; grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .count {
-    /* ⚠️ `flex-grow: 0`（不是 1）：计数块个数是奇数时（供应商页 5 个），
-     * grow 会让最后一块**被拉伸成整行宽**，看起来像被选中的高亮项。
-     * 固定成半宽后每块尺寸一致，奇数个只是末尾留一个空位。 */
-    flex: 0 1 calc(50% - 4px);
-    min-width: 0;          /* ⚠️ 关键：不清掉 min-width 时 flex 项不会收缩 */
+    min-width: 0;          /* ⚠️ 网格项默认不收缩，不清掉会被长内容撑破 */
     padding: 7px 10px;
   }
   .count b { font-size: 16px; }
@@ -868,7 +934,10 @@ main > * { min-width: 0; }
  * 故把单列规则降到 360 —— 常见手机走 720 断点的两列布局。
  */
 @media (max-width: 360px) {
-  .count { flex: 1 1 100%; }   /* 一列，避免数字被压到换行 */
+  /* 一列，避免数字被压到换行。
+     ⚠️ 用 `grid-template-columns`（容器属性），不是 `flex` ——
+     `.counts` 已是 grid，flex 属性在网格项上无效。 */
+  .counts { grid-template-columns: 1fr; }
   .bar-label { width: 52px; }  /* 此时折成两行可以接受 */
 }
 
