@@ -1162,3 +1162,158 @@ test('⚠️ KPI 卡的浅色规则必须**两套都加**（显式 light + 跟�
   assert.ok(/html:not\(\[data-theme\]\)\s*\.kpi\s*\{/.test(css),
     '⚠️ 跟随系统（auto）的浅色也要覆盖 .kpi')
 })
+
+// ─────────────── 真实执行渲染函数（抓 TDZ 这类**运行时**错误） ───────────────
+//
+// ## 为什么必须有这一组（用户报「用量页直接加载不出来了」）
+//
+// 我上一轮加 KPI 卡时，把 `rangeLabel` **用在了 `const` 声明之前** ——
+// `const` 有 TDZ，于是 `loadUsage()` 一执行就抛
+// `Cannot access 'rangeLabel' before initialization`，**整个用量页空白**。
+//
+// ⚠️⚠️ **这类错误任何「读源码文本」的断言都抓不到**：
+// 语法完全合法（`new Function(src)` 照样通过），只有**真的跑一遍**才会暴露。
+// 项目此前只有静态文本断言，所以这个 bug 一路漏到了线上。
+//
+// ⇒ 这里搭一个**最小 DOM 桩**，把真实的 `loadUsage()` 跑起来。
+// ⚠️ 桩只实现面板实际用到的那几个 API（见下方统计），
+// 故意**不做**通用伪装 —— 用到没实现的方法要立刻报错，而不是静默返回 undefined。
+
+/** 极简 DOM 元素桩。 */
+function makeEl(tag) {
+  const el = {
+    tagName: String(tag).toUpperCase(),
+    children: [],
+    style: {},
+    dataset: {},
+    classList: {
+      _s: new Set(),
+      add(...c) { for (const x of c) this._s.add(x) },
+      remove(...c) { for (const x of c) this._s.delete(x) },
+      toggle(c, on) { if (on === undefined) { this._s.has(c) ? this._s.delete(c) : this._s.add(c) } else if (on) this._s.add(c); else this._s.delete(c) },
+      contains(c) { return this._s.has(c) },
+    },
+    get firstChild() { return this.children[0] ?? null },
+    get textContent() { return this._text ?? '' },
+    set textContent(v) { this._text = String(v); this.children = [] },
+    appendChild(c) { this.children.push(c); return c },
+    removeChild(c) { const i = this.children.indexOf(c); if (i >= 0) this.children.splice(i, 1); return c },
+    insertBefore(c) { this.children.unshift(c); return c },
+    addEventListener() {},
+    removeEventListener() {},
+    setAttribute() {},
+    getBoundingClientRect() { return { top: 0, height: 0, left: 0, width: 0 } },
+    querySelectorAll() { return [] },
+    querySelector() { return null },
+    cloneNode() { return makeEl(tag) },
+    // ⚠️ 桩里恒真：真实浏览器里「已脱离文档」的元素写文字无效，
+    // 但这里没有文档树概念，恒真足够验证**逻辑**不抛错。
+    get isConnected() { return true },
+    hidden: false,
+    title: '',
+  }
+  return el
+}
+
+/**
+ * 在最小 DOM 桩里加载面板 JS，并跑一个渲染函数。
+ *
+ * @param fnSource - 要执行的代码（可访问面板里的函数与变量）
+ */
+function runPanelJs(fnSource) {
+  const src = panelAsset('/panel/app.js')?.body ?? ''
+  const els = new Map()
+  const document = {
+    getElementById: (id) => {
+      if (!els.has(id)) els.set(id, makeEl('div'))
+      return els.get(id)
+    },
+    createElement: (tag) => makeEl(tag),
+    querySelectorAll: () => [],
+    querySelector: () => null,
+    documentElement: makeEl('html'),
+    importNode: (n) => n,
+  }
+  const store = new Map([['wb_api_key', 'k']])
+  const localStorage = {
+    getItem: (k) => (store.has(k) ? store.get(k) : null),
+    setItem: (k, v) => store.set(k, String(v)),
+    removeItem: (k) => store.delete(k),
+  }
+  const window = { open() {}, addEventListener() {}, matchMedia: () => ({ matches: false, addEventListener() {} }) }
+  const fetchStub = async () => ({ ok: true, status: 200, text: async () => '{}', json: async () => ({}) })
+  // ⚠️ 用 `new Function` 包一层：面板 JS 里全是函数声明与 const，
+  // 直接 eval 会把它们塞进当前作用域，和测试变量撞名。
+  // ⚠️⚠️ **必须把定时器换成空实现**。
+  //
+  // 面板 JS 末尾会调 `bootstrap()`，而它注册了 `setInterval(loadWaf, 20000)`
+  // 之类的常驻定时器 —— 在 Node 测试进程里那会让**整个测试永不退出**
+  //（我第一版就踩到了：单测跑 294 秒后被 cancel）。
+  //
+  // ⚠️ 这里要验证的是**同步渲染逻辑**，定时器与它无关，故直接吞掉。
+  // ⚠️ 但**不要**把 `setTimeout` 实现成「立即执行回调」—— 那会让
+  // 轮询类代码递归自激，同样卡死。直接返回一个假 id、什么都不做最稳。
+  const noTimer = () => 0
+  const factory = new Function(
+    'document', 'localStorage', 'window', 'fetch', 'navigator', 'location', 'alert', 'confirm', 'URL', 'AbortController', 'setTimeout', 'clearTimeout', 'setInterval', 'clearInterval',
+    src + '\n;return { ' + fnSource + ' };',
+  )
+  return factory(document, localStorage, window, fetchStub, { userAgent: 'test' }, { href: 'http://x/panel/', search: '' }, () => {}, () => true, URL, AbortController, noTimer, noTimer, noTimer, noTimer)
+}
+
+test('🔴 loadUsage 必须能**真的跑起来**（TDZ 这类运行时错误只有执行才抓得到）', async () => {
+  // 用户报「直接加载不出来了」：`loadUsage` 里 `rangeLabel` 被用在 `const` 声明之前，
+  // TDZ 抛错 ⇒ 整页空白。语法检查完全合法，只有真跑才暴露。
+  const rt = runPanelJs('loadUsage')
+  assert.equal(typeof rt.loadUsage, 'function', 'loadUsage 应可取出')
+  // 用空数据跑：只要不抛异常就算过（这里验证的是**不崩**，不是渲染细节）
+  await assert.doesNotReject(async () => { await rt.loadUsage() },
+    '⚠️ loadUsage 不得抛错（TDZ / 未定义变量这类都会在这里暴露）')
+})
+
+test('🔴 用量页所有渲染函数都必须能真的执行（逐个跑一遍）', async () => {
+  // ⚠️ 只测 loadUsage 不够：它内部会调 renderUsageTrend / renderUsageHours，
+  // 但那两条在「今日 + 无数据」时可能提前 return，覆盖不到主体逻辑。
+  // 故把三个渲染函数各自**单独**喂数据跑一遍。
+  const rt = runPanelJs('renderUsageTrend,renderUsageHours,renderUsageRanges,loadUsage')
+  const bars = [
+    { day: '2026-10-11', count: 42, failed: 0, input: 1322, output: 2001, tokens: 3323 },
+    { day: '2026-10-10', count: 10, failed: 2, input: 100, output: 50, tokens: 150 },
+  ]
+  const hours = [
+    { hour: '08:00', count: 22, failed: 0, input: 5, output: 12 },
+    { hour: '10:00', count: 20, failed: 1, input: 0, output: 0 },
+  ]
+
+  // 多日窗口：应画出柱子
+  await assert.doesNotReject(async () => { rt.renderUsageTrend(bars, 7) }, '多日趋势应可渲染')
+  // 单日窗口：应隐藏面板（不抛错）
+  await assert.doesNotReject(async () => { rt.renderUsageTrend(bars, 1) }, '单日趋势应可渲染（并隐藏面板）')
+  // 空数据
+  await assert.doesNotReject(async () => { rt.renderUsageTrend([], 7) }, '空趋势应可渲染')
+  // 按小时：今日窗口
+  await assert.doesNotReject(async () => { rt.renderUsageHours(hours, 1) }, '按小时应可渲染')
+  // 按小时：非今日（应给提示而不是画图）
+  await assert.doesNotReject(async () => { rt.renderUsageHours(hours, 7) }, '非今日按小时应可渲染')
+  await assert.doesNotReject(async () => { rt.renderUsageRanges() }, '时间窗控件应可渲染')
+})
+
+test('⚠️ 用量页不得有「清空」按钮（用户要求删除）', () => {
+  // 用户原话：「这个清空按钮删了，不需要」。
+  //
+  // ⚠️ 删按钮时**必须连 JS 里的事件绑定一起删** ——
+  // `$('clear-usage')` 在按钮不存在时返回 `null`，紧接着 `.onclick = …`
+  // 会抛 `TypeError`，而它位于顶层脚本流里 ⇒ **从这里往后的所有绑定全部失效**
+  //（表现为「面板一半的按钮都不好使了」）。
+  const html = panelAsset('/panel/')?.body ?? ''
+  const js = stripJsComments(panelAsset('/panel/app.js')?.body ?? '')
+
+  assert.ok(!html.includes('id="clear-usage"'), '⚠️ 清空按钮应已从 HTML 删除')
+  assert.ok(!js.includes("$('clear-usage')"),
+    '⚠️ JS 里不得再引用 clear-usage（否则 null.onclick 抛错，后续绑定全失效）')
+  // 刷新按钮必须仍在（只删清空）
+  assert.ok(html.includes('id="refresh-usage"'), '刷新按钮应保留')
+  // ⚠️ 后端端点**保留**：用户只要求删按钮，没说删能力
+  const idx = readFileSync('src/index.ts', 'utf8')
+  assert.ok(idx.includes("'/admin/usage/clear'"), '后端清空端点应保留（只删了按钮）')
+})

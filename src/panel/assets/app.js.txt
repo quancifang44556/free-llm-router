@@ -1017,6 +1017,15 @@ async function loadUsage() {
   //（用户原话：「这个每小时用量的 21 24 是什么意思」）。
   const box = $('usage-summary')
   clear(box)
+  // ⚠️⚠️ `rangeLabel` **必须在使用之前声明**。
+  //
+  // 我上一轮加 KPI 卡时把它用在了声明之前 —— `const` 有 TDZ，
+  // 于是 `loadUsage` 一执行就抛 `Cannot access 'rangeLabel' before initialization`，
+  // **整个用量页空白**（用户报「直接加载不出来了」）。
+  //
+  // ⚠️ 教训：这类错误**语法检查发现不了**（`new Function()` 也照样通过，
+  // 因为它是**运行时**错误）。改渲染顺序时必须确认所有 `const` 都在使用点之前。
+  const rangeLabel = (USAGE_RANGES.find((r) => r.key === usageRangeKey) || {}).label || '今日'
   const successRate = total === 0 ? 0 : (ok / total) * 100
   box.appendChild(kpiCard('blue', 'Σ', rangeLabel + '总请求', fmtNum(total),
     `${activeDays} 天有记录`))
@@ -1037,7 +1046,6 @@ async function loadUsage() {
 
   // ── 数据边界说明（关键：解释「为什么明细比总数少」）──
   const scope = $('usage-scope')
-  const rangeLabel = (USAGE_RANGES.find((r) => r.key === usageRangeKey) || {}).label || '今日'
   if (total === 0) {
     scope.textContent = `${rangeLabel}：没有请求记录。`
   } else {
@@ -2061,11 +2069,6 @@ $('run-daily-all').onclick = runDailyAll
 // 而真相只是余额没重新拉（缓存），非常容易误判成任务白做。
 $('refresh-status').onclick = () => { loadTaskStatus(false); invalidateCredits() }
 $('refresh-usage').onclick = loadUsage
-$('clear-usage').onclick = async () => {
-  if (!confirm('清空用量记录？')) return
-  await api('/admin/usage/clear', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })
-  loadUsage()
-}
 $('load-models').onclick = loadModels
 $('refresh-providers').onclick = async () => {
   await loadProviders()
