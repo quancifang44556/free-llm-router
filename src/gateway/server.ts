@@ -377,6 +377,36 @@ export async function handleChatCompletions(
       ? ((rawBody as Record<string, unknown>).model as string)
       : ''
 
+  // ── 聚合 provider 分支 ──
+  //
+  // ## 🔴 **必须在这里手写剥前缀**（不能靠 `splitModelName`）
+  //
+  // `aggregate` **不在 `providerIds()`** 里（见 `aggregate.ts` 文件头：
+  // 它是网关层的一层，不是注册表里的 Provider）。而 `splitModelName` 对
+  // **未知前缀**的处理是：回落到默认供应商，并把**整串**当模型名 ——
+  // 实测 `aggregate/deepseek-v4-1-flash` ⇒ `{provider:'buddy',
+  // model:'aggregate/deepseek-v4-1-flash'}`。
+  //
+  // 后果比「报错」严重得多：那个名字上游当然不认识，回 11102
+  // `model [...] service info not found`，被归类为 `model_unavailable`
+  // ⇒ **给这个模型写 6 小时模型级冷却** —— 一个纯粹由我方前缀引起的失败，
+  // 被记成了「上游没有这个模型」。之后所有同名请求都选不到号。
+  //
+  // ⚠️ 判据是**前缀完全匹配**（`=== id` 或 `startsWith(id + '/')`），
+  // 不是「包含 `aggregate/`」—— 否则 `buddy/aggregate/x` 会被误吞。
+  const AGG_PREFIX = `${AGGREGATE_PROVIDER_ID}/`
+  if (rawModel === AGGREGATE_PROVIDER_ID || rawModel.startsWith(AGG_PREFIX)) {
+    return await handleAggregateChat({
+      model: rawModel.slice(AGG_PREFIX.length),
+      // ⚠️ 就地算 `wantsStream`（不用外层那个 `const`）——
+      // 本分支在它**之前**执行（必须早于 `splitModelName`），
+      // 引用未初始化的 `const` 会抛 TDZ 错误。判据与外层**逐字一致**：
+      // OpenAI 规范里 `stream` 缺省是 `false`（非流式）。
+      wantsStream: (rawBody as Record<string, unknown>).stream === true,
+      rawBody, request, env, realm, ctx, sessionKey,
+    })
+  }
+
   // ⚠️ 多供应商路由：`provider/model` 前缀决定去哪家。
   // 无前缀时回落到默认供应商（保持既有用户兼容 —— 他们已经在用裸模型名）。
   const routed = splitModelName(rawModel, providerIds(), DEFAULT_PROVIDER)
@@ -401,19 +431,6 @@ export async function handleChatCompletions(
    * 故判据是**严格等 true**：只有显式 `stream: true` 才走流式。
    */
   const wantsStream = (rawBody as Record<string, unknown>).stream === true
-
-  // ── 聚合 provider 分支 ──
-  //
-  // ⚠️ **放在 `splitModelName` 之后、其余全部逻辑之前**。`providerIds()`
-  // 里**不含** `aggregate`（见 `aggregate.ts` 文件头：它是网关层的一层，
-  // 不是注册表里的 Provider）⇒ 必须在这里显式认出它，否则会被当成未知前缀
-  // 而回落到默认供应商，表现为「`aggregate/...` 悄悄变成了 buddy 的模型」。
-  if (routed.provider === AGGREGATE_PROVIDER_ID) {
-    return await handleAggregateChat({
-      model: routed.model, wantsStream, rawBody, request, env, realm, ctx, sessionKey,
-    })
-  }
-
 
   // ⚠️ **用户关闭的供应商必须拒绝路由**（关闭 = 彻底关掉，不只是从目录里消失）。
   //
@@ -840,7 +857,6 @@ function tryDetectError(data: string): string | undefined {
   }
 }
 
-
 /**
  * 非 WorkBuddy 供应商的对话处理。
  *
@@ -1207,7 +1223,6 @@ async function handleProviderChat(input: {
     ),
   }
 }
-
 
 /**
  * 这次失败看起来是**鉴权类**问题吗（该续期）。

@@ -15,6 +15,7 @@
  */
 
 import { test } from 'node:test'
+import { splitModelName } from '../src/providers/types.js'
 import {
   emptyUsageState,
   recordUsageInto,
@@ -1448,4 +1449,55 @@ test('⚠️ /admin/usage 的 days 参数：非法值回退「全部」而不是
   assert.ok(/parsedDays > 0 \? Math\.floor\(parsedDays\) : 0/.test(block),
     '⚠️ 非法/非正数应回退 0（全部），不能报错让页面空白')
   assert.ok(/usageSummary\(days\)/.test(block), '应把窗口传给 DO')
+})
+
+test('🔴 聚合前缀必须在 `splitModelName` **之前**剥掉（否则会被记成模型级冷却）', () => {
+  // ## 实测缺陷（聚合首次上线时踩到）
+  //
+  // `aggregate` **不在 `providerIds()`** 里（它是网关层的一层，不是注册表里的
+  // Provider）。而 `splitModelName` 对**未知前缀**的处理是：回落到默认供应商，
+  // 并把**整串**当模型名 —— 实测：
+  //   splitModelName('aggregate/deepseek-v4-1-flash', ids, 'buddy')
+  //     ⇒ { provider: 'buddy', model: 'aggregate/deepseek-v4-1-flash' }
+  //
+  // 后果**比报错严重得多**：那个名字上游当然不认识，回 11102
+  // `model [...] service info not found`，被归类为 `model_unavailable`
+  // ⇒ **给这个模型写 6 小时模型级冷却** —— 一个纯粹由我方前缀引起的失败，
+  // 被记成了「上游没有这个模型」。之后所有同名请求都选不到号。
+  //
+  // ⇒ 判据现在是 `rawModel === id || rawModel.startsWith(id + '/')`，
+  //   在 `splitModelName` **之前**处理，且**用 `rawModel` 而不是 `routed`**。
+  const src = readFileSync('src/gateway/server.ts', 'utf8')
+  const code = stripComments(src)
+
+  // ① 必须有手写剥前缀
+  assert.ok(/const AGG_PREFIX = `\$\{AGGREGATE_PROVIDER_ID\}\/`/.test(code),
+    '⚠️ 必须手写剥聚合前缀（splitModelName 不认识它）')
+  // ② 判据必须是**完全前缀匹配**，不能是「包含」
+  assert.ok(/rawModel === AGGREGATE_PROVIDER_ID \|\| rawModel\.startsWith\(AGG_PREFIX\)/.test(code),
+    '⚠️ 必须是完全前缀匹配（否则 buddy/aggregate/x 会被误吞）')
+  // ③ 传进聚合的 model 必须是**剥过前缀**的
+  assert.ok(/model: rawModel\.slice\(AGG_PREFIX\.length\)/.test(code),
+    '⚠️ 必须传剥过前缀的裸键')
+  // ④ ⚠️ 剥前缀的分支必须在 `splitModelName` **之前**执行
+  //    （在之后的话 routed 已经错了）
+  const aggAt = code.indexOf('const AGG_PREFIX')
+  const splitAt = code.indexOf('const routed = splitModelName')
+  assert.ok(aggAt > 0 && splitAt > 0, '两处都应存在')
+  assert.ok(aggAt < splitAt,
+    '⚠️ 聚合分支必须在 splitModelName **之前** —— 否则 routed 已经把整串当模型名了')
+})
+
+test('⚠️ splitModelName 对未知前缀的行为（上一条测试的前提）', () => {
+  // 上一条测试断言「必须自己剥」，其前提是 splitModelName 对未知前缀
+  // 会回落到默认供应商并把整串当模型名。这个前提若变了，那条断言就失去意义。
+  const ids = ['buddy', 'workbuddy', 'cline']
+  const r = splitModelName('aggregate/deepseek-v4-1-flash', ids, 'buddy')
+  assert.equal(r.provider, 'buddy', '未知前缀应回落到默认供应商')
+  assert.equal(r.model, 'aggregate/deepseek-v4-1-flash',
+    '⚠️ 未知前缀时整串都被当成模型名 —— 这正是必须在之前剥的原因')
+  // 已知前缀仍正常
+  const ok = splitModelName('cline/deepseek-v4.1-flash', ids, 'buddy')
+  assert.equal(ok.provider, 'cline')
+  assert.equal(ok.model, 'deepseek-v4.1-flash')
 })
