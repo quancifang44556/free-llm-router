@@ -76,10 +76,20 @@ export interface UsageDim {
   failed: number
 }
 
-/** 某一天里某个小时的计数（只用于「今日」的按小时趋势）。 */
+/**
+ * 某一天里某个小时的聚合（只用于「今日」的按小时视图）。
+ *
+ * ⚠️ 除请求数外**也要记 token** —— 用户看到「22」时无从判断这是请求数
+ * 还是 token（实测反馈：「这个每小时用量的 21 24 是什么意思」）。
+ * 只给一个裸数字，任何单位都靠猜。
+ */
 export interface UsageHour {
   count: number
   failed: number
+  /** 输入 token 合计。⚠️ 旧数据没有这个字段，读取时按 0 处理。 */
+  input: number
+  /** 输出 token 合计。⚠️ 同上。 */
+  output: number
 }
 
 /**
@@ -209,9 +219,14 @@ export function recordUsageInto(state: UsageState, r: UsageRecord, now: number =
   addDim(day.byModel, r.model, r)
   addDim(day.byAccount, r.uid, r)
   const hk = hourKeyUtc8(r.at)
-  const h = day.byHour[hk] ?? { count: 0, failed: 0 }
-  h.count += 1
-  if (!r.ok) h.failed += 1
+  // ⚠️ 缺字段的旧数据按 0 起步（不然 `+=` 会得到 NaN，整列变成 null）
+  const prev = day.byHour[hk]
+  const h: UsageHour = {
+    count: (prev?.count ?? 0) + 1,
+    failed: (prev?.failed ?? 0) + (r.ok ? 0 : 1),
+    input: (prev?.input ?? 0) + r.input,
+    output: (prev?.output ?? 0) + r.output,
+  }
   day.byHour[hk] = h
 
   pruneUsageDays(state, now)
@@ -247,7 +262,7 @@ export interface UsageSummary {
   /** 按账号聚合（降序）。 */
   byAccount: Array<{ uid: string; count: number; input: number; output: number; failed: number }>
   /** 按小时聚合（**仅「今日」窗口有意义**；更长窗口请看 `byDay`）。 */
-  byHour: Array<{ hour: string; count: number; failed: number }>
+  byHour: Array<{ hour: string; count: number; failed: number; input: number; output: number }>
   /** 按天趋势（新在前），用于画柱状图。 */
   byDay: UsageTrendBar[]
   /** 本次窗口的天数（0 = 全部）。 */
@@ -351,8 +366,13 @@ export function summarizeUsageState(
     // 「09:00」），合并起来没有任何解释力。更长窗口请看 `byDay`。
     if (day === todayKey) {
       for (const [k, v] of Object.entries(b.byHour)) {
-        const cur = byHour[k] ?? { count: 0, failed: 0 }
-        cur.count += v.count; cur.failed += v.failed
+        const cur = byHour[k] ?? { count: 0, failed: 0, input: 0, output: 0 }
+        cur.count += v.count
+        cur.failed += v.failed
+        // ⚠️ 旧数据的 byHour 没有 input/output（undefined）⇒ 按 0，
+        // 否则整列变 NaN 而界面显示 `NaN`。
+        cur.input += v.input ?? 0
+        cur.output += v.output ?? 0
         byHour[k] = cur
       }
     }

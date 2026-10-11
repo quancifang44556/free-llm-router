@@ -711,6 +711,42 @@ function usageDays() {
   return hit === undefined ? 1 : hit.days
 }
 
+/**
+ * 一张 KPI 卡片（照参考项目：彩色图标章 + 大数字 + 带单位副标题）。
+ *
+ * @param tone - 色系：blue / purple / green / orange / cyan / pink / red
+ * @param icon - 图标章里的单字符（不引图标库，避免打包体积与主题冲突）
+ * @param label - 小号标签
+ * @param value - **大号主数字**（已格式化）
+ * @param sub - 副标题（**必须带单位**，见调用处的说明）
+ */
+function kpiCard(tone, icon, label, value, sub) {
+  const card = document.createElement('div')
+  card.className = 'kpi ' + tone
+  const chip = document.createElement('div'); chip.className = 'kpi-chip'; chip.textContent = icon
+  const lb = document.createElement('div'); lb.className = 'kpi-label'; lb.textContent = label
+  const vv = document.createElement('div'); vv.className = 'kpi-value'; vv.textContent = value
+  const sb = document.createElement('div'); sb.className = 'kpi-sub'; sb.textContent = sub
+  card.appendChild(chip); card.appendChild(lb); card.appendChild(vv); card.appendChild(sb)
+  return card
+}
+
+/**
+ * 毫秒 → 人话（`1.2s` / `3分12秒`）。
+ *
+ * ⚠️ 旧版直接显示裸毫秒（`11856`），用户必须自己换算 —— 而本轮用户已经
+ * 明确抱怨过「裸数字看不懂」。超过 1 秒就不该再给毫秒。
+ */
+function fmtDuration(ms) {
+  const v = typeof ms === 'number' && Number.isFinite(ms) && ms >= 0 ? ms : 0
+  if (v < 1000) return v + ' ms'
+  const sec = v / 1000
+  if (sec < 60) return sec.toFixed(1).replace(/\.0$/, '') + ' 秒'
+  const m = Math.floor(sec / 60)
+  const s = Math.round(sec % 60)
+  return m + ' 分 ' + s + ' 秒'
+}
+
 /** 千分位（避免 1234567 这种读不出来的数字）。 */
 function fmtNum(n) {
   const v = typeof n === 'number' && Number.isFinite(n) ? n : 0
@@ -778,15 +814,29 @@ function renderUsageRanges() {
 function renderUsageTrend(byDay, windowDays) {
   const box = $('usage-trend')
   const title = $('usage-trend-title')
+  const panel = $('usage-trend-panel')
+  const note = $('usage-trend-note')
   clear(box)
 
   const bars = Array.isArray(byDay) ? byDay : []
-  // ⚠️ 单日窗口下趋势没有意义（只有一根柱）——如实说明，而不是画一根怪柱。
-  if (windowDays === 1 || bars.length <= 1) {
-    title.textContent = windowDays === 1 ? '按天趋势（今日单日，请看下方「按小时」）' : '按天趋势'
-  } else {
-    title.textContent = '按天趋势'
+
+  // ## 🔴 「今日」窗口**直接隐藏整个按天趋势面板**（用户明确要求）
+  //
+  // 今日窗口只有**一根柱** —— 那既不构成「趋势」，观感也差
+  //（单根柱要么被拉成整条白块，要么孤零零杵着）。
+  // 旧版还留着面板 + 一句说明，用户看到的就是「今日 + 一根柱」。
+  //
+  // ⚠️ 用 `hidden` 隐藏**整个面板**（含标题），而不是只清空内容 ——
+  // 留一个空标题比不显示更让人困惑。
+  // ⚠️ 单日窗口下这段时间的信息由下方「按小时」承担（那个才有意义）。
+  if (windowDays === 1) {
+    panel.hidden = true
+    return
   }
+  panel.hidden = false
+  title.textContent = '按天趋势'
+  note.textContent = bars.length > 0 ? `${bars.length} 天有记录` : ''
+
   if (bars.length === 0) {
     const p = document.createElement('p'); p.className = 'hint'
     p.textContent = '该窗口内没有请求记录（用 /v1/chat/completions 发一次对话就会出现）'
@@ -860,11 +910,28 @@ function renderUsageHours(byHour, windowDays) {
     fill.className = 'bar-fill' + (h.failed > 0 ? ' bad' : '')
     fill.style.width = Math.round((h.count / maxCount) * 100) + '%'
     track.appendChild(fill)
+    // ⚠️⚠️ **必须带单位**。旧版只渲染一个裸 `count`（如「22」「21」），
+    // 用户原话：「这个每小时用量的 21 24 是什么意思」—— 完全看不出是
+    // 请求数还是 token 数。现在明确写「22 次请求」+ 该小时的 token 量。
     const val = document.createElement('span'); val.className = 'bar-val'
-    val.textContent = fmtNum(h.count) + (h.failed ? ' / ' + fmtNum(h.failed) : '')
-    row.appendChild(label); row.appendChild(track); row.appendChild(val)
+    val.textContent = fmtNum(h.count) + ' 次请求'
+      + (h.failed ? `（失败 ${fmtNum(h.failed)}）` : '')
+    val.title = `${h.hour}：${fmtNum(h.count)} 次请求`
+      + (h.failed ? `，失败 ${fmtNum(h.failed)} 次` : '')
+      + `\n输入 ${fmtNum(h.input ?? 0)} tokens · 输出 ${fmtNum(h.output ?? 0)} tokens`
+    // 该小时的 token 量单独一列（原来完全没有，用户不知道每小时花了多少）
+    const tok = document.createElement('span'); tok.className = 'bar-tokens'
+    const tot = (h.input ?? 0) + (h.output ?? 0)
+    tok.textContent = tot > 0 ? fmtTokensShort(tot) + ' tok' : '—'
+    row.appendChild(label); row.appendChild(track); row.appendChild(val); row.appendChild(tok)
     box.appendChild(row)
   }
+  // 表头（否则右侧那两个数字仍然要靠猜）
+  const head = document.createElement('div'); head.className = 'bar-row bar-head'
+  for (const t of ['时段', '', '请求数', 'Tokens']) {
+    const c = document.createElement('span'); c.textContent = t; head.appendChild(c)
+  }
+  box.insertBefore(head, box.firstChild)
 }
 
 /**
@@ -943,15 +1010,30 @@ async function loadUsage() {
   const activeDays = sum('activeDays')
   const detailCapped = parts.some((p) => p.detailCapped)
 
-  // ── 汇总卡片 ──
+  // ── KPI 卡片（照 cpa-usage-keeper 的观感：大数字 + 彩色图标章 + 带单位副标题）──
+  //
+  // ⚠️ 每条副标题都**必须带单位**。旧版这里只写裸数字，而「按小时」那处更糟 ——
+  // 只渲染 `count` 一个数，用户看到「21」「24」完全不知道是请求数还是 token
+  //（用户原话：「这个每小时用量的 21 24 是什么意思」）。
   const box = $('usage-summary')
   clear(box)
-  box.appendChild(countBlock('总请求', fmtNum(total)))
-  box.appendChild(countBlock('成功', fmtNum(ok)))
-  box.appendChild(countBlock('失败', fmtNum(failed)))
-  box.appendChild(countBlock('输入 token', fmtNum(inputTokens)))
-  box.appendChild(countBlock('输出 token', fmtNum(outputTokens)))
-  box.appendChild(countBlock('平均耗时 ms', fmtNum(avgMs)))
+  const successRate = total === 0 ? 0 : (ok / total) * 100
+  box.appendChild(kpiCard('blue', 'Σ', rangeLabel + '总请求', fmtNum(total),
+    `${activeDays} 天有记录`))
+  box.appendChild(kpiCard('green', '✓', '成功', fmtNum(ok),
+    `成功率 ${successRate.toFixed(1)}%`))
+  // ⚠️ 图标用 `×`（U+00D7，拉丁字母区，所有字体都有），**不要**用
+  // `✕`（U+2715，杂项符号区）—— 项目实测后者在部分手机字体缺字形、
+  // 会渲染成空框（单测明确禁止，见 tests/panel.test.ts 的 RISKY 列表）。
+  // 这与本项目其它地方（能力标签）的约定一致。
+  box.appendChild(kpiCard(failed > 0 ? 'red' : 'cyan', '×', '失败', fmtNum(failed),
+    failed > 0 ? `占 ${((failed / total) * 100).toFixed(1)}%` : '无失败'))
+  box.appendChild(kpiCard('purple', '↓', '输入 token', fmtTokensShort(inputTokens),
+    fmtNum(inputTokens) + ' tokens'))
+  box.appendChild(kpiCard('pink', '↑', '输出 token', fmtTokensShort(outputTokens),
+    fmtNum(outputTokens) + ' tokens'))
+  box.appendChild(kpiCard('orange', '⏱', '平均耗时', fmtDuration(avgMs),
+    fmtNum(total) + ' 次请求的平均'))
 
   // ── 数据边界说明（关键：解释「为什么明细比总数少」）──
   const scope = $('usage-scope')

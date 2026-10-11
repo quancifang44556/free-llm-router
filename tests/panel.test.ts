@@ -1096,3 +1096,69 @@ test('⚠️ 趋势图必须限宽（用户报「太宽不好看」）', () => {
   // ③ 窄屏不能溢出容器
   assert.ok(/width:\s*100%/.test(body), '⚠️ 应有 width:100% 兜底窄屏（不能溢出）')
 })
+
+test('🔴 用量「按小时」的数字**必须带单位**（用户报「21 24 是什么意思」）', () => {
+  // ## 用户原话：「这个每小时用量的 21 24 是什么意思」
+  //
+  // 根因：旧版渲染时只写一个裸 `count`：
+  //   `val.textContent = fmtNum(h.count) + (h.failed ? ' / ' + … : '')`
+  // ⇒ 界面上就是「21」「24」两个数字，**看不出是请求数还是 token 数**。
+  // 这不是「不够美观」，是**信息缺失** —— 用户无法解读自己的数据。
+  const js = stripJsComments(panelAsset('/panel/app.js')?.body ?? '')
+  const fn = js.slice(js.indexOf('function renderUsageHours'))
+  // ① 值必须带「次请求」这样的单位
+  assert.ok(/次请求/.test(fn), '⚠️ 请求数必须写明单位（不能只有裸数字）')
+  // ② 必须同时给出该小时的 token 量（否则仍然不知道每小时花了多少）
+  assert.ok(/tokens/.test(fn) || /tok/.test(fn), '⚠️ 该小时的 token 量也要给')
+  // ③ 必须有表头，否则右侧两列仍然靠猜
+  assert.ok(/bar-head/.test(fn), '⚠️ 需要表头说明各列是什么')
+  // ④ 悬停提示里要有完整明细
+  assert.ok(/\.title\s*=/.test(fn), '⚠️ 应有 title 提示给出完整数字')
+})
+
+test('🔴 「今日」窗口不得显示按天趋势（单根柱没有意义）', () => {
+  // 用户明确要求：「今日就不要显示按天趋势了」。
+  // 今日窗口只有**一根柱** —— 既不构成趋势，观感也差
+  //（单根柱要么被拉成整条白块，要么孤零零杵着）。
+  //
+  // ⚠️ 要隐藏**整个面板**（含标题），而不是只清空内容 ——
+  // 留一个空标题比不显示更让人困惑。
+  const js = stripJsComments(panelAsset('/panel/app.js')?.body ?? '')
+  const fn = js.slice(js.indexOf('function renderUsageTrend'))
+  assert.ok(/windowDays === 1/.test(fn), '应判单日窗口')
+  assert.ok(/panel\.hidden = true/.test(fn),
+    '⚠️ 单日窗口必须**隐藏整个面板**（不是只清空内容）')
+  // 且必须是**提前返回**（不能继续画柱子）
+  const hideAt = fn.indexOf('panel.hidden = true')
+  const returnAt = fn.indexOf('return', hideAt)
+  assert.ok(returnAt > hideAt && returnAt - hideAt < 200,
+    '⚠️ 隐藏后必须立即 return，否则仍会画出那根柱')
+})
+
+test('🔴 byHour 必须带 token（否则「按小时」给不出用量）', () => {
+  // 上一条测试断言「按小时要显示 tokens」，其前提是**后端确实算了**。
+  // 这个前提若变了，那条断言就只是空转。
+  const src = readFileSync('src/store/usage.ts', 'utf8')
+  const iface = src.slice(src.indexOf('export interface UsageHour'))
+  const body = iface.slice(0, iface.indexOf('}'))
+  for (const k of ['input', 'output']) {
+    assert.ok(new RegExp(`\\b${k}\\b`).test(body),
+      `⚠️ UsageHour 必须包含 ${k}（否则按小时给不出 token 量）`)
+  }
+  // ⚠️ 旧数据没有这两个字段 ⇒ 累加时必须按 0 兜底，否则整列变 NaN
+  assert.ok(/prev\?\.input \?\? 0/.test(src) && /prev\?\.output \?\? 0/.test(src),
+    '⚠️ 旧数据的 byHour 没有 input/output，累加必须 ?？ 0 兜底（否则显示 NaN）')
+  assert.ok(/v\.input \?\? 0/.test(src) && /v\.output \?\? 0/.test(src),
+    '⚠️ 汇总合并时同样要兜底')
+})
+
+test('⚠️ KPI 卡的浅色规则必须**两套都加**（显式 light + 跟随系统 auto）', () => {
+  // 这正是本项目上一轮踩过的缺陷（用户报「浅色主题下趋势柱背景还是深色」）：
+  // 两套浅色规则**独立维护**，只写一处就会在「跟随系统」模式下漏掉。
+  // 本轮新增 KPI 卡时，我自己又差点犯同一个错（先只加了一处）。
+  const css = panelAsset('/panel/style.css')?.body ?? ''
+  assert.ok(/html\[data-theme='light'\]\s*\.kpi\s*\{/.test(css),
+    "⚠️ 显式 light 主题要覆盖 .kpi")
+  assert.ok(/html:not\(\[data-theme\]\)\s*\.kpi\s*\{/.test(css),
+    '⚠️ 跟随系统（auto）的浅色也要覆盖 .kpi')
+})

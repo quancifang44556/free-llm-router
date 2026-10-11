@@ -87,28 +87,49 @@
 
   <!-- ───────── 用量 ───────── -->
   <section class="view" id="view-usage" hidden>
-    <h2>用量 <button class="ghost" id="refresh-usage">刷新</button>
-      <button class="ghost" id="clear-usage">清空</button></h2>
-
-    <!-- 时间窗切换（今日 / 近 7 天 / 近 30 天 / 全部） -->
-    <div id="usage-range" class="seg" role="tablist" aria-label="时间范围"></div>
-
-    <div id="usage-summary" class="counts"></div>
+    <!-- 工具行：标题 + 时间窗 + 操作（照参考项目把「筛选」与「操作」放一行） -->
+    <div class="page-head">
+      <h2>用量</h2>
+      <div class="page-tools">
+        <div id="usage-range" class="seg" role="tablist" aria-label="时间范围"></div>
+        <button class="ghost" id="refresh-usage">刷新</button>
+        <button class="ghost" id="clear-usage">清空</button>
+      </div>
+    </div>
 
     <!-- ⚠️ 数据边界说明：明细只留最近 500 条，而按天聚合留 90 天。
          两者不是一回事，必须说清 —— 否则用户会以为「总数不对」。 -->
     <p class="hint" id="usage-scope"></p>
 
-    <h3 id="usage-trend-title">按天趋势</h3>
-    <div id="usage-trend" class="trend"></div>
+    <!-- KPI 卡片网格（照参考项目：大数字 + 彩色图标章 + 带单位的副标题） -->
+    <div id="usage-summary" class="kpi-grid"></div>
 
-    <h3 id="usage-hours-title">按小时</h3>
-    <div id="usage-hours" class="bars"></div>
+    <!-- 按天趋势（**今日窗口不显示** —— 单根柱没有意义，见 JS 说明） -->
+    <section class="panel" id="usage-trend-panel">
+      <div class="panel-head">
+        <h3 id="usage-trend-title">按天趋势</h3>
+        <span class="hint" id="usage-trend-note"></span>
+      </div>
+      <div id="usage-trend" class="trend"></div>
+    </section>
 
-    <h3>按模型</h3>
-    <div id="usage-models"></div>
-    <h3>按账号</h3>
-    <div id="usage-accounts"></div>
+    <!-- 按小时（只对「今日」有意义） -->
+    <section class="panel" id="usage-hours-panel">
+      <div class="panel-head">
+        <h3 id="usage-hours-title">按小时</h3>
+        <span class="hint" id="usage-hours-note"></span>
+      </div>
+      <div id="usage-hours" class="bars"></div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head"><h3>按模型</h3></div>
+      <div id="usage-models"></div>
+    </section>
+    <section class="panel">
+      <div class="panel-head"><h3>按账号</h3></div>
+      <div id="usage-accounts"></div>
+    </section>
   </section>
 
   <!-- ───────── 模型 ───────── -->

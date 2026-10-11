@@ -161,7 +161,90 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 .bar-track { flex: 1; background: #10131a; border-radius: 3px; height: 14px; position: relative; overflow: hidden; }
 .bar-fill { background: var(--accent); height: 100%; }
 .bar-fill.bad { background: var(--err); }
-.bar-val { width: 60px; text-align: right; color: var(--dim); font-variant-numeric: tabular-nums; }
+/* ⚠️ 数值列要够宽才放得下带单位的文案（如「22 次请求（失败 3）」） */
+.bar-val { width: 132px; text-align: right; color: var(--dim); font-variant-numeric: tabular-nums; }
+/* 该时段的 token 量（原版没有这一列，用户不知道每小时花了多少） */
+.bar-tokens { width: 78px; text-align: right; color: var(--dim); font-variant-numeric: tabular-nums; }
+/* 迷你表头：告诉用户右侧两个数字分别是什么 */
+.bar-head { font-size: 10px; color: var(--dim); opacity: .8; margin-bottom: 2px; }
+.bar-head span:nth-child(2) { flex: 1; }
+.bar-head span:nth-child(3) { width: 132px; text-align: right; }
+.bar-head span:nth-child(4) { width: 78px; text-align: right; }
+
+/* ─────────── 用量页：KPI 卡片（照 cpa-usage-keeper 的观感） ─────────── */
+/*
+ * 参考项目的观感要点（已从其总览截图确认）：
+ *   · 大号数字（约 28px / 粗体）+ 小号带单位副标题
+ *   · 左上角一个**彩色图标章**，每张卡一个色系（蓝/紫/绿/橙/青/粉）
+ *   · 卡片圆角 16–20px、极淡的描边 + 柔和阴影
+ *   · 深色主题下卡片比背景**略亮**，而不是更黑
+ *
+ * ⚠️ 我们的面板是**手写 CSS + 明暗两套主题**，故这里只用 CSS 变量，
+ * 不引第三方 UI 库 —— 否则要么打包体积暴涨，要么与既有主题打架。
+ */
+.kpi-grid {
+  display: grid; gap: 12px; margin-bottom: 14px;
+  /* 自适应列数：窄屏 1 列、宽屏最多 3 列（参考项目是 3 列布局） */
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+}
+.kpi {
+  position: relative;
+  border: 1px solid var(--line); border-radius: 16px;
+  padding: 14px 16px 13px;
+  background: var(--panel);
+  /* 柔和阴影（参考项目用 0 10px 18px -3px）——比纯描边更有层次 */
+  box-shadow: 0 1px 2px rgba(0,0,0,.04), 0 8px 18px -8px rgba(0,0,0,.10);
+  overflow: hidden;
+}
+/* 左上角的彩色图标章 */
+.kpi-chip {
+  width: 26px; height: 26px; border-radius: 8px;
+  display: inline-flex; align-items: center; justify-content: center;
+  font-size: 13px; line-height: 1; margin-bottom: 10px;
+  background: var(--kpi-soft, rgba(79,140,255,.14));
+  color: var(--kpi, var(--accent));
+}
+.kpi-label { font-size: 11px; color: var(--dim); margin-bottom: 3px; }
+/* ⚠️ 数字要大：这是整张卡的主体（参考项目约 28px/900） */
+.kpi-value {
+  font-size: 25px; font-weight: 700; line-height: 1.15;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
+  /* ⚠️ 用 `overflow-wrap` 而不是 `word-break: break-all` —— 后者会把正常
+     英文单词也拦腰截断（项目单测明确禁止，见 tests/panel.test.ts）。 */
+  overflow-wrap: anywhere;
+}
+.kpi-sub { font-size: 11px; color: var(--dim); margin-top: 5px; }
+/* 每张卡的色系（照参考项目的蓝/紫/绿/橙/青/粉） */
+.kpi.blue   { --kpi: #4f8cff; --kpi-soft: rgba(79,140,255,.14); }
+.kpi.purple { --kpi: #a855f7; --kpi-soft: rgba(168,85,247,.14); }
+.kpi.green  { --kpi: #22c55e; --kpi-soft: rgba(34,197,94,.14); }
+.kpi.orange { --kpi: #f59e0b; --kpi-soft: rgba(245,158,11,.15); }
+.kpi.cyan   { --kpi: #06b6d4; --kpi-soft: rgba(6,182,212,.14); }
+.kpi.pink   { --kpi: #ec4899; --kpi-soft: rgba(236,72,153,.14); }
+.kpi.red    { --kpi: var(--err); --kpi-soft: rgba(239,95,95,.14); }
+
+/* ─────────── 用量页：通用面板容器 ─────────── */
+.panel {
+  border: 1px solid var(--line); border-radius: 16px;
+  background: var(--panel); padding: 14px 16px; margin-bottom: 14px;
+  box-shadow: 0 1px 2px rgba(0,0,0,.03);
+}
+.panel-head {
+  display: flex; align-items: baseline; justify-content: space-between;
+  gap: 10px; margin-bottom: 12px; flex-wrap: wrap;
+}
+.panel-head h3 { margin: 0; font-size: 13px; font-weight: 600; }
+
+/* ─────────── 用量页：页头（标题 + 工具行） ─────────── */
+.page-head {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 12px; flex-wrap: wrap; margin-bottom: 10px;
+}
+.page-head h2 { margin: 0; }
+.page-tools { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+/* 页头里的分段控件不需要下边距（原先 .seg 自带 margin-bottom:12px） */
+.page-tools .seg { margin-bottom: 0; }
 
 /* ─────────── 时间窗分段控件（用量页） ─────────── */
 .seg {
@@ -176,6 +259,13 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 .seg-item:hover { color: var(--text); }
 .seg-item.active { background: var(--accent); color: #fff; }
 html[data-theme='light'] .seg-item.active { color: #fff; }
+/* ⚠️ 用量页 KPI 卡：浅色下阴影要略重一点才有层次（深色下靠亮色卡片本身）。
+   ⚠️ **必须与下方 `prefers-color-scheme` 那一份成对出现** ——
+   两套浅色规则是独立维护的，只写一处就会在「跟随系统」模式下漏掉
+   （本项目已为此踩过一次，见 AGENTS.md §9.1b ②g）。 */
+html[data-theme='light'] .kpi {
+  box-shadow: 0 1px 2px rgba(0,0,0,.04), 0 10px 20px -12px rgba(0,0,0,.18);
+}
 
 /* ─────────── 按天趋势柱 ─────────── */
 /*
@@ -395,6 +485,10 @@ html[data-theme='light'] .prov-card .prov-credits { background: #e7f5ec; border-
   html:not([data-theme]) .banner { background: #fdecec; border-color: #f0a0a0; color: #7f1d1d; }
   html:not([data-theme]) .notice { background: #eef4ff; border-color: #b9d0f5; }
   html:not([data-theme]) .cap.off { color: #8a93a3; }
+  /* ⚠️ 与上面 `html[data-theme='light'] .kpi` 成对 —— 漏一个就是「只有某种模式出错」 */
+  html:not([data-theme]) .kpi {
+    box-shadow: 0 1px 2px rgba(0,0,0,.04), 0 10px 20px -12px rgba(0,0,0,.18);
+  }
   html:not([data-theme]) .model-row.off .mid,
   html:not([data-theme]) .model-row.off .mname { color: #9aa3b2; }
 }
@@ -630,4 +724,14 @@ main > * { min-width: 0; }
    让积分单独占一行，否则会把 uid/昵称挤成一条竖线。 */
 @media (max-width: 720px) {
   .card .acct-credits { flex-basis: 100%; }
+  /* ⚠️ 用量「按小时」在窄屏要收窄：三列（78+132+78=288px）+ 轨道
+     会让轨道被挤到几乎没有宽度。
+     ⇒ 隐藏 token 列（它在 title 提示里仍有），请求数列收窄。 */
+  .bar-tokens { display: none; }
+  .bar-head span:nth-child(4) { display: none; }
+  .bar-val { width: 84px; }
+  .bar-head span:nth-child(3) { width: 84px; }
+  .bar-label { width: 54px; }
+  /* KPI 卡片在窄屏单列铺满，数字略小一点以免折行 */
+  .kpi-value { font-size: 22px; }
 }
