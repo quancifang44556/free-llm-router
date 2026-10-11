@@ -21,7 +21,7 @@
 - **全部核心能力已用真实账号端到端验证**：凭据加密、任务自动化（growth 计划 23/23 成功）、
   OpenAI 兼容流式/非流式网关 + **Responses API**、**13 家供应商**、
   **聚合路由**（跨渠道临期优先）、用量四窗口、面板 + 安全头。
-- **568 条单测通过**（`npm test`）；`npm run typecheck` 通过。
+- **572 条单测通过**（`npm test`）；`npm run typecheck` 通过。
 
 **第 1–8 步的实施记录、实测结论与踩过的坑，全部在 [§9 实施进度与实测发现](#九实施进度与实测发现)。**
 原先 `docs/` 下的 8 份分步文档已并入该节，`docs/` 目录已删除。
@@ -528,7 +528,7 @@ TaskRunner DO
 
 ## 九、实施进度与实测发现
 
-**第 1–8 步全部完成；第 9–10 轮改造已交付。** `npm test` → **568/568 通过**；`npm run typecheck` → 通过。
+**第 1–8 步全部完成；第 9–10 轮改造已交付。** `npm test` → **572/572 通过**；`npm run typecheck` → 通过。
 
 > 本节是**唯一的实施记录**：每一步做了什么、**实测验证到什么**、以及**踩到的真实坑**。
 > 原先分散在 `docs/` 下的 8 份分步记录已全部并入本节，`docs/` 目录已删除。
@@ -1535,6 +1535,72 @@ val.textContent = fmtNum(h.count) + (h.failed ? ' / ' + fmtNum(h.failed) : '')
 
 ⚠️ 但要**区分**哪些函数是「只为该按钮存在」的：
 `loadProviderCredits` 必须保留（首次进视图的 `creditsLoaded` 仍在用它）。
+
+#### ②n 未接线代码审计：接线 3 处 + 删 7 处死代码（2026-10-11）
+
+**测试基线：572 条单测通过。**
+
+对全仓库做了「实现了但零引用」的导出审计（23 个），逐条实测后分三类处理。
+
+##### a. 🔴 最有价值：任务**从不「接受」**，导致未接受的任务白跑
+
+上游语义：`accept` **不产生进度**，只是把 `not_accepted` 变成 `accepted` ——
+而**只有已接受的任务才计分**。
+
+而本引擎**从不调用** `acceptTasks`：`acceptStatus` 被解析、被暴露，
+却没有任何地方去接受 ⇒ 未接受的任务即使上报了行为事件**也不会点亮**，
+用户看到的只是「任务跑了但进度不动」——**又一个静默失效**。
+
+⇒ 新增 `acceptPending` 动作（按桌面 / mp 分组调用，两者指纹不同，
+混在一起会有一半被拒），作为 `planGrowth` 的**第 2 步**（先接受再上报）。
+
+**线上实测**：计划 27 → **28 步**，`acceptPending` 报「已接受 1 个任务（其中 mp 1 个）」；
+复扫确认 `Sequential_Tasks_3` **从 pending 列表消失**（accept 真的落到了上游）。
+
+⚠️ 进度结构是 `queue` + `done`（不是持久化下标）⇒ **加步骤不破坏进行中的运行**。
+
+##### b. 🔴 更正一条**错误的可行性判断**（比死代码更值得修）
+
+`loomy.ts` / `index.ts` 曾写「微信扫码需要本地服务器承载弹窗页 ⇒ Workers 不可行」。
+**错的** —— 它把「承载二维码**展示页**」与「登录协议本身」混为一谈。
+
+实测该文件微信流程**每个网络调用都是出站 HTTPS**
+（`open.weixin.qq.com` / `long.open.weixin.qq.com` / `account.xfinfr.com`）；
+`grep -nE 'createServer|\.listen\(|127\.0\.0\.1|localhost'` **只命中注释**。
+参考实现那个 `createServer` 只是展示二维码的 HTML 壳 —— 本该由面板承担。
+
+⇒ 已**完整接线微信扫码登录**（start 返回 `qrImageUrl`、poll 处理
+`loomy-wechat` 会话、新增 `/login/loomy/bind` 补绑手机号端点 + 面板 UI）。
+**线上实测拿到真实二维码 URL**，轮询如实返回 `waiting`。
+
+⚠️⚠️ **教训：「不可行」这种结论必须去读代码验证** ——
+写错会**永久排除一个能做的功能**，而且没人会再去质疑它。
+
+##### c. 删掉 7 处真死代码（逐条 grep 确认为零引用）
+
+`providerErrorToSseFrame`、`randomUuid`、`readableDetail`、
+`isFreeOpencodeModel`、`isReachableOpencodeModel`、
+`raccoonCredentialExpiresAtMs`、`hourBucketUtc8`。
+
+⚠️ `hourBucketUtc8` 的注释**声称「面板旧视图与既有单测都在用」**，
+而 grep 证明**零引用** —— 又一条「注释与代码不符」。
+
+##### d. 顺带接线：模型级冷却接入标准 `Retry-After` 头
+
+`resetAt` 原先**只**来自上游文案的 `reset at … UTC+8`（我们逆向的格式，
+上游随时可改）。⇒ 文案优先、标准头兜底。
+
+⚠️ 顺序不能反：文案给的是**绝对墙钟**（更精确），`Retry-After` 只有秒级粒度。
+⚠️ 并把 `parseRetryAfterMs` 从 `providers/opencode.ts` 提到 `gateway/http.ts` ——
+它是 **HTTP 标准头**解析，让网关 import 供应商模块是层次颠倒。
+
+##### e. ⚠️ 一条**没有**接的（判断记录）
+
+审计建议把 `checkinStatus` 挂到 `/admin/accounts`。
+⚠️ **不接** —— 那个端点目前**只读 DO**（快），加 N 次上游调用会把它变成
+「逐账号打上游」，正是本项目刚修过的
+「`/admin/packages` 16~41s 阻塞账号列表」同类问题。
+（要接也应挂到按需触发的入口，而不是列表端点。）
 
 #### ③ 全供应商实测结论（跳过 buddy/workbuddy/trae）
 
