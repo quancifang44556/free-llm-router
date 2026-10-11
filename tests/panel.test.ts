@@ -852,16 +852,40 @@ test('🔴 账号卡片必须支持单独停用/启用，且按钮在「删除�
     '删除仍应是 danger 样式')
 })
 
-test('⚠️ 每个账号卡片必须单独显示积分（用户要求）', () => {
-  const js = panelAsset('/panel/app.js')?.body ?? ''
+test('⚠️ 每个账号卡片必须单独显示积分，且**不得阻塞账号列表**', () => {
+  // ## 用户两条反馈（先后）
+  //
+  // 1. 「每个账号单独显示积分」—— 于是接了 `acct-credits`。
+  // 2. ⚠️「账号半天加载不出来」—— 因为积分是逐账号串行实时查上游
+  //    （实测 `/admin/packages` 要 **16.3 秒**，而 `/admin/accounts` 只要 1.5 秒），
+  //    旧写法把两者**串在一起** ⇒ 点开弹窗后要盯空白等 16 秒。
+  //
+  // ⇒ 现在**先渲染账号**，积分**异步补**。这条测试钉住这个结构。
+  const js = stripJsComments(panelAsset('/panel/app.js')?.body ?? '')
   const css = panelAsset('/panel/style.css')?.body ?? ''
   assert.ok(js.includes('acct-credits'), '账号卡片要有积分元素')
-  // ⚠️ 数据必须来自已有的 `/admin/accounts`（`a.credits`），
-  // **不能**为每个账号再打一次上游 —— 那既慢又消耗额度。
-  assert.ok(/a\.credits/.test(js), '积分应取账号自身字段，不额外请求')
   assert.ok(/acct-credits/.test(css), '要有样式')
-  // 查不到时显示 `—` 而不是 0（显示 0 会让人以为额度用光）
-  assert.ok(js.includes("cr.textContent = '—'"), '未查到应显示破折号而非 0')
+
+  // ① ⚠️ **必须**用 `/admin/packages` 而不是 `a.credits` ——
+  //    后者只在 `AccountPoolDO.revive()` 里被写，平时恒为 0（废弃字段）。
+  assert.ok(/fetchPackages\(\)/.test(js), '积分应来自 /admin/packages')
+
+  // ② ⚠️ 积分必须在**渲染之后**异步补，不能 await 在渲染之前。
+  const fn = js.slice(js.indexOf('async function loadModalAccounts'))
+  const renderAt = fn.indexOf('box.appendChild(card)')
+  const creditAt = fn.indexOf('await fetchPackages()')
+  assert.ok(renderAt > 0, '应有账号渲染')
+  assert.ok(creditAt > renderAt,
+    '⚠️ 积分查询必须在**账号渲染之后**（之前会阻塞 16 秒 —— 用户报「半天加载不出来」）')
+
+  // ③ ⚠️ 必须有轮次校验：用户快速切换供应商时，旧一家的积分不能写进新一家
+  assert.ok(/modalAccountsSeq/.test(js), '⚠️ 异步补齐必须有轮次校验（否则串数据）')
+  // ④ ⚠️ 元素可能已被下一次重载移除，写之前要判 isConnected
+  assert.ok(/\.isConnected/.test(js), '⚠️ 写之前要判元素是否仍在文档里')
+  // ⑤ 三种终态都要有：有额度 / 查询失败（带原因）/ 不支持查余额
+  assert.ok(/查询失败/.test(js), '查询失败要显示（不是静默 0）')
+  assert.ok(/不支持查余额/.test(js), '后端标 skipped 时应显示「不支持查余额」而非「查询失败」')
+  assert.ok(js.includes("el.textContent = '—'"), '未查到应显示破折号而非 0')
 })
 
 test('🔴 供应商关闭必须真的关掉（服务端状态 + 双向拦截）', () => {
@@ -1008,4 +1032,67 @@ test('⚠️ 拖动排序只作用于手柄，不作用于整行（否则按钮�
     '⚠️ 整行不得起拖（会让按钮点不中）')
   // 开关按钮必须仍然有 onclick（未被拖动逻辑吃掉）
   assert.ok(/sw\.onclick/.test(js), '⚠️ 开关按钮的 onclick 必须保留')
+})
+
+test('🔴 浅色主题必须覆盖**两套**规则（显式 light + 跟随系统的 auto）', () => {
+  // ## 实测缺陷（用户报「用量的柱形图在自适应主题下的浅色主题背景还是深色的」）
+  //
+  // 项目有**两套**浅色规则，独立维护：
+  //   1. `html[data-theme='light']` —— 用户**显式**选浅色；
+  //   2. `@media (prefers-color-scheme: light) { html:not([data-theme]) ... }`
+  //      —— 用户选「跟随系统」且系统是浅色。
+  //
+  // 我只把 `.trend-track` 加进了第 1 套 ⇒ **auto 模式下漏了**，
+  // 于是柱状图背景仍是深色（`#10131a`）。
+  // ⚠️ 这类缺陷只在**某一种模式**下出现，极难发现 —— 必须用测试钉住「两处都有」。
+  const css = panelAsset('/panel/style.css')?.body ?? ''
+
+  // 两套规则都必须存在
+  assert.ok(/html\[data-theme='light'\]\s*\.trend-track/.test(css),
+    "⚠️ 显式 light 主题要覆盖 .trend-track")
+  assert.ok(/html:not\(\[data-theme\]\)\s*\.trend-track/.test(css),
+    '⚠️ 跟随系统（auto）的浅色也要覆盖 .trend-track —— 漏了就是用户报的那个缺陷')
+
+  // 一般化：凡是有 `.bar-track` 浅色覆盖的地方，`.trend-track` 也必须有
+  // （两个都是「柱状图轨道」，成对出现才不容易漏）
+  const explicitLightBlock = css.slice(css.indexOf("html[data-theme='light'] .out"))
+  assert.ok(/\.bar-track[\s\S]{0,400}\.trend-track|\.trend-track[\s\S]{0,400}\.bar-track/.test(css)
+    || /\.trend-track/.test(explicitLightBlock),
+    '⚠️ .bar-track 与 .trend-track 应在同一处一起覆盖（它们是一对）')
+
+  // ⚠️ 更强的判据：**逐条**检查浅色规则体里没有深色底。
+  //（不能简单地「取第一个 [data-theme='light'] 之后的全部文本」——
+  //  那会把后面的 auto 块与注释也算进来，产生假失败。我第一版就是这么错的。）
+  const lightRuleBodies: string[] = []
+  const re = /html\[data-theme='light'\]([^{]*)\{([^}]*)\}/g
+  let m: RegExpExecArray | null
+  while ((m = re.exec(css)) !== null) lightRuleBodies.push(m[2] ?? '')
+  const autoRuleBodies: string[] = []
+  const re2 = /html:not\(\[data-theme\]\)([^{]*)\{([^}]*)\}/g
+  while ((m = re2.exec(css)) !== null) autoRuleBodies.push(m[2] ?? '')
+  assert.ok(lightRuleBodies.length > 0 && autoRuleBodies.length > 0,
+    '两套浅色规则都应存在')
+  for (const body of [...lightRuleBodies, ...autoRuleBodies]) {
+    assert.ok(!/#10131a/.test(body),
+      `⚠️ 浅色规则体里不得残留深色底 #10131a（实际：${body.trim().slice(0, 80)}）`)
+  }
+})
+
+test('⚠️ 趋势图必须限宽（用户报「太宽不好看」）', () => {
+  // `.trend-col` 的 flex-basis 是 26px（保证窄屏柱子可见），
+  // 而 30 天窗口 ⇒ 30 列 ⇒ 光柱子就要 780px+，再加 `flex-grow` 撑满
+  // ⇒ 整条图横铺满 1180px 容器，很难看。
+  const css = panelAsset('/panel/style.css')?.body ?? ''
+  const rule = css.slice(css.indexOf('.trend {'))
+  const body = rule.slice(0, rule.indexOf('}'))
+  // ① 整块要有宽度上限
+  assert.ok(/max-width:\s*\d+px/.test(body),
+    '⚠️ .trend 必须有 max-width（否则 30 列横铺满屏）')
+  // ② 单列也要封顶，否则「唯一一根柱」会被拉成整条白块
+  const colRule = css.slice(css.indexOf('.trend-col {'))
+  const colBody = colRule.slice(0, colRule.indexOf('}'))
+  assert.ok(/max-width:\s*\d+px/.test(colBody),
+    '⚠️ .trend-col 必须有 max-width（否则单列时一根柱被拉成白块）')
+  // ③ 窄屏不能溢出容器
+  assert.ok(/width:\s*100%/.test(body), '⚠️ 应有 width:100% 兜底窄屏（不能溢出）')
 })

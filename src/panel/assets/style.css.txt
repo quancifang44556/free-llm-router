@@ -187,9 +187,31 @@ html[data-theme='light'] .seg-item.active { color: #fff; }
   display: flex; align-items: flex-end; gap: 4px;
   overflow-x: auto; padding: 8px 2px 0; margin-bottom: 12px;
   border: 1px solid var(--line); border-radius: 8px; background: var(--panel2);
+  /* ## 🔴 必须限宽（用户报「太宽不好看」）
+   *
+   * `.trend-col` 的 `flex-basis` 是 26px（为了让窄窗口的柱子不至于细到看不见），
+   * 而列**只多不少**：30 天窗口 ⇒ 30 列 ⇒ 光柱子就要 780px+，
+   * 在 1180px 的主容器里被 `flex-grow` 拉得更宽，整条图横铺满屏、很难看。
+   *
+   * ⇒ 给整块一个**上限**，超过就横向滚动（`overflow-x: auto` 已有）。
+   * 只加 `max-width` 而不动 `flex-basis`：前者限制**整块**的观感，
+   * 后者保证**单根柱**在窄屏仍可见 —— 两件事互不冲突。
+   *
+   * ⚠️ 用 `max-width: 100%` 兜底窄屏：不能让它溢出容器。
+   */
+  max-width: 760px;
+  width: 100%;
 }
 .trend-col {
-  flex: 1 0 26px; min-width: 26px;
+  /* ⚠️ **每列必须有宽度上限**（原先是 `flex: 1 0 26px`，grow=1 会撑满剩余空间）：
+   * 30 列时每列被拉宽、柱子跟着变胖；单列时更糟 —— 一根柱被拉成整条白块
+   *（这正是参考实现记录过的那个观感缺陷）。
+   *
+   * ⇒ `1 1 26px` 允许长高但**封顶 56px**：单列时是一根正常的柱（不是白块），
+   * 30 列时每列被压到 21px 左右仍可见（且不会被拉胖）。
+   */
+  flex: 1 1 26px;
+  max-width: 56px;
   display: flex; flex-direction: column; align-items: center; gap: 4px;
 }
 .trend-val {
@@ -359,7 +381,14 @@ html[data-theme='light'] .prov-card .prov-credits { background: #e7f5ec; border-
   html:not([data-theme]) textarea,
   html:not([data-theme]) button.ghost { background: #ffffff; }
   html:not([data-theme]) .out { background: #f8f9fb; }
+  /* ⚠️ `.bar-track` 与 `.trend-track` 是**两个**元素，都要覆盖。
+     实测缺陷（用户报「浅色主题下柱形图背景还是深色的」）：
+     我只把 `.trend-track` 加进了 `[data-theme='light']` 那一套，
+     而**跟随系统（auto）**模式走的是这段 `prefers-color-scheme` ——
+     两套规则是**独立维护**的，漏一处就只在某一种模式下出错，极难发现。
+     ⇒ 凡是在浅色下需要改底色的元素，**两处都要加**。 */
   html:not([data-theme]) .bar-track,
+  html:not([data-theme]) .trend-track,
   html:not([data-theme]) .switch { background: #e8ebf0; }
   html:not([data-theme]) .credits-pill,
   html:not([data-theme]) .prov-credits { background: #e7f5ec; border-color: #86c79a; }
