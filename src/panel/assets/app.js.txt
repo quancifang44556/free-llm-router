@@ -517,6 +517,35 @@ function renderLoginPrompt(el, body, providerId) {
   //
   // ⚠️ 这条路径**不需要用户打开任何链接**：掏出微信扫一下即可。
   // 与「打开浏览器 → 登录 → 等回跳」的家相比省掉一整步。
+  // ⚠️ **`qrImageUrl` 与 `qrSvg` 是两种不同形态**，都要支持：
+  //   · `qrSvg`（raccoon）—— 服务端**渲染好的 SVG 字符串**，插进 DOM；
+  //   · `qrImageUrl`（loomy 微信）—— 微信官方图片端点的 **URL**，
+  //     用 `<img src>` 显示（服务端不自己画二维码）。
+  // 只支持其中一种会让另一家显示空白（本文件上方记过同类缺陷：
+  // 「商汤登录显示 undefined」）。
+  if (typeof body.qrImageUrl === 'string' && body.qrImageUrl !== '') {
+    const tip = document.createElement('div')
+    tip.textContent = '请用微信扫描下方二维码完成授权：'
+    el.appendChild(tip)
+    const box = document.createElement('div')
+    box.className = 'qr-box'
+    const img = document.createElement('img')
+    // ⚠️ 图片来自微信官方端点；`alt` 必须有（图挂了也要能看出是什么）
+    img.src = body.qrImageUrl
+    img.alt = '微信登录二维码'
+    img.width = 180
+    img.height = 180
+    // ⚠️ 只带 referrerpolicy，**不带** crossorigin：微信该端点无 CORS 头，
+    // 加 crossorigin 会让图片加载失败（而它不需要被 canvas 读取）。
+    img.referrerPolicy = 'no-referrer'
+    box.appendChild(img)
+    el.appendChild(box)
+    const status = document.createElement('div')
+    status.textContent = '等待扫码…'
+    el.appendChild(status)
+    el._loginStatus = status
+    return
+  }
   if (typeof qrSvg === 'string' && qrSvg !== '') {
     const tip = document.createElement('div')
     tip.textContent = '请用微信扫描下方二维码完成授权：'
@@ -1942,6 +1971,138 @@ let modalLoginTimer = null
  */
 async function startLoomySmsLogin(out) {
   clear(out)
+  // ── 先让用户选登录方式 ──
+  //
+  // ⚠️ 两种方式**都可行**（微信流程全是出站 HTTPS，见 `providers/loomy.ts`
+  // 的更正说明）—— 此前只提供短信，是因为一条**错误的**可行性判断把微信
+  // 永久排除了。现在两条都给出，默认短信（少一步扫码）。
+  const pick = document.createElement('div')
+  pick.className = 'hint'
+  pick.textContent = '选择登录方式：'
+  out.appendChild(pick)
+  const row = document.createElement('div')
+  row.className = 'row'
+  const smsBtn = document.createElement('button')
+  smsBtn.textContent = '短信验证码'
+  const wxBtn = document.createElement('button')
+  wxBtn.className = 'ghost'
+  wxBtn.textContent = '微信扫码'
+  row.appendChild(smsBtn)
+  row.appendChild(wxBtn)
+  out.appendChild(row)
+
+  wxBtn.onclick = () => { void startLoomyWechatLogin(out) }
+  smsBtn.onclick = () => {
+    // 切到短信表单（清掉选择器，避免两套 UI 叠在一起）
+    clear(out)
+    void renderLoomySmsForm(out)
+  }
+}
+
+/**
+ * loomy 微信扫码登录（与 raccoon 同形态：服务端给二维码，面板轮询）。
+ *
+ * ⚠️ 与 raccoon 的差异：扫完之后讯飞侧若**没绑手机号**，还要补一步绑定
+ *（轮询返回 `status: 'need_phone'`）—— 故轮询回调里要处理这个分支。
+ */
+async function startLoomyWechatLogin(out) {
+  clear(out)
+  const res = await api('/admin/providers/login/start', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ provider: 'loomy', realm: 'cn', mode: 'wechat' }),
+  })
+  if (!res.ok) { out.textContent = JSON.stringify(res.body, null, 2); return }
+  const state = res.body.state
+  clear(out)
+  renderLoginPrompt(out, res.body, 'loomy')
+  if (modalLoginTimer) clearInterval(modalLoginTimer)
+  let tries = 0
+  modalLoginTimer = setInterval(async () => {
+    tries += 1
+    if (tries > 100) { clearInterval(modalLoginTimer); out.textContent += '\n授权超时。'; return }
+    const r = await api('/admin/providers/login/poll?state=' + encodeURIComponent(state))
+    if (!r.ok) return
+    const status = out._loginStatus
+    if (r.body && r.body.done) {
+      clearInterval(modalLoginTimer)
+      alert('登录成功')
+      loadModalAccounts(); loadAccounts(); loadPool()
+      return
+    }
+    // ⚠️ 需要补绑手机号：轮询停掉，转到绑定表单
+    if (r.body && r.body.status === 'need_phone') {
+      clearInterval(modalLoginTimer)
+      void renderLoomyBindForm(out, state, r.body.nickname)
+      return
+    }
+    if (status) {
+      status.textContent = r.body && r.body.message ? r.body.message : '等待扫码…'
+    }
+  }, 3000)
+}
+
+/**
+ * 微信已授权但讯飞侧未绑手机号 ⇒ 补绑（`bind === 0` 才走到这里）。
+ *
+ * ⚠️ 两个动作走同一个端点（`action: 'send' | 'check'`）：
+ * 先发码、再校验。验证码一次性，校验后会话即被清掉。
+ */
+async function renderLoomyBindForm(out, state, nickname) {
+  clear(out)
+  const tip = document.createElement('div')
+  tip.className = 'hint'
+  tip.textContent = (nickname ? `微信「${nickname}」` : '该微信号')
+    + '还没绑定手机号，请填写手机号完成绑定。'
+  out.appendChild(tip)
+
+  const phoneInput = document.createElement('input')
+  phoneInput.type = 'tel'
+  phoneInput.placeholder = '11 位手机号'
+  const sendBtn = document.createElement('button')
+  sendBtn.textContent = '发送验证码'
+  const row1 = document.createElement('div')
+  row1.className = 'row'
+  row1.appendChild(phoneInput)
+  row1.appendChild(sendBtn)
+  out.appendChild(row1)
+
+  const codeInput = document.createElement('input')
+  codeInput.type = 'text'
+  codeInput.placeholder = '短信验证码'
+  const checkBtn = document.createElement('button')
+  checkBtn.textContent = '完成绑定'
+  const row2 = document.createElement('div')
+  row2.className = 'row'
+  row2.appendChild(codeInput)
+  row2.appendChild(checkBtn)
+  out.appendChild(row2)
+
+  const msg = document.createElement('div')
+  msg.className = 'hint'
+  out.appendChild(msg)
+
+  sendBtn.onclick = async () => {
+    const r = await api('/admin/providers/login/loomy/bind', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ state, action: 'send', phone: phoneInput.value.trim(), realm: 'cn' }),
+    })
+    msg.textContent = r.ok ? '验证码已发送' : '发送失败：' + JSON.stringify(r.body)
+  }
+  checkBtn.onclick = async () => {
+    const r = await api('/admin/providers/login/loomy/bind', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ state, action: 'check', code: codeInput.value.trim(), realm: 'cn' }),
+    })
+    if (r.ok) {
+      alert('登录成功')
+      loadModalAccounts(); loadAccounts(); loadPool()
+    } else {
+      msg.textContent = '绑定失败：' + JSON.stringify(r.body)
+    }
+  }
+}
+
+async function renderLoomySmsForm(out) {
   // 第一步：填手机号 → 发码
   const tip = document.createElement('div')
   tip.textContent = '讯飞（loomy）用短信验证码登录。请填写手机号后点「发送验证码」。'

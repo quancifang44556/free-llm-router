@@ -1542,3 +1542,33 @@ test('⚠️ parseRetryAfterMs 必须在共享层（provider 无关），且网�
   assert.ok(/refined\.resetAt === undefined/.test(server),
     '⚠️ 应是「文案优先、头兜底」，不是反过来')
 })
+
+test('🔴 loomy 微信扫码登录已接线（后端两个端点 + 会话字段齐全）', () => {
+  // ## 背景：一条**错误的可行性判断**曾永久排除这个功能
+  //
+  // `loomy.ts` 与 `index.ts` 都曾注释「微信扫码需要本地服务器承载弹窗页
+  // ⇒ Workers 不可行」。**那是错的** —— 它把「承载二维码展示页」与
+  // 「登录协议本身」混为一谈。实测微信流程的每个网络调用都是出站 HTTPS
+  //（`open.weixin.qq.com` / `long.open.weixin.qq.com` / `account.xfinfr.com`），
+  // 而展示二维码本该由面板渲染。
+  //
+  // 本测试钉住：后端两个端点都在，且会话字段齐全。
+  const idx = readFileSync('src/index.ts', 'utf8')
+  // ① start：必须能走 wechat 模式，且返回 qrImageUrl（不是 authUrl）
+  assert.ok(/body\.mode === 'wechat'/.test(idx),
+    '⚠️ start 端点应支持 mode=wechat')
+  assert.ok(/qrImageUrl: buildLoomyWechatQrImageUrl\(uuid\)/.test(idx),
+    '⚠️ 应返回 qrImageUrl（面板用 <img src> 直接显示，无需前端 QR 库）')
+  // ② poll：必须处理 loomy-wechat 会话
+  assert.ok(/kind'\] === 'loomy-wechat'/.test(idx),
+    '⚠️ poll 端点应处理 loomy-wechat 会话')
+  // ③ 补绑手机号端点（bind===0 时必须能完成登录）
+  assert.ok(/providers\/login\/loomy\/bind/.test(idx),
+    '⚠️ 应有补绑手机号的端点（否则 bind===0 的用户永远登不进去）')
+  // ④ 会话必须持久化 uuid 与 lastErrcode ——
+  //    长轮询的 `last` 参数依赖后者，丢了会让服务端每次都当新会话。
+  assert.ok(/lastErrcode: ''/.test(idx), '⚠️ 会话里应初始化 lastErrcode')
+  assert.ok(/lastErrcode: polled\.errcode/.test(idx), '⚠️ 每次轮询应把 errcode 写回会话')
+  // ⑤ 微信 code 只用一次 ⇒ 拿到 rcode 后必须替换掉 uuid
+  assert.ok(/rcode: auth\.rcode/.test(idx), '⚠️ 拿到 rcode 后应写回会话（避免重复用同一个 code）')
+})

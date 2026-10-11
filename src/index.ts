@@ -34,6 +34,13 @@ import { isValidUid, LOGIN_STATE_TTL_MS, pollLogin, startLogin } from './upstrea
  */
 const RACCOON_LOGIN_STATE_TTL_MS = 10 * 60 * 1000
 /**
+ * loomy 微信扫码登录会话的存活时长。
+ *
+ * ⚠️ 与 raccoon 同量级（10 分钟）：微信二维码本身的有效期也在这个尺度，
+ * 更长只会让用户拿到一个已经失效的二维码去扫。
+ */
+const LOOMY_LOGIN_STATE_TTL_MS = 10 * 60 * 1000
+/**
  * cline 设备码登录的节流下限（毫秒）。
  *
  * ⚠️ 与 `src/providers/cline.ts` 的 `CLINE_DEVICE_MIN_INTERVAL_MS` 同值。
@@ -1250,6 +1257,14 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
   if (path === '/admin/providers/login/start' && request.method === 'POST') {
     const body = (await request.json().catch(() => ({}))) as {
       provider?: string; realm?: string; phone?: string
+      /**
+       * 登录方式（仅 loomy 用）：`'wechat'` 走微信扫码，缺省走短信。
+       *
+       * ⚠️ 两种方式**都可行**（微信流程全是出站 HTTPS）——
+       * 见 `providers/loomy.ts` 的 `capabilities.login` 注释（那里更正过
+       * 一条「微信不可行」的错误判断）。
+       */
+      mode?: string
     }
     const providerId = body.provider ?? ''
     // ⚠️ 会话分片必须与**账号将要落入的分片**一致，否则轮询时找不到会话
@@ -1573,6 +1588,57 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
     // ⚠️ `msgid` 必须持久化在登录会话里（Workers 无跨请求内存）——
     // 丢了它第二步会被服务端判「msgid 无效」，而那个报错与真实原因无关
     //（参考实现 `loomy-oauth.ts:141-144` 专门为此不返回空串）。
+    // ── loomy：**微信扫码**（二维码由本服务渲染，与 raccoon 同形态） ──
+    //
+    // ⚠️ 面板默认给 loomy 走短信（见 `startModalLogin`），
+    // 但只要显式传 `mode: 'wechat'` 就走这条 —— 两条路径**都可行**，
+    // 因为微信流程全是出站 HTTPS（见 `providers/loomy.ts` 的更正说明）。
+    //
+    // 流程（`providers/loomy.ts`）：
+    // ① 拉微信授权页 → 正则取 `uuid`；
+    // ② 面板渲染 `qrImageUrl`（`open.weixin.qq.com/connect/qrcode/<uuid>`）；
+    // ③ 轮询 `long.open.weixin.qq.com/connect/l/qrconnect` 拿一次性 `code`；
+    // ④ 用 `code` 换 `rcode`（`bindLoomyThirdAccount`）→ 视 `bind` 走 skip 或绑手机号。
+    //
+    // ⚠️ 会话里存 `uuid` 与 `lastErrcode`：轮询**必须原样回传**，
+    // 而 Workers 没有跨请求内存（面板每几秒发一个独立请求）。
+    if (providerId === 'loomy' && body.mode === 'wechat') {
+      const { fetchLoomyWechatUuid, buildLoomyWechatQrImageUrl } = await import('./providers/loomy.js')
+      try {
+        const uuid = await fetchLoomyWechatUuid(
+          crypto.randomUUID().replace(/-/g, ''),
+          AbortSignal.timeout(30_000),
+        )
+        const state = crypto.randomUUID()
+        await pool.saveLoginSession(
+          state,
+          {
+            provider: 'loomy',
+            kind: 'loomy-wechat',
+            realm: loginRealm,
+            uuid,
+            // ⚠️ 长轮询要求带上一次的 errcode（`last` 参数），
+            // 故它必须**持久化**，不能放模块变量。
+            lastErrcode: '',
+            createdAt: Date.now(),
+          },
+          Date.now() + LOOMY_LOGIN_STATE_TTL_MS,
+        )
+        return json({
+          ok: true,
+          provider: 'loomy',
+          state,
+          // 面板用 `<img src>` 直接显示（微信官方图片端点，无需前端 QR 库）
+          qrImageUrl: buildLoomyWechatQrImageUrl(uuid),
+          realm: loginRealm,
+          expiresInMs: LOOMY_LOGIN_STATE_TTL_MS,
+        })
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        return jsonError(502, `微信二维码获取失败：${message}`, 'wechat_qr_failed')
+      }
+    }
+
     if (providerId === 'loomy') {
       const { sendLoomySmsCode } = await import('./providers/loomy.js')
       // 🔴 **必须复用上面已经解析过的 `body`，不能再次 `request.json()`**。
@@ -1744,6 +1810,82 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
     }
   }
 
+  // ── loomy 微信扫码：补绑手机号（`bind === 0` 时才走到这里） ──
+  //
+  // 两个动作共用本端点（`action` 区分）：
+  //   · `send`  ⇒ 向该手机号下发验证码（`bindLoomySendMsg`）
+  //   · `check` ⇒ 校验验证码并完成绑定 + 登录（`bindLoomyCheckCode`）
+  //
+  // ⚠️ 为什么不复用短信端点：那条走的是 `/login/phone/*`（手机号**直接登录**），
+  // 而这里是 `/login/thirdAccount/bind/*`（**给微信账号补绑手机号**）——
+  // 端点与语义都不同。混用会让「微信登录」变成「手机号登录」，
+  // 用户拿到的账号与他扫的那个微信无关。
+  if (path === '/admin/providers/login/loomy/bind' && request.method === 'POST') {
+    const body = (await request.json().catch(() => ({}))) as {
+      state?: string; action?: string; phone?: string; code?: string; realm?: string
+    }
+    const state = typeof body.state === 'string' ? body.state : ''
+    const action = body.action === 'check' ? 'check' : 'send'
+    if (state === '') return jsonError(400, 'state 必填（重新发起登录）', 'missing_state')
+
+    const saved = await findLoginSession(env, state)
+    if (saved === undefined) {
+      return jsonError(404, '登录会话不存在或已过期，请重新发起登录', 'session_not_found')
+    }
+    if (saved.payload['kind'] !== 'loomy-wechat') {
+      return jsonError(400, '该会话不是微信登录，请重新发起', 'wrong_flow')
+    }
+    const rcode = typeof saved.payload['rcode'] === 'string' ? saved.payload['rcode'] : ''
+    if (rcode === '') {
+      // ⚠️ 还没扫码成功就来绑手机号 ⇒ 如实说明，别让用户以为是自己填错了
+      return jsonError(400, '尚未完成微信扫码，请先扫码', 'wechat_not_confirmed')
+    }
+
+    const { bindLoomySendMsg, bindLoomyCheckCode } = await import('./providers/loomy.js')
+    if (action === 'send') {
+      const phone = typeof body.phone === 'string' ? body.phone.trim() : ''
+      if (!/^1\d{10}$/.test(phone)) {
+        return jsonError(400, '请填写 11 位手机号（以 1 开头）', 'invalid_phone')
+      }
+      try {
+        const msgid = await bindLoomySendMsg(rcode, phone, AbortSignal.timeout(30_000))
+        // ⚠️ `msgid` 与 `phone` 必须写回会话：校验那一步两个都要用，
+        // 而 Workers 无跨请求内存。
+        await saved.pool.saveLoginSession(
+          state,
+          { ...saved.payload, msgid, phone },
+          Date.now() + LOOMY_LOGIN_STATE_TTL_MS,
+        )
+        return json({ ok: true, sent: true })
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        return jsonError(502, `验证码发送失败：${message}`, 'bind_send_failed')
+      }
+    }
+
+    // action === 'check'
+    const code = typeof body.code === 'string' ? body.code.trim() : ''
+    if (!/^\d{4,8}$/.test(code)) return jsonError(400, '请填写收到的验证码', 'invalid_code')
+    const msgid = typeof saved.payload['msgid'] === 'string' ? saved.payload['msgid'] : ''
+    if (msgid === '') {
+      await saved.pool.removeLoginSession(state)
+      return jsonError(400, '登录会话缺少 msgid，请重新发送验证码', 'session_incomplete')
+    }
+    try {
+      const result = await bindLoomyCheckCode(rcode, code, msgid, AbortSignal.timeout(30_000))
+      // ⚠️ 验证码一次性：无论成败都清会话（与短信端点同口径）
+      await saved.pool.removeLoginSession(state)
+      return json(await persistProviderCredential(env, result.credential, Date.now()))
+    } catch (error) {
+      await saved.pool.removeLoginSession(state)
+      const message = error instanceof Error ? error.message : String(error)
+      return json(
+        { error: { message: `验证码校验失败：${message}。请重新获取验证码后再试。`, type: 'bind_failed' } },
+        400,
+      )
+    }
+  }
+
   // ── 轮询供应商登录结果 ──
   if (path === '/admin/providers/login/poll' && request.method === 'GET') {
     const state = url.searchParams.get('state') ?? ''
@@ -1787,6 +1929,77 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
         const credential = await pollZcodeLogin(saved.payload['flow'] as never, AbortSignal.timeout(20_000))
         if (credential === undefined) return json({ done: false, message: '等待授权中…' })
         return json(await persistProviderCredential(env, credential, now))
+      }
+      // ── loomy：微信扫码（二维码由本服务渲染；扫完可能还要绑手机号） ──
+      //
+      // ⚠️ 与 raccoon 的**关键差异**：微信授权成功后还要看讯飞侧是否已绑手机号
+      //（`bindLoomyThirdAccount` 返回的 `bind`）：
+      //   · `bind === 1` ⇒ 直接 `bindLoomySkip` 换 session，**一次轮询就完成**；
+      //   · `bind === 0` ⇒ 需要用户补手机号：先把 `rcode` 存回会话，
+      //     返回 `need_phone`，由面板收集手机号后再调 `/login/loomy/bind`。
+      //
+      // ⚠️ `rcode` 必须**持久化**（Workers 无跨请求内存），
+      // 且微信 `code` 只用一次 ⇒ 拿到 `rcode` 后立刻替换掉会话里的 `uuid`，
+      // 避免重复用同一个 code 去换（第二次必然失败）。
+      if (saved.payload['kind'] === 'loomy-wechat') {
+        const { pollLoomyWechatOnce, bindLoomyThirdAccount, bindLoomySkip } =
+          await import('./providers/loomy.js')
+        // 已经拿到 rcode 却还在轮询 ⇒ 说明在等用户补手机号，不该再扫一次
+        const existingRcode = saved.payload['rcode']
+        if (typeof existingRcode === 'string' && existingRcode !== '') {
+          return json({ done: false, status: 'need_phone', message: '请补填手机号完成绑定' })
+        }
+        const uuid = saved.payload['uuid']
+        if (typeof uuid !== 'string' || uuid === '') {
+          return json({ done: false, status: 'failed', message: '登录会话缺少 uuid，请重新发起' })
+        }
+        const lastErrcode = typeof saved.payload['lastErrcode'] === 'string'
+          ? saved.payload['lastErrcode'] : ''
+        const polled = await pollLoomyWechatOnce(uuid, lastErrcode, AbortSignal.timeout(20_000))
+
+        // ⚠️ 把本次 errcode 写回会话：长轮询的 `last` 参数依赖它，
+        // 丢了会让服务端每次都当「新会话」返回 waiting。
+        const bound = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(saved.realm))
+        const base = { ...saved.payload, lastErrcode: polled.errcode }
+        await bound.saveLoginSession(
+          state, base, Date.now() + LOOMY_LOGIN_STATE_TTL_MS,
+        ).catch(() => {})
+
+        if (polled.status === 'cancelled') {
+          return json({ done: false, status: 'canceled', message: '用户已取消授权，请重新发起' })
+        }
+        if (polled.status === 'expired') {
+          return json({ done: false, status: 'expired', message: '二维码已失效，请重新发起' })
+        }
+        if (polled.status === 'error') {
+          // ⚠️ 网络抖动不当作失败：如实回 waiting，让面板继续轮询
+          return json({ done: false, status: 'waiting', message: '等待扫码…' })
+        }
+        if (polled.status !== 'confirmed' || polled.code === '') {
+          return json({ done: false, status: polled.status, message: '等待扫码…' })
+        }
+
+        // 已确认 ⇒ 用一次性 code 换 rcode
+        const auth = await bindLoomyThirdAccount(polled.code, AbortSignal.timeout(20_000))
+        if (auth.bind === 1) {
+          // 讯飞侧已绑手机号 ⇒ 直接换 session，登录完成
+          const result = await bindLoomySkip(auth.rcode, AbortSignal.timeout(20_000))
+          const done = await persistProviderCredential(env, result.credential, now)
+          await bound.removeLoginSession(state)
+          return json(done)
+        }
+        // 需要补手机号：把 rcode 写回会话，等面板提交手机号
+        await bound.saveLoginSession(
+          state,
+          { ...base, rcode: auth.rcode, ...(auth.nickname === undefined ? {} : { nickname: auth.nickname }) },
+          Date.now() + LOOMY_LOGIN_STATE_TTL_MS,
+        )
+        return json({
+          done: false,
+          status: 'need_phone',
+          message: '该微信号还没绑手机号，请填写手机号完成绑定',
+          ...(auth.nickname === undefined ? {} : { nickname: auth.nickname }),
+        })
       }
       // ── raccoon：微信扫码（二维码由本服务渲染，用户扫完即完成） ──
       if (saved.payload['kind'] === 'raccoon') {
