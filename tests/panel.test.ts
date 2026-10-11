@@ -1581,3 +1581,123 @@ test('⚠️ uid / provider id 这类长串必须能断行', () => {
       `⚠️ ${sel} 必须能断行（长串会撑破容器）`)
   }
 })
+
+test('🔴 loadPool 必须在 providerCache 就绪**之后**调用（否则「供应商」计数首屏恒为 0）', () => {
+  // ## 缺陷（外部测试报告定位，我已独立复核）
+  //   「供应商」计数首屏恒显示 0，点一次「刷新」才变正确。
+  //
+  // 根因：`loadPool()` 末尾用 `providerCache` 算「已启用的供应商数」，
+  // 而 `providerCache` 要到 `await api('/admin/providers')` **之后**才赋值。
+  // 原先在 `loadProviders()` 的**第一行**就同步调 `loadPool()` ⇒ 读到的必然是
+  // 模块级初值 `[]` ⇒ 恒为 0。
+  //
+  // ⚠️ **100% 复现，不是偶发**：`loadPool` 内部 `await fetchPoolCounts()`
+  // 至少要等两个网络往返，必然晚于那里的读取。
+  // ⚠️ 「刷新一下就好」这种症状最容易被当成抖动放过去 —— 必须用测试钉住。
+  const js = stripJsComments(panelAsset('/panel/app.js')?.body ?? '')
+  const fn = js.slice(js.indexOf('async function loadProviders'))
+  const assignAt = fn.indexOf('providerCache = res.body.providers')
+  assert.ok(assignAt > 0, '应能定位 providerCache 赋值')
+
+  // ⚠️ 判据要**区分两个分支**，不能只找第一个 `loadPool()`：
+  //    · 赋值**之前**的那个在 `if (!res.ok)` 错误分支里（用旧缓存兜底，是对的）；
+  //    · 真正的「成功路径」调用必须在赋值**之后**。
+  // （我第一版只比较「第一个 loadPool 的位置」，于是命中了错误分支那位，
+  //   报了个假失败 —— 而真正命中的原因是注释里也写了 `loadPool()`，
+  //   项目早已记录过「断言源码前必须剥注释」这条教训。）
+  const afterAssign = fn.slice(assignAt)
+  assert.ok(/loadPool\(\)/.test(afterAssign),
+    '⚠️ 成功路径必须在 providerCache 赋值**之后**调 loadPool()（否则计数恒 0）')
+  // 赋值前只允许出现**错误分支**里那一次兜底调用
+  const beforeAssign = fn.slice(0, assignAt)
+  const beforeCalls = (beforeAssign.match(/loadPool\(\)/g) ?? []).length
+  assert.ok(beforeCalls <= 1,
+    `⚠️ 赋值前最多只应有错误分支的 1 次兜底调用，实际 ${beforeCalls} 次`)
+  assert.ok(/if \(!res\.ok\)[\s\S]{0,200}?loadPool\(\)/.test(beforeAssign),
+    '⚠️ 供应商列表失败时也要渲染计数（用已有缓存兜底），否则统计栏空白')
+})
+
+test('🔴 accent 必须拆成「背景」与「文字」两个令牌（否则修一个坏一个）', () => {
+  // ## 缺陷：深色主题主按钮白字对比度 3.22:1（WCAG AA 正文需 4.5:1）
+  //
+  // ⚠️ 但**不能直接把 `--accent` 调深** —— 它同时被当作**文字色**用在
+  // 深色背景上（`.trend-label.today`、KPI 图标章、`.spark` 描边），
+  // 而那里它原本有 5.97:1 的好成绩。调深会把它拉到约 4.03:1
+  // ⇒ **修好按钮、弄坏文字**（外部报告的建议漏了这一层，我复核时补上）。
+  //
+  // ⇒ 拆成两个令牌：`--accent`（实底，压白字，要够深）
+  //   与 `--accent-text`（当文字/描边，要够亮）。
+  const css = stripCssComments(panelAsset('/panel/style.css')?.body ?? '')
+  assert.ok(/--accent-text:/.test(css), '⚠️ 必须有 --accent-text 令牌')
+  // 三处主题（深色 / 显式浅色 / 跟随系统浅色）都要定义
+  const defs = css.match(/--accent-text:/g) ?? []
+  assert.ok(defs.length >= 3,
+    `⚠️ --accent-text 必须在三处主题都定义（深色 + 显式浅色 + auto），实际 ${defs.length} 处`)
+  // 「当文字用」的三处不得再用 --accent
+  for (const sel of ['.trend-label.today']) {
+    const i = css.indexOf(sel)
+    assert.ok(!/var\(--accent\)/.test(css.slice(i, css.indexOf('}', i))),
+      `⚠️ ${sel} 是文字，应使用 --accent-text（--accent 已调深，会降低可读性）`)
+  }
+  assert.ok(/\.spark path \{ stroke: var\(--kpi, var\(--accent-text\)\)/.test(css),
+    '⚠️ sparkline 描边应使用 --accent-text')
+})
+
+test('⚠️ 必须支持 prefers-reduced-motion（动效敏感用户）', () => {
+  const css = stripCssComments(panelAsset('/panel/style.css')?.body ?? '')
+  assert.ok(/@media\s*\(prefers-reduced-motion:\s*reduce\)/.test(css),
+    '⚠️ 应有 prefers-reduced-motion 降级')
+  // ⚠️ 不能简单删 transition（有代码可能依赖 transitionend），压到极小即可
+  const i = css.indexOf('prefers-reduced-motion')
+  const block = css.slice(i, i + 500)
+  assert.ok(/transition-duration:\s*0?\.\d+ms/.test(block),
+    '⚠️ 应把 transition-duration 压到极小，而不是删掉 transition')
+})
+
+test('⚠️ 供应商卡片的积分必须带单位（与账号弹层口径一致）', () => {
+  // 报告：卡片右上角只有裸数字 `10,296`，而弹层里写的是 `5,049 积分`。
+  // 同一份数据两种口径 ⇒ 用户不知道这个数字是什么。
+  const js = stripJsComments(panelAsset('/panel/app.js')?.body ?? '')
+  const i = js.indexOf('creditCache[prov.id].toLocaleString')
+  assert.ok(i > 0, '应能定位卡片积分渲染')
+  const line = js.slice(i, js.indexOf('\n', i))
+  assert.ok(/积分/.test(line),
+    '⚠️ 卡片积分必须带单位「积分」（与弹层一致）')
+  // ⚠️ title 写在**下一行** —— 不能只扫同一行（我第一版就这么写，假失败了）
+  const stmt = js.slice(i, i + 300)
+  assert.ok(/credits\.title\s*=/.test(stmt), '⚠️ 应给 title 说明这是「全部账号合计」')
+  // ⚠️ 药丸变宽了，CSS 要保证不换行、且长名称不会钻到它下面
+  const css = stripCssComments(panelAsset('/panel/style.css')?.body ?? '')
+  const pill = css.slice(css.indexOf('.prov-card .prov-credits'))
+  assert.ok(/white-space:\s*nowrap/.test(pill.slice(0, pill.indexOf('}'))),
+    '⚠️ 积分药丸不得换行（「积分」两字被折下去会很难看）')
+  assert.ok(/:has\(\.prov-credits:not\(\[hidden\]\)\)/.test(css),
+    '⚠️ 只应在**有积分时**才给名称预留右侧空间（否则没积分的卡片白空一块）')
+})
+
+test('⚠️ 配置页「已存凭据数」必须说明口径（与账号总数不是一回事）', () => {
+  // 报告：并排显示「账号总数 19」与「已存凭据数 20」会让人怀疑有脏数据。
+  // ⚠️ 不改成同一个数（两者口径**本来就不同**：账号池 vs 凭据存储），
+  // 而是在值里写清口径 —— 不加 tooltip（单元格 title 在手机上点不出来）。
+  const js = stripJsComments(panelAsset('/panel/app.js')?.body ?? '')
+  const i = js.indexOf("'已存凭据数'")
+  assert.ok(i > 0, '应有「已存凭据数」这一行')
+  const seg = js.slice(i, js.indexOf('\n', i))
+  assert.ok(/口径/.test(seg), '⚠️ 必须说明口径不同（否则用户以为是脏数据）')
+})
+
+test('⚠️ /v1/models 的每个条目都应有 name（aggregate 曾是整列空白）', () => {
+  // 报告：模型页 19 个 `aggregate/*` 条目名称列为空，看起来像渲染失败。
+  // 根因在后端：`VirtualModel` 本来就有 `name` 字段，只是没往外发。
+  const src = readFileSync('src/index.ts', 'utf8')
+  const i = src.indexOf('AGGREGATE_AUTO}')
+  assert.ok(i > 0, '应能定位 aggregate 条目构造')
+  const seg = src.slice(i, i + 900)
+  assert.ok(/name:\s*'自动选择/.test(seg), '⚠️ aggregate/auto 必须给 name')
+  assert.ok(/name:\s*v\.name\s*\|\|\s*v\.key/.test(seg),
+    '⚠️ 虚拟模型必须有 name（并兜底到 key，避免空单元格）')
+  // ⚠️ 前端也要兜底：少一个字段不该渲染出空单元格
+  const js = stripJsComments(panelAsset('/panel/app.js')?.body ?? '')
+  assert.ok(/m\.name \|\| m\.id/.test(js),
+    '⚠️ 前端名称缺失时应回落到 id（防御性）')
+})

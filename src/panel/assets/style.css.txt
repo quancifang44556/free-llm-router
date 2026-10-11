@@ -1,7 +1,19 @@
 /* free-llm-router 管理面板样式 */
 :root {
   --bg: #0f1115; --panel: #171a21; --panel2: #1d2129; --line: #262b36;
-  --text: #e6e9ef; --dim: #9aa4b2; --accent: #4f8cff;
+  --text: #e6e9ef; --dim: #9aa4b2;
+  /*
+   * ⚠️ accent **拆成两个令牌** —— 它们对底色的要求相反。
+   *
+   * 背景（按钮底、导航选中、进度条填充）：上面压**白字** ⇒ 要够深，
+   *   否则白字对比度不足（WCAG AA 正文需 4.5:1）。
+   * 文字（当强调色文字、描边）：压在**深色背景**上 ⇒ 要够**亮**。
+   *
+   * 原先共用一个 `#4f8cff`：当按钮底时白字只有 **3.22:1（不达标）**，
+   * 但当文字时是 **5.97:1（很好）**。⇒ 无论往哪边调都会修一个、坏另一个。
+   * 拆开后各取所需（实测：白字 on #3b6fd4 = 4.76:1；#4f8cff 当文字 = 5.97:1）。
+   */
+  --accent: #3b6fd4; --accent-text: #4f8cff;
   --ok: #34c77b; --warn: #e0a33e; --err: #ef5f5f;
 }
 * { box-sizing: border-box; }
@@ -340,7 +352,7 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
   display: inline-flex; align-items: center; justify-content: center;
   font-size: 13px; line-height: 1; margin-bottom: 10px;
   background: var(--kpi-soft, rgba(79,140,255,.14));
-  color: var(--kpi, var(--accent));
+  color: var(--kpi, var(--accent-text));
 }
 .kpi-label { font-size: 11px; color: var(--dim); margin-bottom: 3px; }
 /* ⚠️ 数字要大：这是整张卡的主体（参考项目约 28px/900） */
@@ -374,7 +386,7 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
   display: block; width: 100%; height: 28px;
   margin-top: 8px; overflow: visible;
 }
-.spark path { stroke: var(--kpi, var(--accent)); }
+.spark path { stroke: var(--kpi, var(--accent-text)); }
 /* 每张卡用自己色系的线（与图标章同色） */
 .spark-blue path   { stroke: #4f8cff; }
 .spark-purple path { stroke: #a855f7; }
@@ -538,7 +550,7 @@ html[data-theme='light'] .kpi {
   font-size: 10px; color: var(--dim); font-family: ui-monospace, monospace;
   white-space: nowrap;
 }
-.trend-label.today { color: var(--accent); font-weight: 600; }
+.trend-label.today { color: var(--accent-text); font-weight: 600; }
 html[data-theme='light'] .trend-track { background: #e8ebf0; }
 
 /* ─────────── 供应商网格 ─────────── */
@@ -548,8 +560,21 @@ html[data-theme='light'] .trend-track { background: #e8ebf0; }
   cursor: pointer; background: var(--panel); transition: border-color .12s, box-shadow .12s;
   box-shadow: 0 1px 2px rgba(0,0,0,.03);
 }
-.prov-card:hover { border-color: var(--accent); }
-.prov-card .prov-name { font-weight: 600; font-size: 13px; }
+.prov-card:hover { border-color: var(--accent-text); }
+.prov-card .prov-name {
+  font-weight: 600; font-size: 13px;
+  min-width: 0; overflow-wrap: anywhere;
+}
+/*
+ * ⚠️ 右侧要**预留**积分药丸的位置，否则长名称会钻到它下面
+ *（药丸是绝对定位、不参与布局，只能靠内边距让位）。
+ *
+ * ⚠️ 但**不能无条件预留** —— 没有积分的卡片（未登录 / 不支持查积分的家）
+ * 会白空出右侧一大块。故用 `:has()` 只在**药丸真的显示时**才让位。
+ * 现代浏览器（Chrome 105+ / Safari 15.4+）均支持；不支持时只是可能重叠，
+ * 不影响功能。
+ */
+.prov-card:has(.prov-credits:not([hidden])) .prov-name { padding-right: 96px; }
 /* ⚠️ 同上（provider id 也是长串）；顺带补断行 */
 .prov-card .prov-id {
   font-family: ui-monospace, monospace; font-size: 11px; color: var(--dim);
@@ -559,6 +584,25 @@ html[data-theme='light'] .trend-track { background: #e8ebf0; }
 .cap { font-size: 10px; padding: 1px 6px; border-radius: 999px; border: 1px solid var(--line); color: var(--dim); }
 .cap.on { color: var(--ok); border-color: #1e5b3a; }
 .cap.off { color: #6b7280; text-decoration: line-through; }
+
+/* ─────────── 动效降级（`prefers-reduced-motion`） ─────────── */
+/*
+ * ⚠️ 面板只有 4 处 transition（按钮/卡片 hover、主题切换），量很小；
+ * 但对**前庭功能敏感**的用户，任何非必要动效都可能引起不适 ——
+ * 系统里既然开了这个开关，就该尊重它。
+ *
+ * ⚠️ 这里**不是**把 `transition` 全删掉，而是压到 `0.01ms`：
+ * 保留「状态变化会立即生效」的语义（有些代码依赖 `transitionend`），
+ * 同时让肉眼看不到动画。
+ */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+  }
+}
 
 /* ─────────── 弹窗 ─────────── */
 .modal {
@@ -626,7 +670,7 @@ html[data-theme='light'] .trend-track { background: #e8ebf0; }
  */
 html[data-theme='light'] {
   --bg: #f6f7f9; --panel: #ffffff; --panel2: #f1f3f6; --line: #d8dde5;
-  --text: #1a1d23; --dim: #5c6675; --accent: #2563eb;
+  --text: #1a1d23; --dim: #5c6675; --accent: #2563eb; --accent-text: #2563eb;
   --ok: #15803d; --warn: #b45309; --err: #dc2626;
 }
 html[data-theme='light'] input,
@@ -670,6 +714,11 @@ header .icon-btn { min-width: 40px; min-height: 40px; }
   font-size: 11px; font-weight: 600; color: var(--ok);
   background: #14301f; border: 1px solid #1e5b3a; border-radius: 999px;
   padding: 1px 8px;
+  /* ⚠️ 药丸补了「积分」二字后变宽（约 85px），而它是**绝对定位、不占位** ——
+     名称一长就会钻到它下面。两个约束一起给：
+       1. 名称预留出药丸的位置（`padding-right`）；
+       2. 药丸自身**不换行**，避免「积分」两字被折到第二行。 */
+  white-space: nowrap;
 }
 html[data-theme='light'] .prov-card .prov-credits { background: #e7f5ec; border-color: #86c79a; }
 
@@ -684,7 +733,7 @@ html[data-theme='light'] .prov-card .prov-credits { background: #e7f5ec; border-
 @media (prefers-color-scheme: light) {
   html:not([data-theme]) {
     --bg: #f6f7f9; --panel: #ffffff; --panel2: #f1f3f6; --line: #d8dde5;
-    --text: #1a1d23; --dim: #5c6675; --accent: #2563eb;
+    --text: #1a1d23; --dim: #5c6675; --accent: #2563eb; --accent-text: #2563eb;
     --ok: #15803d; --warn: #b45309; --err: #dc2626;
   }
   html:not([data-theme]) input,

@@ -2822,16 +2822,22 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
         env, realms, userDisabledProviders, disabledModels,
       )
       // `auto` 放最前（它是「不指定模型」的入口）
+      // ⚠️ `name` **必须给**：面板「模型」页有「名称」列，
+      // 缺了就是**整列空白**（实测反馈：19 个 aggregate 条目名称列全空，
+      // 看起来像渲染失败）。`VirtualModel` 本来就有 `name` 字段，只是没往外发。
       data.push({
         id: `${AGGREGATE_PROVIDER_ID}/${AGGREGATE_AUTO}`,
         object: 'model',
         owned_by: AGGREGATE_PROVIDER_ID,
+        name: '自动选择（临期优先）',
       })
       for (const v of virtuals) {
         data.push({
           id: `${AGGREGATE_PROVIDER_ID}/${v.key}`,
           object: 'model',
           owned_by: AGGREGATE_PROVIDER_ID,
+          // ⚠️ 兜底到 key：万一某条目 name 为空，也不该给一个空单元格
+          name: v.name || v.key,
         })
       }
     } catch (error) {

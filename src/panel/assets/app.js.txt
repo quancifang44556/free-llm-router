@@ -1222,7 +1222,9 @@ async function loadModels() {
   clear(box)
   if (!res.ok) { const e = document.createElement('p'); e.className = 'hint'; e.textContent = '加载失败'; box.appendChild(e); return }
   const data = (res.body && res.body.data) || []
-  box.appendChild(wrapTable(buildTable(['id', '名称'], data.map((m) => [m.id, m.name || '']))))
+  // ⚠️ 名称缺失时**回落到 id** —— 后端已给名称，但前端不该因为少一个字段
+  // 就渲染出**空单元格**（实测反馈：整列空白看起来像渲染失败）。
+  box.appendChild(wrapTable(buildTable(['id', '名称'], data.map((m) => [m.id, m.name || m.id]))))
   const note = document.createElement('p'); note.className = 'hint'
   note.textContent = '共 ' + data.length + ' 个模型（来自上游 /v3/config）'
   box.appendChild(note)
@@ -1305,7 +1307,22 @@ async function loadProviderCredits() {
 }
 
 async function loadProviders() {
-  loadPool()      // 计数渲染在视图顶部
+  // ⚠️⚠️ **`loadPool()` 不能在这里调**（见下方它的新位置）。
+  //
+  // ## 🔴 为什么（实测缺陷：「供应商」计数首屏恒为 0）
+  //
+  // `loadPool()` 末尾要用 `providerCache` 算「已启用的供应商数」，
+  // 而 `providerCache` 要到本函数**后面**（`await api('/admin/providers')`
+  // 之后）才被赋值。原先在这里同步调用它 ⇒ 读到的是模块级初值 `[]`
+  // ⇒ **首屏恒显示「0 供应商」**，而下方明明渲染了 13 张卡片，自相矛盾。
+  //
+  // ⚠️ 这不是偶发：`loadPool` 内部 `await fetchPoolCounts()` 至少要等两个
+  // 网络往返，**必然**晚于这里对 `providerCache` 的读取 ⇒ 100% 复现。
+  //（点一次「刷新」会正确，因为那时 `providerCache` 已被上一轮填好了 ——
+  //  这种「刷新一下就好」的症状最容易被当成偶发抖动放过去。）
+  //
+  // ⇒ 把 `loadPool()` 移到 `providerCache` / `providerDisabled` 赋值**之后**。
+
   // 先取各供应商的账号数（决定是否自动关闭模型 + 卡片是否显示积分）
   accountCounts = {}
   // ⚠️ 必须合并两个 realm：国际版账号在 global，
@@ -1321,13 +1338,22 @@ async function loadProviders() {
   const box = $('providers')
   clear(box)
   if (!res.ok) {
-    const p = document.createElement('p'); p.className = 'hint'; p.textContent = '加载失败'; box.appendChild(p); return
+    const p = document.createElement('p'); p.className = 'hint'; p.textContent = '加载失败'; box.appendChild(p)
+    // ⚠️ 供应商列表取失败时**仍要渲染计数**（否则整块统计栏是空的，
+    //    用户连「有多少账号」都看不到）——此时用已有的 `providerCache` 兜底。
+    loadPool()
+    return
   }
   providerCache = res.body.providers || []
   // ⚠️ 面板设置（顺序 + 已关闭的家）来自**服务端** —— 「关闭」是真的关掉
   //（模型从 /v1/models 消失、且拒绝路由），不是浏览器本地偏好。
   providerOrder = Array.isArray(res.body.order) ? res.body.order : []
   providerDisabled = new Set(Array.isArray(res.body.disabled) ? res.body.disabled : [])
+
+  // ⚠️ **到这里 `providerCache` / `providerDisabled` 才就绪**，
+  // 现在调 `loadPool()` 才能算出正确的「供应商」计数（见函数开头的说明）。
+  // 不 await：计数是独立的次要请求，不该拖住下面的卡片渲染。
+  loadPool()
 
   // ⚠️ **按服务端设置排序**：`providerOrder` 是用户拖出来的顺序，
   // 不在里面的（新加的供应商）**按注册表原顺序追加在后面** ——
@@ -1355,7 +1381,11 @@ async function loadProviders() {
     credits.hidden = true
     if (typeof creditCache[prov.id] === 'number') {
       credits.hidden = false
-      credits.textContent = creditCache[prov.id].toLocaleString('zh-CN')
+      // ⚠️ **必须带单位**：原来只有一个裸数字（`10,296`），
+      // 而账号弹层里同样的值写的是「5,049 积分」—— 同一份数据两种口径，
+      // 用户不知道这个数字是什么（实测反馈）。
+      credits.textContent = creditCache[prov.id].toLocaleString('zh-CN') + ' 积分'
+      credits.title = '该供应商全部账号的剩余积分合计（实时查上游）'
     }
     card.appendChild(credits)
 
@@ -2044,7 +2074,13 @@ async function loadConfig() {
   }
 
   const cred = await api('/admin/credentials?realm=cn')
-  if (cred.ok && cred.body) pairs.push(['已存凭据数', cred.body.count])
+  // ⚠️ 「已存凭据数」与「账号总数」口径**不同**（前者是凭据存储里的条数，
+  // 后者是账号池里能被选中的账号数），可能相差 1~2。
+  // 并排展示会让人怀疑有脏数据 ⇒ 把口径写进**值**里说明清楚。
+  //（不加 tooltip：表格单元格的 title 在手机上点不出来，等于没有。）
+  if (cred.ok && cred.body) {
+    pairs.push(['已存凭据数', `${cred.body.count}（凭据存储条数；与账号总数口径不同，可能相差 1~2）`])
+  }
 
   // 任务计划构成（让用户知道会自动做什么）
   pairs.push(['Cron 触发', '每小时 1 次（0 * * * *）'],
