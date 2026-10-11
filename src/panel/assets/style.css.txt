@@ -637,12 +637,16 @@ html[data-theme='light'] .trend-track { background: #e8ebf0; }
 .modal-body { padding: 14px 16px; overflow: auto; }
 .mtab-panel[hidden] { display: none !important; }
 /*
- * ⚠️ 弹窗里的卡片**保持与外部同一底色**（`--panel`）。
- * 原先改成 `--panel2`，而 `--panel2` 正是 `.bar-track`/`.switch` 等
- * **控件底色**用的值 —— 卡片和控件撞色会让层级读不出来。
- * 弹窗本身已有边框与遮罩，不需要再靠底色区分。
+ * ⚠️ 弹窗里的卡片**必须用 `--panel2`**（比弹窗底亮/暗一档）。
+ *
+ * ⚠️ 我一度把它改成 `--panel`「统一底色」，那是**错的**：
+ * `.modal-box` 本身就是 `--panel` ⇒ 卡片与弹窗底**完全相同**
+ *（实测对比度 **1.00:1**）⇒ 卡片**看不见**，只剩一圈边框。
+ *
+ * ⚠️ 这正是「相邻嵌套面必须有视觉差异」那条纪律：
+ * 弹窗（`--panel`）与其中的卡片（`--panel2`）必须差一档。
  */
-.modal .card { background: var(--panel); }
+.modal .card { background: var(--panel2); }
 /*
  * ⚠️ 二级弹窗（`openInfo`）的内容是**表格 + 说明**，
  * 与主弹窗的卡片列表形态不同 ⇒ 统一给它一点内部节奏：

@@ -455,17 +455,3 @@ export function summarizeUsage(records: UsageRecord[], now: number = Date.now())
   return summarizeUsageState(migrateUsageState(records, now), 0, now)
 }
 
-/**
- * 小时桶标签（`MM-DD HH:00`，UTC+8）。
- *
- * ⚠️ 保留此函数名与格式：面板的「按小时」旧视图与既有单测都在用。
- * 新代码请优先用 {@link hourKeyUtc8}。
- */
-export function hourBucketUtc8(at: number): string {
-  const CST_OFFSET = 8 * 60 * 60 * 1000
-  const d = new Date(at + CST_OFFSET)
-  const mm = String(d.getUTCMonth() + 1).padStart(2, '0')
-  const dd = String(d.getUTCDate()).padStart(2, '0')
-  const hh = String(d.getUTCHours()).padStart(2, '0')
-  return `${mm}-${dd} ${hh}:00`
-}

@@ -202,16 +202,6 @@ function decodeBase64Url(value: string): string {
   return new TextDecoder().decode(bytes)
 }
 
-/**
- * 解析凭据的过期时刻（毫秒）。
- *
- * 取值优先级：`expires_at`（显式字段）→ **JWT 的 `exp`**（见上方说明）。
- */
-export function raccoonCredentialExpiresAtMs(credential: ProviderCredential): number | undefined {
-  if (Number.isFinite(credential.expiresAt) && credential.expiresAt > 0) return credential.expiresAt
-  return decodeJwtExpMs(credential.accessToken)
-}
-
 // ── 手机号加密 ──────────────────────────────────────────────────────
 
 /**

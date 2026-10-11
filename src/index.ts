@@ -1554,12 +1554,16 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
     // > 那 7 个都是「返回 loginUrl → 前端 window.open → 轮询 login.poll」。
     // > 短信登录**没有 URL 可打开**，故走「发验证码 → 用户输入 → 提交」三步。
     //
-    // ## ✅ 为什么它在 Workers 上**可行**（与微信扫码相反）
+    // ## ✅ 为什么它在 Workers 上**可行**
     //
-    // 短信路径是**纯 HTTP 三步**，`loomy-oauth.ts` 里 `127.0.0.1` 出现 **0 次**
-    //（实测 grep）—— 不需要任何本地回调监听。
-    // ⚠️ 而 loomy 的**微信扫码**路径需要本地服务器承载弹窗页
-    //（`loomy-wechat-login.ts:11-13` 的 `127.0.0.1:随机端口`），那条**不可行**。
+    // 短信路径是**纯 HTTP 三步**，不需要任何本地回调监听。
+    //
+    // ⚠️ **更正**：此处曾写「loomy 的微信扫码需要本地服务器承载弹窗页 ⇒ 不可行」。
+    // **那个判断是错的** —— 它把「展示二维码的 HTML 壳」与「登录协议本身」
+    // 混为一谈。微信流程的每个网络调用都是出站 HTTPS
+    //（`open.weixin.qq.com` / `long.open.weixin.qq.com` / `account.xfinfr.com`），
+    // 而展示二维码本该由面板渲染 `buildLoomyWechatQrImageUrl(uuid)` 承担。
+    // 详见 `providers/loomy.ts` 的 `capabilities.login` 注释。
     //
     // ## 流程
     //

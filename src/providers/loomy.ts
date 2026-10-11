@@ -1088,18 +1088,30 @@ export const loomyProvider: Provider = {
     /**
      * ✅ **短信验证码登录已接线**（`/admin/providers/login/start` + `/login/loomy/sms`）。
      *
-     * ## ⚠️ 它为什么在 Workers 上可行（与 loomy 的微信扫码相反）
+     * 短信路径是**纯 HTTP 三步**（发码 → 用户输入 → 校验），不需要任何本地监听。
      *
-     * 短信路径是**纯 HTTP 三步**（发码 → 用户输入 → 校验），
-     * `loomy-oauth.ts` 里 `127.0.0.1` 出现 **0 次**（实测 grep）——
-     * 不需要任何本地回调监听。
+     * ## 🔴 更正：微信扫码那条**也是可行的**（本文件曾错误地判定它不可行）
      *
-     * ⚠️ 而**微信扫码**那条需要本地服务器承载弹窗页
-     *（`loomy-wechat-login.ts:11-13`：`127.0.0.1:随机端口` 上的 `/wechat/qr`
-     * 与 `/wechat/poll`），Workers 拉不起本地端口 ⇒ **那条不可行**。
-     * 故面板上 loomy 只提供**短信**一种方式。
+     * 本注释此前写着「微信扫码需要本地服务器承载弹窗页 ⇒ Workers 不可行」。
+     * **那个判断是错的** —— 它把「承载二维码**展示页**」与「登录协议本身」
+     * 混为一谈了。实测本文件里微信流程的每一个网络调用都是**出站 HTTPS**：
      *
-     * 依据：参考实现 `deepseek-harness-codearts/src/loomy-oauth.ts:6-7,131-186`。
+     * | 步骤 | 端点 |
+     * |---|---|
+     * | 拉授权页取 uuid | `open.weixin.qq.com/connect/qrconnect` |
+     * | 长轮询扫码结果 | `long.open.weixin.qq.com/connect/l/qrconnect` |
+     * | 二维码图片 | `open.weixin.qq.com/connect/qrcode/<uuid>`（**纯字符串拼接**，无 I/O） |
+     * | 绑定 / 发码 / 校验 / 跳过 | `account.xfinfr.com`（`postLoomyAccount`） |
+     *
+     * `grep -nE 'createServer|\.listen\(|127\.0\.0\.1|localhost'` 在本文件里
+     * **只命中注释、零命中代码** ⇒ 没有任何 socket。
+     *
+     * ⚠️ 参考实现里那个 `createServer` **只是给浏览器展示二维码用的 HTML 壳**
+     *（它需要起一个本地页把二维码画出来）—— 那件事**本该由本服务的面板承担**
+     *（面板直接渲染 `buildLoomyWechatQrImageUrl(uuid)` 即可）。
+     *
+     * ⚠️ 故 `login: true` 是**如实的**：短信已接线，微信扫码**可以接线**
+     *（属于待接功能，不是「不可行」）。
      */
     login: true,
     listModels: true,

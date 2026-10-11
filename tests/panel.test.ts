@@ -1736,6 +1736,14 @@ test('🔴 二级弹窗不得使用无 CSS 定义的类名（.muted 曾是死类
   assert.ok(/border-radius:\s*16px/.test(body),
     '⚠️ .modal-box 圆角应与 .panel/.kpi 一致（16px）')
   assert.ok(/box-shadow/.test(body), '⚠️ .modal-box 应有阴影（与卡片系统一致）')
+  // ⚠️⚠️ 弹窗内的卡片**必须与弹窗底差一档**，否则卡片「隐形」。
+  // `.modal-box` 用的是 `--panel` ⇒ 卡片若也用 `--panel` 就是**同一颜色**
+  //（实测对比度 1.00:1，只剩一圈边框）。这里钉住它必须是 `--panel2`。
+  //（我一度把它「统一」成 --panel，是这个断言该拦住的那类错误。）
+  const cardRule = css.slice(css.indexOf('.modal .card'))
+  const cardBody = cardRule.slice(0, cardRule.indexOf('}'))
+  assert.ok(/background:\s*var\(--panel2\)/.test(cardBody),
+    '⚠️ .modal .card 必须用 --panel2（用 --panel 会与 .modal-box 同色、卡片隐形）')
 })
 
 test('🔴 聚合只暴露白名单两个模型（用户要求）', () => {

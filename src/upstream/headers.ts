@@ -411,7 +411,3 @@ export function randomHex32(): string {
   return out
 }
 
-/** 生成 UUID v4（`crypto.randomUUID` 在 Workers 可用）。 */
-export function randomUuid(): string {
-  return crypto.randomUUID()
-}

@@ -671,24 +671,6 @@ export function parseRetryAfterMs(headers: Headers | undefined): number | undefi
   return Number.isFinite(at) ? Math.max(0, at - Date.now()) : undefined
 }
 
-/** 从错误体里抽出人可读片段（禁止把整坨 JSON 抛给用户）。 */
-export function readableDetail(body: string): string {
-  const text = body.trim()
-  if (text === '') return '（上游未返回错误详情）'
-  try {
-    const data = JSON.parse(text) as { error?: unknown; message?: unknown; msg?: unknown }
-    const nested = typeof data.error === 'object' && data.error !== null
-      ? (data.error as { message?: unknown }).message
-      : data.error
-    const parts = [data.message, nested, data.msg]
-      .filter((v): v is string => typeof v === 'string' && v.length > 0)
-    if (parts.length > 0) return parts.join(' ')
-  } catch {
-    // 非 JSON：直接截断原文
-  }
-  return text.length > 500 ? `${text.slice(0, 500)}…` : text
-}
-
 /**
  * 把一次失败的 HTTP 响应归类为语义化的错误。
  *
@@ -747,16 +729,6 @@ export function shouldRotateForKind(kind: OpencodeErrorKind): boolean {
 }
 
 // ─────────────────────────── Provider ───────────────────────────
-
-/** 是否免费模型（**未知模型返回 false**）。 */
-export function isFreeOpencodeModel(id: string): boolean {
-  return FREE_IDS.has(id)
-}
-
-/** 是否在我们已实测可达的通道里（**未知模型返回 false**）。 */
-export function isReachableOpencodeModel(id: string): boolean {
-  return REACHABLE_IDS.has(id)
-}
 
 /**
  * 拉模型目录并合并能力元数据。
