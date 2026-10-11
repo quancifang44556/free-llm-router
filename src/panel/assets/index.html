@@ -8,7 +8,7 @@
 </head>
 <body>
 <header>
-  <div class="brand"><h1>free-llm-router</h1><span id="auth-status" class="pill"></span></div>
+  <div class="brand"><h1>free-llm-router</h1><span id="auth-status" class="pill" hidden></span></div>
   <div class="auth">
     <!--
   ⚠️ 主题图标用 SVG 而不是 emoji：emoji 的字形随系统差异很大（大小、基线、
@@ -40,7 +40,6 @@
   <button class="nav-item active" data-view="providers">供应商与账号</button>
   <button class="nav-item" data-view="tasks">任务中心</button>
   <button class="nav-item" data-view="usage">用量</button>
-  <button class="nav-item" data-view="packages">积分包</button>
   <button class="nav-item" data-view="models">模型</button>
   <button class="nav-item" data-view="config">配置</button>
   <button class="nav-item" data-view="logs">日志</button>
@@ -90,20 +89,26 @@
   <section class="view" id="view-usage" hidden>
     <h2>用量 <button class="ghost" id="refresh-usage">刷新</button>
       <button class="ghost" id="clear-usage">清空</button></h2>
+
+    <!-- 时间窗切换（今日 / 近 7 天 / 近 30 天 / 全部） -->
+    <div id="usage-range" class="seg" role="tablist" aria-label="时间范围"></div>
+
     <div id="usage-summary" class="counts"></div>
-    <h3>按小时</h3>
+
+    <!-- ⚠️ 数据边界说明：明细只留最近 500 条，而按天聚合留 90 天。
+         两者不是一回事，必须说清 —— 否则用户会以为「总数不对」。 -->
+    <p class="hint" id="usage-scope"></p>
+
+    <h3 id="usage-trend-title">按天趋势</h3>
+    <div id="usage-trend" class="trend"></div>
+
+    <h3 id="usage-hours-title">按小时</h3>
     <div id="usage-hours" class="bars"></div>
+
     <h3>按模型</h3>
     <div id="usage-models"></div>
     <h3>按账号</h3>
     <div id="usage-accounts"></div>
-  </section>
-
-  <!-- ───────── 积分包 ───────── -->
-  <section class="view" id="view-packages" hidden>
-    <h2>积分包 <button class="ghost" id="refresh-packages">实时查询</button></h2>
-    <p class="hint">逐账号实时查上游余额（串行，避免触发风控）。</p>
-    <div id="packages"></div>
   </section>
 
   <!-- ───────── 模型 ───────── -->

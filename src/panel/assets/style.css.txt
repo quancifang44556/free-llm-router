@@ -163,6 +163,57 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 .bar-fill.bad { background: var(--err); }
 .bar-val { width: 60px; text-align: right; color: var(--dim); font-variant-numeric: tabular-nums; }
 
+/* ─────────── 时间窗分段控件（用量页） ─────────── */
+.seg {
+  display: inline-flex; gap: 2px; padding: 3px; margin-bottom: 12px;
+  background: var(--panel2); border: 1px solid var(--line); border-radius: 8px;
+}
+.seg-item {
+  background: transparent; border: 0; color: var(--dim);
+  font-size: 12px; padding: 5px 12px; border-radius: 6px; cursor: pointer;
+  font-family: inherit; transition: background .12s, color .12s;
+}
+.seg-item:hover { color: var(--text); }
+.seg-item.active { background: var(--accent); color: #fff; }
+html[data-theme='light'] .seg-item.active { color: #fff; }
+
+/* ─────────── 按天趋势柱 ─────────── */
+/*
+ * ⚠️ 用 flex 横排 + 每列固定最小宽度，而不是等分整行：
+ * 等分会让「30 天窗口」的柱子细到看不见，而「唯一一根柱」被拉成整条白块
+ *（参考实现记录过这个真实缺陷）。
+ */
+.trend {
+  display: flex; align-items: flex-end; gap: 4px;
+  overflow-x: auto; padding: 8px 2px 0; margin-bottom: 12px;
+  border: 1px solid var(--line); border-radius: 8px; background: var(--panel2);
+}
+.trend-col {
+  flex: 1 0 26px; min-width: 26px;
+  display: flex; flex-direction: column; align-items: center; gap: 4px;
+}
+.trend-val {
+  font-size: 10px; color: var(--dim); font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.trend-track {
+  width: 100%; height: 64px; display: flex; align-items: flex-end;
+  background: #10131a; border-radius: 4px; overflow: hidden;
+}
+.trend-fill {
+  width: 100%; background: var(--accent); border-radius: 3px 3px 0 0;
+  min-height: 2px; transition: height .15s;
+}
+.trend-fill.bad { background: var(--err); }
+/* 无数据的那天：一条极矮的底衬，表示「这天存在但没请求」 */
+.trend-fill.empty { background: var(--line); }
+.trend-label {
+  font-size: 10px; color: var(--dim); font-family: ui-monospace, monospace;
+  white-space: nowrap;
+}
+.trend-label.today { color: var(--accent); font-weight: 600; }
+html[data-theme='light'] .trend-track { background: #e8ebf0; }
+
 /* ─────────── 供应商网格 ─────────── */
 .prov-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 10px; }
 .prov-card {
@@ -501,15 +552,38 @@ main > * { min-width: 0; }
  * 按下即开始拖动，click 事件不会触发。
  * `cursor: grab` 明示可拖；手机上由浏览器映射成长按拖动。
  */
+/*
+ * 拖动手柄。
+ *
+ * ## 🔴 `touch-action: none` 是 **iOS 能拖起来的关键**
+ *
+ * 用户报「拖动排序在 iOS 上只会选择文字」。原因是 iOS Safari 对普通元素
+ * **根本不支持 HTML5 拖放**（`draggable` 只对链接/图片等原生可拖元素有效），
+ * 故已改用 Pointer Events（见 app.js 的说明）。
+ *
+ * 但换事件还不够：**必须显式关掉浏览器的手势接管**，否则 iOS 会把长按
+ * 解释成文字选择 / 滚动，`pointermove` 根本不会持续派发。
+ * `touch-action: none` 就是那个开关。
+ *
+ * ⚠️ 只加在**手柄**上（不是整行）—— 加在整行会让列表无法滚动。
+ * ⚠️ `user-select: none` 是第二道防线（桌面端长按拖时也会选中文字）。
+ */
 .drag-handle {
   cursor: grab;
   color: var(--dim);
   font-size: 18px;
   line-height: 1;
-  padding: 0 4px;
+  /* 加大触摸目标：移动端 4px 内边距太窄，手指按不准 */
+  padding: 6px 10px;
+  margin: -6px -6px -6px -2px;
   user-select: none;
+  -webkit-user-select: none;
+  touch-action: none;
 }
 .drag-handle:active { cursor: grabbing; }
+
+/* 拖动进行中：禁止整页选中文字（iOS 上尤其明显） */
+.dragging-active { user-select: none; -webkit-user-select: none; }
 
 /* 拖动中的行：降透明度，让「正在拖谁」一目了然 */
 .card.dragging { opacity: 0.45; }

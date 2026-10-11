@@ -38,10 +38,23 @@ async function api(path, options) {
   return { status: res.status, ok: res.ok, body: body }
 }
 
+/**
+ * 设置顶部密钥状态。
+ *
+ * ⚠️ **用户要求删掉「密钥有效」** —— 顶部常态显示它没有信息量（能打开面板
+ * 就说明密钥有效）。故现在：
+ * - 成功时**整个 pill 隐藏**；
+ * - 只有**出错**（密钥无效/未设置）时才显示，因为那时的提示是有用的。
+ *
+ * ⚠️ 用 `hidden` 属性而不是 `display:none` 内联样式：前者可被
+ * `[hidden]` 的 CSS 规则统一处理，也不会在元素上留垃圾样式。
+ */
 function setAuth(message, ok) {
   const el = $('auth-status')
+  if (ok) { el.hidden = true; el.textContent = ''; el.className = 'pill'; return }
+  el.hidden = false
   el.textContent = message
-  el.className = 'pill ' + (ok ? 'ok' : 'err')
+  el.className = 'pill err'
 }
 
 function show(id, value) {
@@ -154,7 +167,6 @@ const VIEW_LOADERS = {
   // 故这里**只调它一个** —— 两个都调会对同一份账号列表白打两遍上游。
   tasks: () => loadAccounts(),
   usage: () => loadUsage(),
-  packages: () => { /* 手动触发（实时查上游，有成本） */ },
   models: () => { /* 手动触发 */ },
   config: () => loadConfig(),
   logs: () => loadLogs(),
@@ -646,25 +658,171 @@ async function loadTaskStatus(continuePolling) {
 
 // ─────────────────────────── 用量 ───────────────────────────
 
-async function loadUsage() {
-  const res = await api('/admin/usage?realm=cn')
-  if (!res.ok) return
-  const d = res.body
+/**
+ * 时间窗选项。
+ *
+ * ⚠️ `days` 与服务端约定一致（1 = 今日；0 = 全部）。用户明确要求
+ * 「切换 1 天 / 7 天 / 30 天」，并选了「再加一个全部」。
+ */
+const USAGE_RANGES = [
+  { key: 'today', label: '今日', days: 1 },
+  { key: '7d', label: '近 7 天', days: 7 },
+  { key: '30d', label: '近 30 天', days: 30 },
+  { key: 'all', label: '全部', days: 0 },
+]
 
-  const box = $('usage-summary')
+/** 当前选中的时间窗（**记住用户选择**，刷新后不跳回默认）。 */
+let usageRangeKey = localStorage.getItem('wb_usage_range') || 'today'
+if (!USAGE_RANGES.some((r) => r.key === usageRangeKey)) usageRangeKey = 'today'
+
+/** 当前窗口的 `days` 值。 */
+function usageDays() {
+  const hit = USAGE_RANGES.find((r) => r.key === usageRangeKey)
+  return hit === undefined ? 1 : hit.days
+}
+
+/** 千分位（避免 1234567 这种读不出来的数字）。 */
+function fmtNum(n) {
+  const v = typeof n === 'number' && Number.isFinite(n) ? n : 0
+  return v.toLocaleString('zh-CN')
+}
+
+/**
+ * token 数量的紧凑格式（`1.2M` / `34.5k`）。
+ *
+ * ⚠️ 只用于**柱子标签**这种空间紧张处；汇总卡片仍用千分位全量 ——
+ * 汇总处用户要的是精确值，紧凑格式会丢掉有效数字。
+ */
+function fmtTokensShort(n) {
+  const v = typeof n === 'number' && Number.isFinite(n) && n > 0 ? n : 0
+  if (v >= 1e9) return (v / 1e9).toFixed(1).replace(/\.0$/, '') + 'B'
+  if (v >= 1e6) return (v / 1e6).toFixed(1).replace(/\.0$/, '') + 'M'
+  if (v >= 1e3) return (v / 1e3).toFixed(1).replace(/\.0$/, '') + 'k'
+  return String(v)
+}
+
+/**
+ * 日键 `YYYY-MM-DD` → 短标签 `MM-DD`（非法输入给空串，由调用方降级）。
+ */
+function dayShortLabel(day) {
+  if (typeof day !== 'string' || day.length < 10) return ''
+  const m = day.slice(5, 7)
+  const d = day.slice(8, 10)
+  return /^\d{2}$/.test(m) && /^\d{2}$/.test(d) ? `${m}-${d}` : ''
+}
+
+/**
+ * 渲染时间窗切换（分段控件）。
+ *
+ * ⚠️ 一次性建好按钮，切换时只改 `active` 类 —— 不每次重建 DOM，
+ * 这样点击手感与焦点都不会丢。
+ */
+function renderUsageRanges() {
+  const box = $('usage-range')
   clear(box)
-  box.appendChild(countBlock('总请求', d.total))
-  box.appendChild(countBlock('成功', d.ok))
-  box.appendChild(countBlock('失败', d.failed))
-  box.appendChild(countBlock('输入 token', d.inputTokens))
-  box.appendChild(countBlock('输出 token', d.outputTokens))
-  box.appendChild(countBlock('平均耗时 ms', d.avgMs))
+  for (const r of USAGE_RANGES) {
+    const b = document.createElement('button')
+    b.type = 'button'
+    b.className = 'seg-item' + (r.key === usageRangeKey ? ' active' : '')
+    b.textContent = r.label
+    b.onclick = () => {
+      if (usageRangeKey === r.key) return
+      usageRangeKey = r.key
+      localStorage.setItem('wb_usage_range', r.key)
+      void loadUsage()
+    }
+    box.appendChild(b)
+  }
+}
 
-  // 按小时（柱状）
-  const hours = $('usage-hours')
-  clear(hours)
-  const maxCount = Math.max(1, ...(d.byHour || []).map((h) => h.count))
-  for (const h of (d.byHour || [])) {
+/**
+ * 按天趋势柱（照参考实现 `token-ledger-panel.js` 的取舍）。
+ *
+ * ⚠️ **缺数据的天不补零**：补零要造日历序列，会让「近 30 天」在数据稀疏时
+ * 出现一长排空柱，观感差且信息量为零。
+ *
+ * ⚠️ **柱高必须有上限**（参考实现记录的真实缺陷）：单日窗口下「今日」
+ * 既是最大值又是它自己，比值恒为 1 ⇒ 高度 100% ⇒ 唯一那根柱撑满容器，
+ * 看着像「一整条白块」。故最大值那根留白、其余压进 [保底, 上限] 区间。
+ */
+function renderUsageTrend(byDay, windowDays) {
+  const box = $('usage-trend')
+  const title = $('usage-trend-title')
+  clear(box)
+
+  const bars = Array.isArray(byDay) ? byDay : []
+  // ⚠️ 单日窗口下趋势没有意义（只有一根柱）——如实说明，而不是画一根怪柱。
+  if (windowDays === 1 || bars.length <= 1) {
+    title.textContent = windowDays === 1 ? '按天趋势（今日单日，请看下方「按小时」）' : '按天趋势'
+  } else {
+    title.textContent = '按天趋势'
+  }
+  if (bars.length === 0) {
+    const p = document.createElement('p'); p.className = 'hint'
+    p.textContent = '该窗口内没有请求记录（用 /v1/chat/completions 发一次对话就会出现）'
+    box.appendChild(p)
+    return
+  }
+
+  const maxTokens = Math.max(0, ...bars.map((b) => b.tokens))
+  const count = bars.length
+  const todayKey = bars[0] && bars[0].day ? bars[0].day : ''
+  for (const b of bars) {
+    const col = document.createElement('div')
+    col.className = 'trend-col'
+    col.title = `${b.day}\n请求 ${fmtNum(b.count)}（失败 ${fmtNum(b.failed)}）\n`
+      + `输入 ${fmtNum(b.input)} · 输出 ${fmtNum(b.output)}`
+
+    const val = document.createElement('span'); val.className = 'trend-val'
+    val.textContent = b.tokens > 0 ? fmtTokensShort(b.tokens) : ''
+
+    const track = document.createElement('div'); track.className = 'trend-track'
+    const fill = document.createElement('div')
+    fill.className = 'trend-fill' + (b.failed > 0 ? ' bad' : '')
+    // 柱高：数量为 0 时给 0（不画），否则按比例 + 保底
+    let pct = 0
+    if (b.tokens > 0 && maxTokens > 0) {
+      if (count <= 1) pct = 72
+      else pct = Math.round(4 + (b.tokens / maxTokens) * 84)
+      pct = Math.min(88, Math.max(4, pct))
+    }
+    fill.style.height = pct > 0 ? pct + '%' : '2px'
+    if (pct === 0) fill.classList.add('empty')
+    track.appendChild(fill)
+
+    const lab = document.createElement('span'); lab.className = 'trend-label'
+    lab.textContent = dayShortLabel(b.day)
+    if (b.day === todayKey) lab.classList.add('today')
+
+    col.appendChild(val); col.appendChild(track); col.appendChild(lab)
+    box.appendChild(col)
+  }
+}
+
+/** 渲染「按小时」（仅今日窗口有意义）。 */
+function renderUsageHours(byHour, windowDays) {
+  const box = $('usage-hours')
+  const title = $('usage-hours-title')
+  clear(box)
+  // ⚠️ 跨天的小时标签会互相覆盖（两个不同的「09:00」），合并起来没有解释力。
+  // 故非「今日」窗口时**如实说明并隐藏**，而不是给一张误导的图。
+  if (windowDays !== 1) {
+    title.textContent = '按小时（只有「今日」窗口按小时统计）'
+    const p = document.createElement('p'); p.className = 'hint'
+    p.textContent = '切换到「今日」可看按小时分布；更长窗口请用上方的「按天趋势」。'
+    box.appendChild(p)
+    return
+  }
+  title.textContent = '按小时（今日）'
+  const hours = Array.isArray(byHour) ? byHour : []
+  if (hours.length === 0) {
+    const p = document.createElement('p'); p.className = 'hint'
+    p.textContent = '今天还没有请求记录。'
+    box.appendChild(p)
+    return
+  }
+  const maxCount = Math.max(1, ...hours.map((h) => h.count))
+  for (const h of hours) {
     const row = document.createElement('div'); row.className = 'bar-row'
     const label = document.createElement('span'); label.className = 'bar-label'; label.textContent = h.hour
     const track = document.createElement('div'); track.className = 'bar-track'
@@ -673,94 +831,139 @@ async function loadUsage() {
     fill.style.width = Math.round((h.count / maxCount) * 100) + '%'
     track.appendChild(fill)
     const val = document.createElement('span'); val.className = 'bar-val'
-    val.textContent = h.count + (h.failed ? ' / ' + h.failed : '')
+    val.textContent = fmtNum(h.count) + (h.failed ? ' / ' + fmtNum(h.failed) : '')
     row.appendChild(label); row.appendChild(track); row.appendChild(val)
-    hours.appendChild(row)
+    box.appendChild(row)
   }
-  if ((d.byHour || []).length === 0) {
+}
+
+/**
+ * 加载用量。
+ *
+ * ## 🔴 这个页面曾经「数字永远不动」（用户报「用量怎么始终是 500」）
+ *
+ * 那不是 HTTP 500 —— 是旧后端的 `total` **撞上了明细环形缓冲的上限**
+ *（500 条），且**没有时间窗概念**。现在后端汇总走**按天聚合**（保留 90 天），
+ * 窗口内的数字不再被封顶，且支持四个窗口。
+ *
+ * ⚠️ 页面必须**如实说明两份数据的边界**（明细 500 条 / 聚合 90 天）——
+ * 否则用户会拿「明细列表只有 12 行」去质疑「总数 300」。
+ */
+async function loadUsage() {
+  renderUsageRanges()
+  const days = usageDays()
+
+  // ⚠️ 两个 realm 都查并**相加**：只查 cn 会漏掉国际版（workbuddy）的用量。
+  // 串行请求（同时出站连接上限 6，且并行没有收益）。
+  const parts = []
+  for (const realm of ['cn', 'global']) {
+    const res = await api(`/admin/usage?realm=${realm}&days=${days}`)
+    if (res.ok) parts.push(res.body)
+  }
+  if (parts.length === 0) {
+    const box = $('usage-summary'); clear(box)
     const p = document.createElement('p'); p.className = 'hint'
-    p.textContent = '还没有请求记录（用 /v1/chat/completions 发一次对话就会出现）'
-    hours.appendChild(p)
+    p.textContent = '加载失败（密钥或网络问题）。'
+    box.appendChild(p)
+    return
   }
 
+  // 合并两个 realm 的结果
+  const sum = (k) => parts.reduce((n, p) => n + (typeof p[k] === 'number' ? p[k] : 0), 0)
+  const mergeDims = (key, idKey) => {
+    const map = new Map()
+    for (const p of parts) {
+      for (const row of (p[key] || [])) {
+        const id = row[idKey]
+        const cur = map.get(id) || { count: 0, input: 0, output: 0, failed: 0 }
+        cur.count += row.count; cur.input += row.input
+        cur.output += row.output; cur.failed += row.failed
+        map.set(id, cur)
+      }
+    }
+    return [...map.entries()]
+      .map(([id, v]) => Object.assign({ [idKey]: id }, v))
+      .sort((a, b) => b.count - a.count)
+  }
+  const byDayMap = new Map()
+  for (const p of parts) {
+    for (const b of (p.byDay || [])) {
+      const cur = byDayMap.get(b.day) || { day: b.day, count: 0, failed: 0, input: 0, output: 0, tokens: 0 }
+      cur.count += b.count; cur.failed += b.failed
+      cur.input += b.input; cur.output += b.output; cur.tokens += b.tokens
+      byDayMap.set(b.day, cur)
+    }
+  }
+  const byHourMap = new Map()
+  for (const p of parts) {
+    for (const h of (p.byHour || [])) {
+      const cur = byHourMap.get(h.hour) || { hour: h.hour, count: 0, failed: 0 }
+      cur.count += h.count; cur.failed += h.failed
+      byHourMap.set(h.hour, cur)
+    }
+  }
+
+  const total = sum('total')
+  const ok = sum('ok')
+  const failed = sum('failed')
+  const inputTokens = sum('inputTokens')
+  const outputTokens = sum('outputTokens')
+  const avgMs = total === 0 ? 0 : Math.round(parts.reduce((n, p) => n + p.avgMs * p.total, 0) / total)
+  const windowDays = parts[0].windowDays
+  const activeDays = sum('activeDays')
+  const detailCapped = parts.some((p) => p.detailCapped)
+
+  // ── 汇总卡片 ──
+  const box = $('usage-summary')
+  clear(box)
+  box.appendChild(countBlock('总请求', fmtNum(total)))
+  box.appendChild(countBlock('成功', fmtNum(ok)))
+  box.appendChild(countBlock('失败', fmtNum(failed)))
+  box.appendChild(countBlock('输入 token', fmtNum(inputTokens)))
+  box.appendChild(countBlock('输出 token', fmtNum(outputTokens)))
+  box.appendChild(countBlock('平均耗时 ms', fmtNum(avgMs)))
+
+  // ── 数据边界说明（关键：解释「为什么明细比总数少」）──
+  const scope = $('usage-scope')
+  const rangeLabel = (USAGE_RANGES.find((r) => r.key === usageRangeKey) || {}).label || '今日'
+  if (total === 0) {
+    scope.textContent = `${rangeLabel}：没有请求记录。`
+  } else {
+    // ⚠️ 说明里必须同时点出「按天聚合」与「明细 500 条」两件事 ——
+    // 只说其一都会让用户误判。
+    let text = `${rangeLabel}：${activeDays} 天有记录，共 ${fmtNum(total)} 次请求`
+    text += `（明细列表只保留最近 500 条，按天聚合保留 90 天；所以明细行数可能少于总数）`
+    if (detailCapped) text += '。当前明细已满，更早的明细不可见，但不影响上方统计'
+    scope.textContent = text
+  }
+
+  renderUsageTrend([...byDayMap.values()].sort((a, b) => b.day.localeCompare(a.day)), windowDays)
+  renderUsageHours([...byHourMap.values()].sort((a, b) => a.hour.localeCompare(b.hour)), windowDays)
+
   const models = $('usage-models'); clear(models)
-  if ((d.byModel || []).length) {
+  const modelRows = mergeDims('byModel', 'model')
+  if (modelRows.length) {
     models.appendChild(wrapTable(buildTable(
       ['模型', '请求', '输入', '输出', '失败'],
-      d.byModel.map((m) => [m.model, m.count, m.input, m.output, m.failed]),
+      modelRows.map((m) => [m.model, fmtNum(m.count), fmtNum(m.input), fmtNum(m.output), fmtNum(m.failed)]),
       1,
     )))
   } else { const p = document.createElement('p'); p.className = 'hint'; p.textContent = '无数据'; models.appendChild(p) }
 
   const accts = $('usage-accounts'); clear(accts)
-  if ((d.byAccount || []).length) {
+  const acctRows = mergeDims('byAccount', 'uid')
+  if (acctRows.length) {
     accts.appendChild(wrapTable(buildTable(
       ['账号', '请求', '输入', '输出', '失败'],
-      d.byAccount.map((a) => [a.uid, a.count, a.input, a.output, a.failed]),
+      acctRows.map((a) => [a.uid, fmtNum(a.count), fmtNum(a.input), fmtNum(a.output), fmtNum(a.failed)]),
       1,
     )))
   } else { const p = document.createElement('p'); p.className = 'hint'; p.textContent = '无数据'; accts.appendChild(p) }
 }
 
-// ─────────────────────────── 积分包 ───────────────────────────
-
-async function loadPackages() {
-  const box = $('packages')
-  clear(box)
-  const p = document.createElement('p'); p.className = 'hint'
-  p.textContent = '查询中（逐账号串行打上游）…'
-  box.appendChild(p)
-
-  const accounts = await fetchPackages()
-  const res = { ok: true, body: { accounts } }
-  clear(box)
-  if (!res.ok) { const e = document.createElement('p'); e.className = 'hint'; e.textContent = '查询失败'; box.appendChild(e); return }
-
-  for (const a of (res.body.accounts || [])) {
-    const card = document.createElement('div'); card.className = 'card'
-    const left = document.createElement('div'); left.className = 'grow'
-    const name = document.createElement('strong'); name.textContent = a.nickname || a.uid
-    const uid = document.createElement('div'); uid.className = 'uid'; uid.textContent = a.uid
-    left.appendChild(name); left.appendChild(uid)
-    card.appendChild(left)
-
-    // ⚠️ 三种状态都要显式处理，**不能只判 error**。
-    //
-    // 线上实测（P2）：后端对「该供应商不支持查余额」（如 opencode 匿名通道）
-    // 回的是 `{skipped:true, reason:'该供应商不支持查余额'}` —— 既没有 error
-    // 也没有 total。只判 `a.error` 会落到 else 分支，把 total 拼进字符串，
-    // 页面上显示成 **「可用 undefined」**（既没信息量，还像是坏了）。
-    if (a.skipped) {
-      const t = document.createElement('span'); t.className = 'tag'
-      t.textContent = a.reason || '未查询余额'
-      card.appendChild(t)
-    } else if (a.error) {
-      // ⚠️ 错误文案**整段显示，不再截断**。
-      // 原先 `a.error.slice(0, 60)` 会把可行动的尾巴切掉 ——
-      // 实测线上剩「Unauthorized: Please make sure you're」这种半句话，
-      // 用户看不出该「重新登录」还是「等一会」。改用 .err-msg 块级样式换行显示。
-      const t = document.createElement('div'); t.className = 'err-msg'
-      t.textContent = a.error
-      t.title = a.error
-      card.appendChild(t)
-    } else if (typeof a.total !== 'number') {
-      // 与 `loadProviderCredits` 同口径的兜底：绝不让 undefined/null 流到界面上
-      const t = document.createElement('span'); t.className = 'tag'; t.textContent = '余额未知'
-      card.appendChild(t)
-    } else {
-      const t = document.createElement('span'); t.className = 'tag ok'
-      t.textContent = '可用 ' + a.total + (a.expiring > 0 ? '（' + a.expiring + ' 即将过期）' : '')
-      card.appendChild(t)
-      const m = document.createElement('span'); m.className = 'metrics'
-      m.textContent = (a.packages || []).length + ' 个包' +
-        (a.earliestExpiry ? ' · 最早到期 ' + new Date(a.earliestExpiry).toLocaleDateString('zh-CN') : '')
-      card.appendChild(m)
-    }
-    box.appendChild(card)
-  }
-}
-
 // ─────────────────────────── 模型 ───────────────────────────
+
+
 
 async function loadModels() {
   const box = $('models')
@@ -994,7 +1197,69 @@ function openProviderManager() {
   // 前者在桌面浏览器上零依赖，且**手机上由浏览器映射成长按拖动**。
   // 手柄只放在左侧的 `≡` 上（不是整行可拖）—— 否则点「启用/关闭」按钮时
   // 会误触发拖动，按钮变得难以点中。
-  let dragIdx = -1
+  // ── 拖动排序：用 **Pointer Events**（不是 HTML5 drag-and-drop）──
+  //
+  // ## 🔴 为什么必须换掉 HTML5 drag-and-drop（用户实测反馈）
+  //
+  // 用户报：「供应商拖动排序功能在 iOS 的浏览器上只会选择文字，
+  // 在 Chromium 内核的浏览器上能正常拖动，但也不太顺手」。
+  //
+  // 根因是**两个独立问题**：
+  //
+  // 1. **iOS Safari 对普通元素根本不支持 HTML5 拖放**。
+  //    `draggable="true"` 只对少数原生可拖元素（链接、图片、选中文本）有效，
+  //    对 `<div>` 只会触发**文字选择**——这正是用户看到的现象。
+  //    ⇒ 这不是「配置不对」，是**平台没有这个能力**，改属性救不回来。
+  // 2. **整行都在拖**（`row.draggable = true`），而注释声称「只有手柄可拖」。
+  //    于是按「启用/关闭」按钮时很容易误触发拖动，按钮因此变得难以点中。
+  //
+  // ⇒ 改用 Pointer Events（`pointerdown/move/up`）：iOS 与 Chromium 都支持，
+  //   且能自己控制触发区域与手感。
+  //
+  // ## 手感设计（用户要求「更顺手」）
+  //
+  // - **只有手柄**能起拖（`pointerdown` 挂在手柄上），按钮回归可点；
+  // - `touch-action: none` 挂在手柄上，**阻止 iOS 把长按解释成文字选择**；
+  // - 起拖前先等 `DRAG_START_PX` 位移 —— 轻点手柄不该算拖动（避免误触）；
+  // - 拖动中给被拖行加 `.dragging`（半透明），其余行按位置让位；
+  // - 用**指针的 Y 坐标**判断该插到哪一行，而不是依赖 `dragover` 事件；
+  // - 松手即落位并保存；**取消**（`pointercancel`）则原样回退，不留半个改动。
+  //
+  // ⚠️ 用 `setPointerCapture` 把后续 move/up 都收给手柄元素：
+  // 否则指针一旦滑出手柄范围，就再也收不到 `pointerup`（拖到一半卡住）。
+  const DRAG_START_PX = 4
+  let drag = null // { pointerId, fromIdx, startY, active }
+
+  /** 把当前指针的 Y 坐标换算成「应插入到第几行」。 */
+  const indexAtY = (clientY) => {
+    const rows = [...list.querySelectorAll('.card')]
+    for (let i = 0; i < rows.length; i += 1) {
+      const box = rows[i].getBoundingClientRect()
+      if (clientY < box.top + box.height / 2) return i
+    }
+    return rows.length - 1
+  }
+
+  const endDrag = (commit) => {
+    if (drag === null) return
+    const { fromIdx, active } = drag
+    drag = null
+    list.classList.remove('dragging-active')
+    for (const el of list.querySelectorAll('.card')) {
+      el.classList.remove('dragging', 'drop-target')
+    }
+    if (!active) return // 只是轻点，没真拖
+    if (commit) {
+      // 落位：把被拖的那条移到目标位置（`targetIdx` 由 move 阶段实时存下）
+      const to = commit
+      if (to !== fromIdx) {
+        const moved = ordered.splice(fromIdx, 1)[0]
+        ordered.splice(to, 0, moved)
+        void (async () => { if (await save()) { render(); void loadProviders() } })()
+      }
+    }
+    render() // 无论成功与否都重画，清掉临时类名
+  }
 
   const render = () => {
     clear(list)
@@ -1002,31 +1267,54 @@ function openProviderManager() {
       // ⚠️ 复用现有的 `.card` 样式（与「账号」页统一），不另造一套。
       const row = document.createElement('div')
       row.className = 'card'
-      row.draggable = true
+      // ⚠️ **不再设 `row.draggable`** —— 整行可拖会让按钮点不中，
+      // 而且 iOS 上它只会触发文字选择（见上方说明）。
 
-      row.ondragstart = (e) => {
-        dragIdx = idx
-        row.classList.add('dragging')
-        if (e.dataTransfer) e.dataTransfer.effectAllowed = 'move'
-      }
-      row.ondragend = () => { row.classList.remove('dragging'); dragIdx = -1 }
-      // ⚠️ 必须 `preventDefault` 才允许 drop —— 否则浏览器拒绝接收。
-      row.ondragover = (e) => { e.preventDefault(); row.classList.add('drop-target') }
-      row.ondragleave = () => row.classList.remove('drop-target')
-      row.ondrop = async (e) => {
-        e.preventDefault(); row.classList.remove('drop-target')
-        if (dragIdx < 0 || dragIdx === idx) return
-        const moved = ordered.splice(dragIdx, 1)[0]
-        ordered.splice(idx, 0, moved)
-        dragIdx = -1
-        if (await save()) { render(); void loadProviders() }
-      }
-
-      // 左侧拖动手柄
       const handle = document.createElement('span')
       handle.className = 'drag-handle'
       handle.textContent = '≡'
-      handle.title = '拖动调整顺序'
+      handle.title = '按住拖动调整顺序'
+      // ⚠️ `touch-action: none` 由 CSS 设在这个手柄上 —— 那是阻止 iOS
+      // 把长按解释成**文字选择**的关键，缺了它就还是「只会选择文字」。
+      handle.addEventListener('pointerdown', (e) => {
+        // 只响应主指针（忽略右键/多指）
+        if (e.button !== 0 && e.pointerType === 'mouse') return
+        drag = { pointerId: e.pointerId, fromIdx: idx, startY: e.clientY, active: false }
+        // ⚠️ 捕获指针：否则滑出手柄后就收不到 pointerup（拖到一半卡住）
+        if (handle.setPointerCapture) { try { handle.setPointerCapture(e.pointerId) } catch { /* 忽略 */ } }
+        // ⚠️ 阻止默认行为，否则 iOS 会开始文字选择
+        e.preventDefault()
+      })
+
+      handle.addEventListener('pointermove', (e) => {
+        if (drag === null || e.pointerId !== drag.pointerId) return
+        if (!drag.active) {
+          // 位移超过阈值才算真的开始拖（轻点不该算）
+          if (Math.abs(e.clientY - drag.startY) < DRAG_START_PX) return
+          drag.active = true
+          list.classList.add('dragging-active')
+          row.classList.add('dragging')
+        }
+        e.preventDefault()
+        const to = indexAtY(e.clientY)
+        drag.targetIdx = to
+        // 高亮「将要插入的位置」
+        const rows = [...list.querySelectorAll('.card')]
+        for (let i = 0; i < rows.length; i += 1) {
+          rows[i].classList.toggle('drop-target', i === to && i !== drag.fromIdx)
+        }
+      })
+
+      const onUp = (e) => {
+        if (drag === null || e.pointerId !== drag.pointerId) return
+        // ⚠️ 先取走目标位置再 endDrag（endDrag 会把 drag 置空）
+        const to = drag.targetIdx
+        endDrag(drag.active ? (typeof to === 'number' ? to : drag.fromIdx) : false)
+      }
+      handle.addEventListener('pointerup', onUp)
+      // ⚠️ `pointercancel`（系统中断、来电等）**不提交** —— 原样回退，
+      // 免得留下一个用户没意图的排序。
+      handle.addEventListener('pointercancel', () => endDrag(false))
       row.appendChild(handle)
 
       const nm = document.createElement('div'); nm.className = 'grow'
@@ -1624,7 +1912,6 @@ $('clear-usage').onclick = async () => {
   await api('/admin/usage/clear', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })
   loadUsage()
 }
-$('refresh-packages').onclick = loadPackages
 $('load-models').onclick = loadModels
 $('refresh-providers').onclick = async () => {
   await loadProviders()

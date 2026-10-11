@@ -15,6 +15,13 @@
  */
 
 import { test } from 'node:test'
+import {
+  emptyUsageState,
+  recordUsageInto,
+  summarizeUsageState,
+  utc8DayKey,
+  windowStartDayKey,
+} from '../src/store/usage.js'
 import { referenceChatHeaders } from '../src/upstream/headers.ts'
 import { classify } from '../src/upstream/client.ts'
 
@@ -1332,4 +1339,113 @@ test('🔴 鉴权失败判据必须认 `invalid access token`（正则跨度写�
   assert.equal(isAuthLikeFailure(403, 'whatever'), true)
   // CodeArts 走 HTTP 400 + 业务码，必须靠**内容**判
   assert.equal(isAuthLikeFailure(400, '{"error_code":"APIG.0602"}'), true)
+})
+
+// ─────────────────── 用量：时间窗与按天聚合 ───────────────────
+
+test('🔴 用量汇总必须走**按天聚合**，不能被 500 条明细环封顶', () => {
+  // ## 实测缺陷（用户报「这个用量怎么始终是 500 不动」）
+  //
+  // 那不是 HTTP 500 —— 是旧实现的 `total` **撞上了明细环形缓冲的上限**
+  //（`USAGE_RING_SIZE = 500`）。旧实现**只有明细**这一份数据，
+  // 于是无论用多久、用多少，概览永远显示 500。
+  //
+  // ⇒ 现在拆成两份独立数据：
+  //   · 明细环 `ring`（最近 500 条）—— 答「每一笔长什么样」
+  //   · 按天聚合 `days`（保留 90 天）—— 答「今天/本周/本月用了多少」
+  const state = emptyUsageState()
+  const base = Date.UTC(2026, 9, 9, 4, 0, 0) // UTC+8 的 12:00
+  // 造 1200 笔（远超 500 上限），跨 3 天
+  for (let i = 0; i < 1200; i++) {
+    const at = base - Math.floor(i / 400) * 24 * 60 * 60 * 1000
+    recordUsageInto(state, {
+      at, uid: `u${i % 3}`, model: i % 2 === 0 ? 'm-a' : 'm-b',
+      input: 10, output: 5, ok: i % 10 !== 0, ms: 100,
+    }, base)
+  }
+
+  const all = summarizeUsageState(state, 0, base)
+  // ⚠️ 关键断言：总数**必须**是 1200，不是 500
+  assert.equal(all.total, 1200, '⚠️ 不得被明细环上限截断')
+  assert.equal(all.detailCount, 500, '明细环仍应只留 500 条')
+  assert.ok(all.detailCapped, '应如实标记「明细已封顶」')
+
+  // 明细环只覆盖最后 400 笔（最后一天的），但聚合覆盖全部
+  assert.equal(all.activeDays, 3, '3 天都应有聚合数据')
+  assert.equal(all.inputTokens, 12000)
+  assert.equal(all.outputTokens, 6000)
+})
+
+test('🔴 时间窗必须按 **UTC+8 日界**过滤（不能用本机时区）', () => {
+  const state = emptyUsageState()
+  // UTC 2026-10-09 16:30 = UTC+8 的 2026-10-10 00:30（**已是第二天**）
+  const now = Date.UTC(2026, 9, 9, 16, 30, 0)
+  const todayKey = utc8DayKey(now)
+  assert.equal(todayKey, '2026-10-10', 'UTC+8 日键应为 10-10（不是 UTC 的 10-09）')
+
+  // 记在「UTC+8 今天」与「昨天」
+  recordUsageInto(state, { at: now, uid: 'u', model: 'm', input: 1, output: 1, ok: true, ms: 1 }, now)
+  recordUsageInto(state, {
+    at: now - 24 * 60 * 60 * 1000, uid: 'u', model: 'm', input: 10, output: 10, ok: true, ms: 1,
+  }, now)
+
+  const today = summarizeUsageState(state, 1, now)
+  assert.equal(today.total, 1, '「今日」应只含今天那笔')
+  assert.equal(today.inputTokens, 1)
+
+  const week = summarizeUsageState(state, 7, now)
+  assert.equal(week.total, 2, '「近 7 天」应含两天')
+
+  // ⚠️ 窗口起点也必须是 UTC+8 日界：`days=1` 的 cutoff 就是今天
+  assert.equal(windowStartDayKey(1, now), '2026-10-10')
+  assert.equal(windowStartDayKey(2, now), '2026-10-09')
+  assert.equal(windowStartDayKey(0, now), undefined, '0 = 全部（无 cutoff）')
+})
+
+test('⚠️ 按小时只对「今日」聚合（跨天的小时标签会互相覆盖）', () => {
+  // 跨天的 `09:00` 是两个不同的时刻，合并起来没有解释力。
+  const state = emptyUsageState()
+  const now = Date.UTC(2026, 9, 9, 4, 0, 0)
+  const yesterday = now - 24 * 60 * 60 * 1000
+  recordUsageInto(state, { at: yesterday, uid: 'u', model: 'm', input: 1, output: 1, ok: true, ms: 1 }, now)
+  recordUsageInto(state, { at: now, uid: 'u', model: 'm', input: 1, output: 1, ok: true, ms: 1 }, now)
+
+  const week = summarizeUsageState(state, 7, now)
+  const hourTotal = week.byHour.reduce((n, h) => n + h.count, 0)
+  assert.equal(hourTotal, 1, '⚠️ 按小时只应统计今日那笔（不是 2）')
+  assert.equal(week.byDay.length, 2, '但按天趋势应有两天')
+})
+
+test('⚠️ 清空用量必须同时清明细与按天聚合', () => {
+  // 只清明细会让「近 30 天」仍报出旧数字，而用户刚点了「清空」——
+  // 那是「状态看着对、行为不对」型缺陷。
+  const src = readFileSync('src/pool/AccountPoolDO.ts', 'utf8')
+  const i = src.indexOf('async clearUsage()')
+  const block = src.slice(i, i + 700)
+  assert.ok(/emptyUsageState\(\)/.test(block),
+    '⚠️ 清空必须写入空状态（同时清掉 ring 与 days）')
+  assert.ok(/delete\(LEGACY_USAGE_RING_KEY\)/.test(block),
+    '⚠️ 也要清掉旧 key，否则下次迁移会把旧数据搬回来')
+})
+
+test('⚠️ 旧版数据必须能迁移（用户已有历史不能凭空消失）', () => {
+  const src = readFileSync('src/pool/AccountPoolDO.ts', 'utf8')
+  assert.ok(/migrateUsageState\(legacy, Date\.now\(\)\)/.test(src),
+    '⚠️ 必须把旧版裸明细数组迁移成按天聚合')
+  assert.ok(/LEGACY_USAGE_RING_KEY = 'usage:ring'/.test(src), '旧 key 名应保持不变')
+  // ⚠️ 明细环与按天聚合必须修在**同一个 key** 里：
+  // 拆成两个 key 会让每笔请求写两次，白白翻倍 DO 行写入配额。
+  assert.ok(/const USAGE_STATE_KEY = 'usage:state'/.test(src), '应合并为一个 key')
+  assert.ok(/await this\.ctx\.storage\.put\(USAGE_STATE_KEY, state\)/.test(src),
+    '⚠️ recordUsage 必须只写一次')
+})
+
+test('⚠️ /admin/usage 的 days 参数：非法值回退「全部」而不是报错', () => {
+  const src = readFileSync('src/index.ts', 'utf8')
+  const i = src.indexOf("path === '/admin/usage'")
+  const block = src.slice(i, i + 1600)
+  assert.ok(/url\.searchParams\.get\('days'\)/.test(block), '应读 days 参数')
+  assert.ok(/parsedDays > 0 \? Math\.floor\(parsedDays\) : 0/.test(block),
+    '⚠️ 非法/非正数应回退 0（全部），不能报错让页面空白')
+  assert.ok(/usageSummary\(days\)/.test(block), '应把窗口传给 DO')
 })

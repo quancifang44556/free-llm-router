@@ -57,11 +57,28 @@ import {
 import { decryptCredential, encryptCredential, requireCredentialKey } from '../store/crypto.js'
 import { cstDay } from '../upstream/travel.js'
 import {
-  summarizeUsage,
+  emptyUsageState,
+  migrateUsageState,
+  pruneUsageDays,
+  recordUsageInto,
+  summarizeUsageState,
   trimUsageRing,
   type UsageRecord,
+  type UsageState,
   type UsageSummary,
 } from '../store/usage.js'
+
+/**
+ * 用量状态的存储键（**一个 key 装明细环 + 按天聚合**）。
+ *
+ * ⚠️ 为什么合并成一个 key：`recordUsage` 在推理的关键路径上，每次都是一次
+ * 读 + 一次写。拆成两个 key 会让每笔请求写两次 —— 在 Free 计划下白白
+ * 翻倍 DO 行写入配额消耗，换不到任何好处。
+ */
+const USAGE_STATE_KEY = 'usage:state'
+
+/** 旧版的键（只存裸明细数组）。仅用于**一次性迁移**，见 `loadUsageState`。 */
+const LEGACY_USAGE_RING_KEY = 'usage:ring'
 
 /** 模型成本账本的存活时长：6h 外的价格不再采信（Go 侧 `modelCostTTL` 同口径）。 */
 const MODEL_COST_TTL_MS = 6 * 60 * 60 * 1000
@@ -905,20 +922,58 @@ export class AccountPoolDO extends DurableObject<Env> {
    * 单次读改写：DO 是单线程的，不存在并发写覆盖问题。
    */
   async recordUsage(record: UsageRecord): Promise<void> {
-    const ring = (await this.ctx.storage.get<UsageRecord[]>('usage:ring')) ?? []
-    ring.push(record)
-    await this.ctx.storage.put('usage:ring', trimUsageRing(ring))
+    const state = await this.loadUsageState()
+    recordUsageInto(state, record, record.at)
+    // ⚠️ **一次写**（`ring` + `days` 同在一个 key）—— 见 `store/usage.ts` 文件头：
+    // 拆成两个 key 会让每笔请求写两次，白白翻倍 DO 行写入配额消耗。
+    await this.ctx.storage.put(USAGE_STATE_KEY, state)
   }
 
-  /** 读取用量概览（聚合在内存里做）。 */
-  async usageSummary(): Promise<UsageSummary> {
-    const ring = (await this.ctx.storage.get<UsageRecord[]>('usage:ring')) ?? []
-    return summarizeUsage(ring)
+  /**
+   * 读取用量概览（聚合在内存里做）。
+   *
+   * @param windowDays - 1 = 今日；7 = 近 7 天；30 = 近 30 天；0 = 全部。
+   */
+  async usageSummary(windowDays = 0): Promise<UsageSummary> {
+    const state = await this.loadUsageState()
+    return summarizeUsageState(state, windowDays, Date.now())
   }
 
-  /** 清空用量记录。 */
+  /**
+   * 清空用量记录（**明细与按天聚合一起清**）。
+   *
+   * ⚠️ 必须两个都清：只清明细会让「近 30 天」仍然报出旧数字，
+   * 而用户刚点了「清空」—— 那是本项目反复警告的「状态看着对、行为不对」。
+   */
   async clearUsage(): Promise<void> {
-    await this.ctx.storage.put('usage:ring', [])
+    await this.ctx.storage.put(USAGE_STATE_KEY, emptyUsageState())
+    // 顺带清掉旧 key，免得下次迁移又把旧数据搬回来。
+    await this.ctx.storage.delete(LEGACY_USAGE_RING_KEY)
+  }
+
+  /**
+   * 读用量状态，并把**旧版数据迁移**过来。
+   *
+   * 旧版只把裸明细数组存在 `usage:ring`，没有按天聚合（这正是
+   * 「用量始终 500」那个缺陷的成因）。升级后第一次读时把它回放成聚合，
+   * 用户已有的历史不会凭空消失。
+   *
+   * ⚠️ 迁移是**幂等**的：写完新 key 后删掉旧 key，故只会发生一次。
+   * ⚠️ 迁移**不回放成未来日键**：`pruneUsageDays` 会挡掉时钟异常产生的键。
+   */
+  private async loadUsageState(): Promise<UsageState> {
+    const state = await this.ctx.storage.get<UsageState>(USAGE_STATE_KEY)
+    if (state !== undefined && Array.isArray(state.ring) && typeof state.days === 'object') {
+      return state
+    }
+    const legacy = await this.ctx.storage.get<UsageRecord[]>(LEGACY_USAGE_RING_KEY)
+    if (legacy === undefined || !Array.isArray(legacy)) {
+      return emptyUsageState()
+    }
+    const migrated = migrateUsageState(legacy, Date.now())
+    await this.ctx.storage.put(USAGE_STATE_KEY, migrated)
+    await this.ctx.storage.delete(LEGACY_USAGE_RING_KEY)
+    return migrated
   }
 
   // ─────────────────────── 请求日志（环形缓冲） ───────────────────────

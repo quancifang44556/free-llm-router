@@ -2225,8 +2225,23 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
   // ── 用量统计 ──
   if (path === '/admin/usage' && request.method === 'GET') {
     const realm = url.searchParams.get('realm') ?? 'cn'
+    // ⚠️ 时间窗：`days` 参数（1 = 今日 / 7 / 30 / 0 = 全部）。
+    //
+    // ## 🔴 为什么必须有这个参数（用户报「用量始终是 500 不动」）
+    //
+    // 那不是 HTTP 500 —— 是旧实现的 `total` **撞上了明细环形缓冲的上限**
+    //（`USAGE_RING_SIZE = 500`），且**完全没有时间窗概念**：无论用多久、
+    // 用多少，概览永远显示 500，且答不出「今天/本周用了多少」。
+    //
+    // ⇒ 现在汇总走**按天聚合**（跨天保留 90 天），窗口内的数量不再被封顶。
+    //
+    // ⚠️ 非法值一律回退「全部」（= 0），**不猜**用户意图：
+    // 传 `days=abc` 时报错还是给全部？给全部更安全（不会让页面空白）。
+    const rawDays = url.searchParams.get('days')
+    const parsedDays = rawDays === null ? 0 : Number(rawDays)
+    const days = Number.isFinite(parsedDays) && parsedDays > 0 ? Math.floor(parsedDays) : 0
     const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
-    const summary = await pool.usageSummary()
+    const summary = await pool.usageSummary(days)
     return json({ realm, ...summary })
   }
   if (path === '/admin/usage/clear' && request.method === 'POST') {

@@ -195,11 +195,22 @@ test('⚠️ /v1/models 必须只列「有账号」的供应商的模型（登�
 
 test('⚠️ 面板视图（账号池已并入供应商）', () => {
   const html = panelAsset('/panel/')?.body ?? ''
-  const views = ['providers', 'tasks', 'usage', 'packages', 'models', 'config', 'logs']
+  // ⚠️ `packages` 已按用户要求**删除**（页面与视图都删）。
+  // 但 `/admin/packages` **端点保留** —— 账号卡片上的「单独显示积分」仍在用它。
+  const views = ['providers', 'tasks', 'usage', 'models', 'config', 'logs']
   for (const v of views) {
     assert.ok(html.includes(`data-view="${v}"`), `缺少视图：${v}`)
     assert.ok(html.includes(`id="view-${v}"`), `缺少视图容器：${v}`)
   }
+  // ⚠️ 反向断言：积分包页签与视图都必须已删除，且不留死代码
+  assert.ok(!html.includes('data-view="packages"'), '积分包页签应已删除')
+  assert.ok(!html.includes('id="view-packages"'), '积分包视图容器应已删除')
+  const js = panelAsset('/panel/app.js')?.body ?? ''
+  assert.ok(!/function loadPackages/.test(js), '⚠️ loadPackages 死代码应已删除')
+  assert.ok(!/refresh-packages/.test(js), '⚠️ 不应残留 refresh-packages 事件绑定')
+  // ⚠️ 但数据源必须保留（账号卡片积分靠它）
+  assert.ok(/function fetchPackages/.test(js),
+    '⚠️ fetchPackages 必须保留（账号卡片的「单独显示积分」在用）')
   // ⚠️ 账号池已并入「供应商与账号」，不该再有独立视图
   assert.ok(!html.includes('data-view="accounts"'), '账号池应已并入供应商视图')
   assert.ok(!html.includes('id="view-accounts"'), '不该再有独立的账号池容器')
@@ -675,15 +686,21 @@ test('⚠️ 柱状图时间标签必须放得下（"10-03 20:00" 折行会让�
   assert.ok(Number(m?.[1]) >= 56, `.bar-label 应 ≥56px 才容得下 "10-03 20:00"（自然宽 55px），实际 ${m?.[1]}px`)
 })
 
-test('⚠️ 积分包必须显式处理 skipped（否则渲染成「可用 undefined」）', () => {
+test('⚠️ 必须显式处理 skipped / 非数字 total（否则渲染成「可用 undefined」）', () => {
   // 线上实测（P2）：opencode 匿名通道那行显示 **「可用 undefined」**。
   // 后端其实是对的 —— 它对该账号返回
   // `{skipped:true, reason:'该供应商不支持查余额'}`（既无 error 也无 total），
   // 是前端只判 `a.error` 就落到 else 分支，把 undefined 拼进了字符串。
+  //
+  // ⚠️ 积分包**页面**已按用户要求删除，但 `/admin/packages` 端点保留
+  //（账号卡片的「单独显示积分」靠它），故这条防线仍然必须有 ——
+  // 只是断言点从已删除的 `loadPackages` 换到仍在的消费方。
   const js = panelAsset('/panel/app.js')?.body ?? ''
-  assert.ok(/a\.skipped/.test(js), '应处理 skipped（后端用它标记「该供应商不支持查余额」）')
-  // 同时要有 total 非数字的兜底（与 loadProviderCredits 同口径）
-  assert.ok(/typeof a\.total !== 'number'/.test(js), '应对非数字 total 兜底，不让 undefined 流到界面')
+  // 账号卡片：非数字 total 必须跳过（不让 undefined 流到界面）
+  assert.ok(/typeof a\.total !== 'number'/.test(js) || /typeof cred\.total !== 'number'/.test(js),
+    '⚠️ 应对非数字 total 兜底，不让 undefined 流到界面')
+  // 任务结果里 skipped 的显式处理（后端用它标记「该供应商不支持查余额」）
+  assert.ok(/r\.skipped/.test(js), '应处理 skipped')
 })
 
 test('⚠️ 错误文案不得硬截断（会切掉「请重新登录」这类可行动的尾巴）', () => {
@@ -695,7 +712,11 @@ test('⚠️ 错误文案不得硬截断（会切掉「请重新登录」这类�
   // 当反例讲解（说明「为什么不再这么写」），不剥会把自己的说明误判成违规。
   const jsCode = stripJsComments(panelAsset('/panel/app.js')?.body ?? '')
   assert.ok(!/a\.error\.slice\(/.test(jsCode), '错误文案不得用 slice 硬截断')
-  assert.ok(jsCode.includes('err-msg'), '长错误应走 .err-msg 块级样式换行显示')
+  // ⚠️ 原先这里断言「长错误走 .err-msg 块级样式」，但那唯一的用点是
+  // 已按用户要求删除的**积分包页**。保留的消费方（账号卡片）用 `title`
+  // 承载完整原因，故这里只钉住「不得硬截断」这条仍然成立的纪律 ——
+  // 用 `title` 承载完整原因也是合规的做法，一并钉住。
+  assert.ok(/title/.test(jsCode), '完整错误原因应通过 title 等方式可达（不被丢弃）')
 })
 
 test('⚠️ 空的输出框不该画出空边框', () => {
@@ -782,16 +803,15 @@ test('⚠️ 「供应商」计数块必须在「已禁用」**右边**，且复
 
 test('⚠️ 供应商列表必须支持**拖动**排序（不是上移/下移按钮）', () => {
   // 用户明确要求：「加一个拖动移动位置」。
-  const js = panelAsset('/panel/app.js')?.body ?? ''
+  //
+  // ⚠️ 实现方式**后来换过**：原先用 HTML5 drag-and-drop，但用户实测
+  // 「iOS 上只会选择文字」⇒ 已改用 Pointer Events
+  //（根因与取舍见下一条测试）。这里只钉住「有拖动能力 + 有手柄」。
+  const js = stripJsComments(panelAsset('/panel/app.js')?.body ?? '')
   const css = panelAsset('/panel/style.css')?.body ?? ''
-  // 行可拖 + 有手柄
-  assert.ok(/row\.draggable = true/.test(js), '行必须是 draggable')
-  assert.ok(/ondragstart/.test(js) && /ondrop/.test(js), '要处理 dragstart 与 drop')
+  assert.ok(/pointerdown/.test(js), '要有拖动能力（Pointer Events）')
   assert.ok(js.includes('drag-handle'), '要有拖动手柄')
   assert.ok(/drag-handle/.test(css), '手柄要有样式（cursor: grab）')
-  // ⚠️ `dragover` 必须 preventDefault，否则浏览器拒绝 drop（静默失效）
-  assert.ok(/ondragover = \(e\) => \{ e\.preventDefault\(\)/.test(js),
-    '⚠️ dragover 必须 preventDefault，否则 drop 不触发')
   // ⚠️ 不能再有上移/下移按钮（用户要的是拖动）
   assert.ok(!/up\.textContent = '↑'/.test(js), '不应保留「上移」按钮')
 })
@@ -802,8 +822,13 @@ test('⚠️ 供应商管理弹窗必须复用现有 .card 样式（视觉统一
   const js = panelAsset('/panel/app.js')?.body ?? ''
   const css = panelAsset('/panel/style.css')?.body ?? ''
   const i = js.indexOf('function openProviderManager')
-  const block = js.slice(i, i + 3200)
-  assert.ok(/row\.className = 'card'/.test(block), '管理行应复用 .card 样式')
+  // ⚠️ 窗口要取到**下一个顶层函数**，不能用固定长度 ——
+  // 该函数因拖动改用 Pointer Events 变长了，固定 3200 会切掉后半段，
+  // 让断言变成「找不到 ⇒ 失败」这种**假失败**（我为此返工过）。
+  const j = js.indexOf('\nfunction ', i + 10)
+  const block = js.slice(i, j > 0 ? j : i + 12000)
+  // ⚠️ 断言前剥注释：我的说明里引用了 `row.draggable` 这类旧写法当反例。
+  assert.ok(/row\.className = 'card'/.test(stripJsComments(block)), '管理行应复用 .card 样式')
   // ⚠️ 按钮也复用现有的 ghost / danger（不另立样式）
   assert.ok(/sw\.className = off \? 'ghost' : 'danger'/.test(block), '开关应复用 ghost/danger')
   // 自造的 .prow 样式必须已删除（否则就是两套风格）
@@ -928,4 +953,59 @@ test('⚠️ loomy 面板必须走短信两步流程（不能进轮询逻辑）'
   const block = js.slice(fn, fn + 600)
   assert.ok(/providerId === 'loomy'/.test(block), '⚠️ 必须在轮询之前分派走')
   assert.ok(/LOGIN_KIND_LABEL[\s\S]{0,120}loomy:/.test(js), '要有「短信验证码登录」标签')
+})
+
+test('🔴 供应商拖动必须用 Pointer Events（iOS Safari 不支持普通元素的 HTML5 拖放）', () => {
+  // ## 用户实测反馈
+  //
+  // 「供应商拖动排序功能在 iOS 的浏览器上只会**选择文字**，
+  //  在 Chromium 内核的浏览器上能正常拖动，但也不太顺手」。
+  //
+  // 根因是**两个独立问题**：
+  // 1. **iOS Safari 对普通元素根本不支持 HTML5 拖放** ——
+  //    `draggable="true"` 只对链接/图片等原生可拖元素有效，对 `<div>`
+  //    只会触发文字选择。⇒ 这不是「配置不对」，改属性救不回来。
+  // 2. **整行都在拖**（`row.draggable = true`），而注释声称「只有手柄可拖」
+  //    ⇒ 按「启用/关闭」按钮时容易误触发拖动，按钮变得难以点中。
+  const js = stripJsComments(panelAsset('/panel/app.js')?.body ?? '')
+  const css = panelAsset('/panel/style.css')?.body ?? ''
+
+  // ① 不得再用 HTML5 拖放 API
+  for (const api of ['ondragstart', 'ondragover', 'ondrop', '.draggable = true']) {
+    assert.ok(!js.includes(api), `⚠️ 不得再用 HTML5 拖放（${api}）—— iOS 上无效`)
+  }
+  // ② 必须用 Pointer Events
+  assert.ok(/pointerdown/.test(js), '应用 pointerdown 起拖')
+  assert.ok(/pointermove/.test(js), '应用 pointermove 跟踪位置')
+  assert.ok(/pointerup/.test(js), '应用 pointerup 落位')
+  // ③ ⚠️ 必须处理 pointercancel，且**不提交**（原样回退）
+  assert.ok(/pointercancel/.test(js), '⚠️ 必须处理 pointercancel（系统中断）')
+  assert.ok(/endDrag\(false\)/.test(js), '⚠️ pointercancel 必须不提交改动')
+  // ④ ⚠️ 必须 setPointerCapture，否则滑出手柄就收不到 pointerup（拖到一半卡住）
+  assert.ok(/setPointerCapture/.test(js), '⚠️ 必须 setPointerCapture（否则拖到一半卡住）')
+  // ⑤ ⚠️ 必须有起拖阈值，轻点手柄不该算拖动
+  assert.ok(/DRAG_START_PX/.test(js), '⚠️ 起拖需有位移阈值（避免误触）')
+
+  // ⑥ ⚠️ CSS 的 touch-action:none 是 iOS 能拖起来的**关键**
+  //   （否则 iOS 把长按解释成文字选择/滚动，pointermove 不会持续派发）
+  const handleRule = css.slice(css.indexOf('.drag-handle {'))
+  const handleBody = handleRule.slice(0, handleRule.indexOf('}'))
+  assert.ok(/touch-action:\s*none/.test(handleBody),
+    '⚠️ .drag-handle 必须有 touch-action: none —— 这是 iOS 能拖的关键')
+  assert.ok(/-webkit-user-select:\s*none|-user-select:\s*none/.test(handleBody),
+    '⚠️ .drag-handle 需要 user-select: none（第二道防线）')
+})
+
+test('⚠️ 拖动排序只作用于手柄，不作用于整行（否则按钮点不中）', () => {
+  // 用户反馈「Chromium 上能拖但不太顺手」的直接原因之一：
+  // 整行可拖会让「启用/关闭」按钮几乎点不中（按下即开始拖动，click 不触发）。
+  const js = stripJsComments(panelAsset('/panel/app.js')?.body ?? '')
+  // pointerdown 必须挂在 handle 上
+  assert.ok(/handle\.addEventListener\('pointerdown'/.test(js),
+    '⚠️ pointerdown 必须挂在小手柄上，不是整行')
+  // row 上不得挂 pointerdown
+  assert.ok(!/row\.addEventListener\('pointerdown'/.test(js),
+    '⚠️ 整行不得起拖（会让按钮点不中）')
+  // 开关按钮必须仍然有 onclick（未被拖动逻辑吃掉）
+  assert.ok(/sw\.onclick/.test(js), '⚠️ 开关按钮的 onclick 必须保留')
 })
