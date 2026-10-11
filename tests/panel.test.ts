@@ -1410,3 +1410,101 @@ test('⚠️ 排名列表：占比用总数为分母、条宽用最大值为分�
   assert.ok(/overflow-wrap:\s*anywhere/.test(nameRule.slice(0, nameRule.indexOf('}'))),
     '⚠️ 长模型名/uid 要能断行（用 overflow-wrap，不是 break-all）')
 })
+
+test('⚠️ 三个视图容器都不得再有「框」（用户报「不要再套一个框」）', () => {
+  // ## 用户原话
+  //   「不显示按小时的就不要显示那个框了，按天趋势里面不要再套一个框，
+  //     切换天数下面不要显示说明，能看懂」
+  //
+  // 根因：`section.view` 原来自带 `background + border + radius + padding`
+  //（那是「一张卡」），而它内部现在**全是卡片**（`.panel` / `.kpi`）
+  // ⇒ 每个内部卡片外围又多一圈同样的框，就是「框里套框」。
+  const css = stripCssComments(panelAsset('/panel/style.css')?.body ?? '')
+  const rule = css.slice(css.indexOf('section.view {'))
+  const body = rule.slice(0, rule.indexOf('}'))
+  for (const prop of ['border', 'background', 'padding']) {
+    assert.ok(!new RegExp(`(^|;)\\s*${prop}\\s*:`).test(body),
+      `⚠️ section.view 不得再有 ${prop}（那是外层框，会与内部卡片叠成两层）`)
+  }
+  // 必须保留 min-width: 0（网格项不收缩，去掉会让长表格撑破页面）
+  assert.ok(/min-width:\s*0/.test(body), '⚠️ min-width: 0 必须保留（防横向溢出）')
+
+  // `.trend` 也不能自带边框/底色（它在 .panel 里）
+  const trend = css.slice(css.indexOf('.trend {'))
+  const trendBody = trend.slice(0, trend.indexOf('}'))
+  assert.ok(!/(^|;)\s*border\s*:/.test(trendBody),
+    '⚠️ .trend 不得自带 border（那正是用户说的「套一个框」）')
+  assert.ok(!/(^|;)\s*background\s*:/.test(trendBody),
+    '⚠️ .trend 不得自带 background（同上）')
+})
+
+test('⚠️ 按小时：非今日窗口必须**整个面板隐藏**（不是留个说明框）', () => {
+  // 用户原话：「不显示按小时的就不要显示那个框了」。
+  // ⚠️ 要隐藏**整个面板**（含标题），而不是面板里塞一句说明 ——
+  // 后者正是用户抱怨的那个「框」。
+  const js = stripJsComments(panelAsset('/panel/app.js')?.body ?? '')
+  const fn = js.slice(js.indexOf('function renderUsageHours'))
+  assert.ok(/windowDays !== 1/.test(fn), '应判非今日窗口')
+  const hideAt = fn.indexOf('panel.hidden = true')
+  assert.ok(hideAt > 0, '⚠️ 非今日窗口必须隐藏整个面板')
+  // 且必须立即 return（不能再往面板里塞内容）
+  const retAt = fn.indexOf('return', hideAt)
+  assert.ok(retAt > hideAt && retAt - hideAt < 120,
+    '⚠️ 隐藏后必须立即 return（否则仍会往里塞说明文字 = 那个没用的框）')
+  // 今日窗口要显示出来（不能被永久隐藏）
+  assert.ok(/panel.hidden = false/.test(fn), '今日窗口必须恢复显示面板')
+})
+
+test('⚠️ 切换天数下面不得有说明文字（用户要求删除）', () => {
+  // 用户原话：「切换天数下面不要显示说明，能看懂」。
+  const html = panelAsset('/panel/')?.body ?? ''
+  const js = stripJsComments(panelAsset('/panel/app.js')?.body ?? '')
+  assert.ok(!html.includes('usage-scope'), '⚠️ HTML 里不得再有说明容器')
+  assert.ok(!/\$\('usage-scope'\)/.test(js), '⚠️ JS 里不得再引用它（否则 null.textContent 抛错）')
+})
+
+test('⚠️ 各视图必须统一为「页头 + 面板」结构（用户要求统一风格）', () => {
+  // 用户原话：「把其它界面的 UI 也统一成这种风格」。
+  const html = panelAsset('/panel/')?.body ?? ''
+  const views = ['tasks', 'usage', 'models', 'providers', 'config', 'logs']
+  for (const v of views) {
+    const i = html.indexOf(`id="view-${v}"`)
+    assert.ok(i > 0, `应有 ${v} 视图`)
+    // 取到下一个视图开头
+    const nextView = html.indexOf('<section class="view"', i + 10)
+    const body = html.slice(i, nextView > 0 ? nextView : undefined)
+    assert.ok(body.includes('class="page-head"'),
+      `⚠️ ${v} 视图应有统一的 .page-head 页头`)
+  }
+  // ⚠️ 不得再有「裸 h2 带按钮」的旧写法（按钮应在 .page-tools 里）
+  assert.ok(!/<h2>[^<]*<button/.test(html), '⚠️ 标题里不得直接塞按钮（应放 .page-tools）')
+})
+
+test('⚠️ 不得用「容器 gap + 子元素 margin」造成双重间距', () => {
+  // 本轮把 `section.view` 从「卡片」改成「布局容器（display:grid; gap:14px）」
+  // 之后，凡是做它直接子元素的块都必须**去掉自己的下边距** ——
+  // 否则 gap 与 margin 叠加，间距凭空翻倍。
+  // ⚠️ 这是改布局时极易漏的一类，本轮我自己就漏了 4 处。
+  const css = stripCssComments(panelAsset('/panel/style.css')?.body ?? '')
+  for (const cls of ['.kpi-grid', '.panel', '.task-cards', '.counts', '.hint', '.page-head']) {
+    const i = css.indexOf(cls + (cls === '.panel' ? ' {' : ' {'))
+    if (i < 0) continue
+    const body = css.slice(i, css.indexOf('}', i))
+    // ⚠️ 允许 `margin-bottom: 0`（显式归零是有意的，见 .page-head 的说明）——
+    //    真正要禁的是**非零**下边距与 gap 叠加。
+    const mb = body.match(/(?:^|;)\s*margin-bottom\s*:\s*([^;]+)/)
+    if (mb) {
+      assert.ok(/^0(\s|px|rem|em|%)*$/.test(mb[1].trim()),
+        `⚠️ ${cls} 是视图直接子元素，不得有**非零** margin-bottom（会与容器 gap 叠成双间距），实际 ${mb[1].trim()}`)
+    }
+  }
+})
+
+test('⚠️ 嵌套面必须有视觉差异（不得「框里套框」）', () => {
+  // 相邻嵌套面若完全一样（同边框同底色），看起来就是多余的框。
+  // `.out` 在 `.panel` 里时保留深色背景（表达「原始输出」的层级差），
+  // 但**去掉描边**，由外层 `.panel` 独自承担边框。
+  const css = stripCssComments(panelAsset('/panel/style.css')?.body ?? '')
+  assert.ok(/\.panel\s*>\s*\.out\s*\{[^}]*border:\s*0/.test(css),
+    '⚠️ .panel 内的 .out 必须去掉边框（否则框里套框）')
+})

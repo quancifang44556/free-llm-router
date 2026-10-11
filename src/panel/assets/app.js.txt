@@ -946,16 +946,20 @@ function renderUsageTrend(byDay, windowDays) {
 function renderUsageHours(byHour, windowDays) {
   const box = $('usage-hours')
   const title = $('usage-hours-title')
+  const panel = $('usage-hours-panel')
   clear(box)
-  // ⚠️ 跨天的小时标签会互相覆盖（两个不同的「09:00」），合并起来没有解释力。
-  // 故非「今日」窗口时**如实说明并隐藏**，而不是给一张误导的图。
+
+  // ## 非「今日」窗口 ⇒ **整个面板隐藏**（用户明确要求：不显示那个框）
+  //
+  // ⚠️ 跨天的小时标签会互相覆盖（两个不同的「09:00」），合并起来没有解释力，
+  // 故这段时间本来就不该有内容。
+  // ⚠️ 上一版留着**面板 + 一句说明**，用户反馈那是「一个没用的框」——
+  // 隐藏**整个面板**（含标题）才是对的：留个空标题 + 说明比不显示更碍眼。
   if (windowDays !== 1) {
-    title.textContent = '按小时（只有「今日」窗口按小时统计）'
-    const p = document.createElement('p'); p.className = 'hint'
-    p.textContent = '切换到「今日」可看按小时分布；更长窗口请用上方的「按天趋势」。'
-    box.appendChild(p)
+    panel.hidden = true
     return
   }
+  panel.hidden = false
   title.textContent = '按小时（今日）'
   const hours = Array.isArray(byHour) ? byHour : []
   if (hours.length === 0) {
@@ -1071,7 +1075,6 @@ async function loadUsage() {
   const avgMs = total === 0 ? 0 : Math.round(parts.reduce((n, p) => n + p.avgMs * p.total, 0) / total)
   const windowDays = parts[0].windowDays
   const activeDays = sum('activeDays')
-  const detailCapped = parts.some((p) => p.detailCapped)
 
   // ── KPI 卡片（照 cpa-usage-keeper 的观感：大数字 + 彩色图标章 + 带单位副标题）──
   //
@@ -1124,18 +1127,10 @@ async function loadUsage() {
   // 而卡上显示的是**均值** —— 拿合计画趋势会把「请求多的一天」画成
   // 「很慢的一天」，那是**误导**。宁可不画，也不给一张错图。
 
-  // ── 数据边界说明（关键：解释「为什么明细比总数少」）──
-  const scope = $('usage-scope')
-  if (total === 0) {
-    scope.textContent = `${rangeLabel}：没有请求记录。`
-  } else {
-    // ⚠️ 说明里必须同时点出「按天聚合」与「明细 500 条」两件事 ——
-    // 只说其一都会让用户误判。
-    let text = `${rangeLabel}：${activeDays} 天有记录，共 ${fmtNum(total)} 次请求`
-    text += `（明细列表只保留最近 500 条，按天聚合保留 90 天；所以明细行数可能少于总数）`
-    if (detailCapped) text += '。当前明细已满，更早的明细不可见，但不影响上方统计'
-    scope.textContent = text
-  }
+  // （原先这里有一段「数据边界说明」，按用户要求**删除**。
+  //   用户原话：「切换天数下面不要显示说明，能看懂」。
+  //   ⚠️ 信息本身没丢：`activeDays` 已作为「总请求」卡的副标题 ——
+  //   它能回答「这段时间有多少天真的用过」，正是说明里唯一有用的那部分。）
 
   renderUsageTrend([...byDayMap.values()].sort((a, b) => b.day.localeCompare(a.day)), windowDays)
   renderUsageHours([...byHourMap.values()].sort((a, b) => a.hour.localeCompare(b.hour)), windowDays)

@@ -54,7 +54,9 @@
 
   <!-- ───────── 任务中心 ───────── -->
   <section class="view" id="view-tasks" hidden>
-    <h2>任务中心</h2>
+    <div class="page-head">
+      <h2>任务中心</h2>
+    </div>
     <p class="hint">点一下就跑完，不用选。所有任务都是幂等的，重复点安全。</p>
 
     <div class="task-cards">
@@ -75,14 +77,21 @@
       </div>
     </div>
 
-    <h3>执行结果</h3>
-    <div id="task-result" class="out"></div>
-    <h3>任务进度</h3>
-    <div class="row">
-      <label>账号 <select id="task-uid"></select></label>
-      <button id="refresh-status" class="ghost">查进度</button>
-    </div>
-    <pre id="task-status" class="out"></pre>
+    <section class="panel">
+      <div class="panel-head"><h3>执行结果</h3></div>
+      <div id="task-result" class="out"></div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h3>任务进度</h3>
+        <div class="row">
+          <label>账号 <select id="task-uid"></select></label>
+          <button id="refresh-status" class="ghost">查进度</button>
+        </div>
+      </div>
+      <pre id="task-status" class="out"></pre>
+    </section>
   </section>
 
   <!-- ───────── 用量 ───────── -->
@@ -95,10 +104,6 @@
         <button class="ghost" id="refresh-usage">刷新</button>
       </div>
     </div>
-
-    <!-- ⚠️ 数据边界说明：明细只留最近 500 条，而按天聚合留 90 天。
-         两者不是一回事，必须说清 —— 否则用户会以为「总数不对」。 -->
-    <p class="hint" id="usage-scope"></p>
 
     <!-- KPI 卡片网格（照参考项目：大数字 + 彩色图标章 + 带单位的副标题） -->
     <div id="usage-summary" class="kpi-grid"></div>
@@ -133,15 +138,19 @@
 
   <!-- ───────── 模型 ───────── -->
   <section class="view" id="view-models" hidden>
-    <h2>模型目录 <button class="ghost" id="load-models">加载</button></h2>
-    <div id="models" class="out"></div>
+    <div class="page-head">
+      <h2>模型目录</h2>
+      <div class="page-tools"><button class="ghost" id="load-models">加载</button></div>
+    </div>
+    <section class="panel"><div id="models" class="out"></div></section>
   </section>
 
   <!-- ───────── 供应商 ───────── -->
   <section class="view" id="view-providers" hidden>
-    <h2>供应商与账号
-      <button class="ghost" id="refresh-providers">刷新</button>
-    </h2>
+    <div class="page-head">
+      <h2>供应商与账号</h2>
+      <div class="page-tools"><button class="ghost" id="refresh-providers">刷新</button></div>
+    </div>
     <div id="pool-counts" class="counts"></div>
     <p class="hint">点任意一家可管理它的账号与模型。</p>
     <div id="providers" class="prov-grid"></div>
@@ -150,15 +159,20 @@
 
   <!-- ───────── 配置 ───────── -->
   <section class="view" id="view-config" hidden>
-    <h2>配置与状态</h2>
-    <div id="config"></div>
+    <div class="page-head"><h2>配置与状态</h2></div>
+    <section class="panel"><div id="config"></div></section>
   </section>
 
   <!-- ───────── 日志 ───────── -->
   <section class="view" id="view-logs" hidden>
-    <h2>请求日志 <button class="ghost" id="refresh-logs">刷新</button>
-      <button class="ghost" id="clear-logs">清空</button></h2>
-    <div id="logs" class="out"></div>
+    <div class="page-head">
+      <h2>请求日志</h2>
+      <div class="page-tools">
+        <button class="ghost" id="refresh-logs">刷新</button>
+        <button class="ghost" id="clear-logs">清空</button>
+      </div>
+    </div>
+    <section class="panel"><div id="logs" class="out"></div></section>
   </section>
 </main>
 

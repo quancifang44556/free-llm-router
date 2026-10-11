@@ -27,8 +27,20 @@ header {
 }
 .brand { display: flex; gap: 12px; align-items: center; }
 h1 { font-size: 15px; margin: 0; letter-spacing: .3px; }
-h2 { font-size: 14px; margin: 0 0 12px; display: flex; gap: 10px; align-items: center; }
-h3 { font-size: 13px; margin: 16px 0 8px; color: var(--dim); font-weight: 500; }
+/*
+ * 标题
+ *
+ * ⚠️ `h2` 的**下边距归零** —— 它现在总是放在 `.page-head` 里，
+ * 而那个容器自己管间距（`margin-bottom: 10px`）。
+ * 两处都加会让标题下方多出一段空白，越看越松。
+ * ⚠️ `h3` 同理：它现在总在 `.panel-head` 里，下边距由容器给。
+ * ⚠️ 但 `h3` **保留非布局场景的下边距**（少数地方 h3 是直接子元素，
+ * 如任务页的「执行结果」），故用 `:only-child` 之外的场景保留。
+ */
+h2 { font-size: 14px; margin: 0; display: flex; gap: 10px; align-items: center; }
+h3 { font-size: 13px; margin: 0; color: var(--dim); font-weight: 500; }
+/* 直接坐在视图里的 h3（不在 .panel-head 内）仍需要上下间距 */
+section.view > h3 { margin: 16px 0 8px; }
 
 nav {
   display: flex; flex-wrap: wrap; gap: 4px; padding: 8px 16px;
@@ -41,8 +53,42 @@ nav {
 .nav-item:hover { color: var(--text); background: var(--panel2); }
 .nav-item.active { color: #fff; background: var(--accent); border-color: var(--accent); }
 
-main { padding: 18px; max-width: 1180px; margin: 0 auto; display: grid; gap: 16px; }
-section.view { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px; }
+/*
+ * 页面主容器（**纯布局**，视觉边界交给内部的 `.panel` / `.kpi`）。
+ *
+ * ⚠️ `max-width` 从 1180 提到 1240：视图容器去掉内边距后内容区反而变宽，
+ * 而 KPI 卡在 1180 时刚好排成 **5 列**（我们正好 5 张卡）——
+ * 每张被压到约 210px，数字稍长就折行。放宽后是 4 列，读起来舒服得多。
+ */
+main { padding: 20px; max-width: 1240px; margin: 0 auto; display: grid; gap: 16px; }
+/*
+ * ⚠️⚠️ **视图容器本身不再是「一张卡」**（用户报「按天趋势里面不要再套一个框」）。
+ *
+ * 根因：`section.view` 原先自带 `background + border + radius`，而它内部
+ * 现在**全部是卡片**（`.panel` / `.kpi` / `.prov-card`）⇒ 每个内部卡片外围
+ * 都又多了一圈同样的框，也就是「框里套框」。
+ *
+ * 这与用户的抱怨是同一件事：他要的是**扁平的一层卡片结构**。
+ * ⇒ 视图容器退成**纯布局容器**（无背景、无边框、无内边距），
+ *   由内部的 `.panel` / `.kpi` 自己承担视觉边界。
+ *
+ * ⚠️ 仍然保留 `min-width: 0`（网格项默认不收缩，去掉会让长表格撑破页面 ——
+ * 见文件里 `main > *` 那段踩坑记录）。
+ */
+/*
+ * 视图容器 = **纯布局容器**（无背景/边框/内边距）。
+ *
+ * ⚠️ 原先是 `background + border + radius + padding` —— 那是「一张卡」。
+ * 而它内部现在**全是卡片**（`.panel` / `.kpi` / `.prov-card`）
+ * ⇒ 每个内部卡片外围又多一圈同样的框，即用户抱怨的「框里套框」。
+ * 视觉边界改由内部卡片自己承担。
+ *
+ * ⚠️ `min-width: 0` 必须保留：网格项默认不收缩，去掉会让长表格撑破页面
+ *（见下方 `main > *` 那段踩坑记录）。
+ * ⚠️ `display: grid; gap` 让视图内的多个面板有统一间距
+ *（容器不再有 padding，间距得自己给）。
+ */
+section.view { min-width: 0; display: grid; gap: 14px; align-content: start; }
 
 .auth { display: flex; gap: 8px; align-items: center; }
 input, select, textarea, button {
@@ -60,7 +106,14 @@ button:disabled { opacity: .5; cursor: not-allowed; }
 .row label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--dim); }
 .pill { font-size: 12px; color: var(--dim); }
 .pill.ok { color: var(--ok); } .pill.err { color: var(--err); }
-.hint { color: var(--dim); font-size: 12px; margin: 6px 0; }
+/*
+ * 说明文字。
+ *
+ * ⚠️ 上下边距**归零**：它现在多半是 `section.view` 或 `.panel` 的直接子元素，
+ * 而那两个容器都有 `gap` —— 再加 margin 就是双重间距。
+ *（`.hint` 在旧结构里靠 margin 撑开，容器改布局后必须跟着改。）
+ */
+.hint { color: var(--dim); font-size: 12px; margin: 0; }
 
 .out {
   background: #0c0f14; border: 1px solid var(--line); border-radius: 8px;
@@ -75,6 +128,26 @@ button:disabled { opacity: .5; cursor: not-allowed; }
  * 这些容器是**先占位、后填内容**的，所以空的时候直接不显示。
  */
 .out:empty { display: none; }
+
+/*
+ * ⚠️ `.out` **放在 `.panel` 里时不要再套一层框**。
+ *
+ * `.out` 自己就有 `border + radius + background`，而 `.panel` 也是同样的三件套
+ * ⇒ 又是「框里套框」（用户明确抱怨过这个观感）。
+ *
+ * 处理：保留 `.out` 的**深色背景**（它表达「这是原始输出」，是有意义的
+ * 层级差），但**去掉描边**，让外层的 `.panel` 独自承担边框。
+ * —— 相邻嵌套面必须有视觉差异（背景步进或阴影），这里用**背景步进**。
+ */
+.panel > .out { border: 0; }
+
+/*
+ * ⚠️ 空面板不应留下一个空框：`.out:empty` 自己会 `display:none`，
+ * 但外层 `.panel` 的 padding 还在，看起来像个莫名的空卡片。
+ * `:has()` 现代浏览器（Chrome 105+ / Safari 15.4+）都支持；
+ * 不支持时只是多一个空框，不影响功能。
+ */
+.panel:has(> .out:empty) { display: none; }
 
 .notice {
   background: #1a2432; border: 1px solid #2a3d57; border-radius: 10px; padding: 14px 16px;
@@ -98,12 +171,15 @@ button:disabled { opacity: .5; cursor: not-allowed; }
 }
 .banner button { background: transparent; border-color: #7a3a3a; color: #ffd9d9; }
 
-.counts { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 12px; }
+/* ⚠️ 下边距归零：它是视图/面板的直接子元素，间距由容器的 gap 给。 */
+.counts { display: flex; flex-wrap: wrap; gap: 10px; }
 .count {
-  background: var(--panel2); border: 1px solid var(--line); border-radius: 8px;
-  padding: 8px 12px; min-width: 92px;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+  padding: 9px 13px; min-width: 92px;
+  box-shadow: 0 1px 2px rgba(0,0,0,.03);
 }
-.count b { display: block; font-size: 18px; font-weight: 600; }
+/* ⚠️ 数字用 tabular-nums：计数块并排时数字宽度一致，不会左右跳动 */
+.count b { display: block; font-size: 19px; font-weight: 600; font-variant-numeric: tabular-nums; }
 .count span { font-size: 11px; color: var(--dim); }
 /*
  * 可点击的计数块（冷却中 / 模型限流）。
@@ -122,8 +198,13 @@ button:disabled { opacity: .5; cursor: not-allowed; }
 }
 
 .card {
-  border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; margin-bottom: 8px;
+  border: 1px solid var(--line); border-radius: 12px; padding: 10px 12px; margin-bottom: 8px;
   display: flex; flex-wrap: wrap; gap: 10px; align-items: center;
+  background: var(--panel);
+  /* ⚠️ 与 `.panel` / `.kpi` 用同一套阴影与圆角 —— 用户要求「把其它界面的 UI
+     也统一成这种风格」。旧值 8px 圆角 + 无阴影，与新的 16px 卡片并排会明显
+     不是一套。 */
+  box-shadow: 0 1px 2px rgba(0,0,0,.03);
 }
 .card .uid { font-family: ui-monospace, monospace; font-size: 12px; color: var(--dim); }
 .card .grow { flex: 1 1 220px; }
@@ -183,8 +264,10 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
  * 不引第三方 UI 库 —— 否则要么打包体积暴涨，要么与既有主题打架。
  */
 .kpi-grid {
-  display: grid; gap: 12px; margin-bottom: 14px;
-  /* 自适应列数：窄屏 1 列、宽屏最多 3 列（参考项目是 3 列布局） */
+  display: grid; gap: 12px;
+  /* ⚠️ 自适应列数由 `minmax` 决定（窄屏 1 列 → 宽屏 4~5 列）。
+     ⚠️ 不写 `margin-bottom`：它总是放在 `section.view`（`gap: 14px`）里，
+     再加下边距就是**双重间距**（本项目改布局时反复踩到这一点）。 */
   grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
 }
 .kpi {
@@ -296,7 +379,9 @@ html[data-theme='light'] .rank-idx { background: #eef1f5; }
 /* ─────────── 用量页：通用面板容器 ─────────── */
 .panel {
   border: 1px solid var(--line); border-radius: 16px;
-  background: var(--panel); padding: 14px 16px; margin-bottom: 14px;
+  /* ⚠️ 不写 `margin-bottom`：面板总是 `section.view`（`gap: 14px`）的子元素，
+     间距由容器统一给。自己再加一份就是双重间距。 */
+  background: var(--panel); padding: 14px 16px;
   box-shadow: 0 1px 2px rgba(0,0,0,.03);
 }
 .panel-head {
@@ -308,7 +393,10 @@ html[data-theme='light'] .rank-idx { background: #eef1f5; }
 /* ─────────── 用量页：页头（标题 + 工具行） ─────────── */
 .page-head {
   display: flex; align-items: center; justify-content: space-between;
-  gap: 12px; flex-wrap: wrap; margin-bottom: 10px;
+  gap: 12px; flex-wrap: wrap;
+  /* ⚠️ `margin-bottom: 0` —— 间距全部交给 `section.view` 的 `gap: 14px`。
+     这里再加一点就会变成「gap + margin」双重间距，标题与内容之间显得空旷。 */
+  margin-bottom: 0;
 }
 .page-head h2 { margin: 0; }
 .page-tools { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
@@ -344,8 +432,11 @@ html[data-theme='light'] .kpi {
  */
 .trend {
   display: flex; align-items: flex-end; gap: 4px;
-  overflow-x: auto; padding: 8px 2px 0; margin-bottom: 12px;
-  border: 1px solid var(--line); border-radius: 8px; background: var(--panel2);
+  overflow-x: auto; padding: 8px 2px 0;
+  /* ⚠️ **不要再套一层框**（用户报「按天趋势里面不要再套一个框」）。
+     它本身已经在一个 `.panel`（有边框/圆角/底色）里了，
+     再加一层就是「框里套框」—— 视觉上冗余，也让层级变模糊。
+     ⇒ 去掉 `border` / `background` / `margin-bottom`（外层 panel 已有内边距）。 */
   /* ## 🔴 必须限宽（用户报「太宽不好看」）
    *
    * `.trend-col` 的 `flex-basis` 是 26px（为了让窄窗口的柱子不至于细到看不见），
@@ -398,8 +489,9 @@ html[data-theme='light'] .trend-track { background: #e8ebf0; }
 /* ─────────── 供应商网格 ─────────── */
 .prov-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 10px; }
 .prov-card {
-  border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px;
-  cursor: pointer; background: var(--panel2); transition: border-color .12s;
+  border: 1px solid var(--line); border-radius: 14px; padding: 12px 14px;
+  cursor: pointer; background: var(--panel); transition: border-color .12s, box-shadow .12s;
+  box-shadow: 0 1px 2px rgba(0,0,0,.03);
 }
 .prov-card:hover { border-color: var(--accent); }
 .prov-card .prov-name { font-weight: 600; font-size: 13px; }
@@ -435,7 +527,8 @@ html[data-theme='light'] .trend-track { background: #e8ebf0; }
 .modal .card { background: var(--panel2); }
 
 /* ─────────── 任务卡片 ─────────── */
-.task-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 12px; margin-bottom: 8px; }
+/* ⚠️ 不写下边距（容器有 gap） */
+.task-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 12px; }
 .task-card {
   border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px;
   background: var(--panel2); display: flex; flex-direction: column; gap: 8px;
@@ -719,9 +812,49 @@ main > * { min-width: 0; }
   .nav-item { white-space: nowrap; flex: 0 0 auto; }
 }
 
+/* ─────────── 手机端（≤720px）：用量页新组件的适配 ─────────── */
+/*
+ * ⚠️ 这些是**本轮新增**的组件（KPI 卡 / 排名行 / sparkline / 页头），
+ * 它们此前没有任何窄屏规则 —— 而宽屏下的尺寸直接缩到 375px 会挤成一团。
+ *
+ * 原则（与既有移动端规则一致）：
+ *   1. **能在容器内滚动的就滚动**，不要撑破页面（横向溢出最难用）；
+ *   2. **不靠缩小字号硬塞** —— 字号低于 11px 在手机上已经不好读；
+ *   3. 实在放不下的**次要信息**宁可省略（鼠标悬停仍可看 title），
+ *      也不要把主信息挤没。
+ */
+@media (max-width: 720px) {
+  /* KPI 卡：单列铺满，数字略收（25px → 22px）以免长数字折行 */
+  .kpi-grid { grid-template-columns: 1fr; gap: 10px; }
+  .kpi { padding: 12px 14px; }
+  .kpi-value { font-size: 22px; }
+  .spark { height: 24px; }
+
+  /* 排名行：手机上把「指标」换到第二行 ——
+     ⚠️ 不换行的话，`metrics` 是 flex:none + nowrap，
+     会把名称栏挤到只剩 100px 左右，长模型名直接变成一列碎字。 */
+  .rank-row { flex-wrap: wrap; row-gap: 6px; }
+  .rank-main { flex: 1 1 100%; order: 1; }
+  .rank-idx { order: 0; }
+  .rank-metrics { order: 2; flex: 1 1 100%; padding-left: 32px; gap: 12px; }
+
+  /* 页头：标题与工具行各占一行（工具行可横向滚动，避免按钮换行凌乱） */
+  .page-head { align-items: flex-start; }
+  .page-tools { width: 100%; overflow-x: auto; flex-wrap: nowrap; }
+  .page-tools .seg { flex: 0 0 auto; }
+
+  /* 面板内边距收紧，把宽度让给内容 */
+  .panel { padding: 12px 13px; border-radius: 14px; }
+  .panel-head { margin-bottom: 10px; }
+}
+
 /* ── 二维码：小屏上略缩，避免把弹窗撑到需要滚动 ── */
 @media (max-width: 420px) {
   .qr-box svg { width: 148px; height: 148px; }
+  /* 更窄的屏：KPI 数字再收一档；排名指标的字号保持 11px（不硬缩） */
+  .kpi-value { font-size: 20px; }
+  .kpi { padding: 11px 12px; }
+  .rank-metrics { padding-left: 0; }
 }
 
 /*
