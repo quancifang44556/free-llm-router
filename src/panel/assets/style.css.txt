@@ -224,6 +224,75 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 .kpi.pink   { --kpi: #ec4899; --kpi-soft: rgba(236,72,153,.14); }
 .kpi.red    { --kpi: var(--err); --kpi-soft: rgba(239,95,95,.14); }
 
+/* ─────────── KPI 卡内的迷你趋势线（sparkline） ─────────── */
+/*
+ * 照参考项目：KPI 卡底部一条细折线，让「数字」带上「走向」。
+ * ⚠️ `preserveAspectRatio: none`（在 JS 里设）+ `height` 固定、
+ * `width: 100%` ⇒ 折线自适应卡片宽度而不留边距。
+ * ⚠️ `vector-effect: non-scaling-stroke`（在 JS 里设）保证横向拉伸时
+ * **描边粗细不变**，否则宽卡上的线会被拉成一片色块。
+ */
+.spark {
+  display: block; width: 100%; height: 28px;
+  margin-top: 8px; overflow: visible;
+}
+.spark path { stroke: var(--kpi, var(--accent)); }
+/* 每张卡用自己色系的线（与图标章同色） */
+.spark-blue path   { stroke: #4f8cff; }
+.spark-purple path { stroke: #a855f7; }
+.spark-green path  { stroke: #22c55e; }
+.spark-orange path { stroke: #f59e0b; }
+.spark-cyan path   { stroke: #06b6d4; }
+.spark-pink path   { stroke: #ec4899; }
+.spark-red path    { stroke: var(--err); }
+
+/* ─────────── 用量页：排名列表（照参考项目的 Top Models） ─────────── */
+.rank-row {
+  display: flex; align-items: center; gap: 12px;
+  padding: 9px 2px; border-bottom: 1px solid var(--line);
+}
+.rank-row:last-child { border-bottom: 0; }
+/* 序号徽章：前三名给一个强调色，其余保持中性（不喧哗） */
+.rank-idx {
+  flex: none; width: 20px; height: 20px; border-radius: 6px;
+  display: inline-flex; align-items: center; justify-content: center;
+  font-size: 11px; font-weight: 600; color: var(--dim);
+  background: var(--panel2);
+}
+.rank-idx.top1 { background: rgba(79,140,255,.16); color: #4f8cff; }
+.rank-idx.top2 { background: rgba(168,85,247,.16); color: #a855f7; }
+.rank-idx.top3 { background: rgba(34,197,94,.16); color: #22c55e; }
+.rank-main { flex: 1 1 auto; min-width: 0; }
+.rank-head {
+  display: flex; align-items: baseline; justify-content: space-between;
+  gap: 10px; margin-bottom: 5px;
+}
+.rank-name {
+  font-size: 12px; font-weight: 500;
+  /* ⚠️ 长模型名/uid 必须能断行，且用 `overflow-wrap` 而非 `break-all`
+     （后者会截断正常英文单词，项目单测禁止）。 */
+  overflow-wrap: anywhere; min-width: 0;
+}
+.rank-share {
+  flex: none; font-size: 11px; color: var(--dim);
+  font-variant-numeric: tabular-nums;
+}
+.rank-track {
+  height: 6px; border-radius: 3px; background: #10131a; overflow: hidden;
+}
+.rank-fill { height: 100%; background: var(--accent); border-radius: 3px; }
+.rank-fill.bad { background: var(--err); }
+.rank-metrics {
+  flex: none; display: flex; gap: 10px; align-items: baseline;
+  font-size: 11px; color: var(--dim); font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.rank-failed { color: var(--err); }
+/* ⚠️ 浅色主题下轨道底色要换 —— **两套都要覆盖**（见 AGENTS.md §9.1b ②g：
+   显式 light 与「跟随系统」是两套独立规则，漏一处就只在某种模式下出错）。 */
+html[data-theme='light'] .rank-track { background: #e8ebf0; }
+html[data-theme='light'] .rank-idx { background: #eef1f5; }
+
 /* ─────────── 用量页：通用面板容器 ─────────── */
 .panel {
   border: 1px solid var(--line); border-radius: 16px;
@@ -485,6 +554,9 @@ html[data-theme='light'] .prov-card .prov-credits { background: #e7f5ec; border-
   html:not([data-theme]) .banner { background: #fdecec; border-color: #f0a0a0; color: #7f1d1d; }
   html:not([data-theme]) .notice { background: #eef4ff; border-color: #b9d0f5; }
   html:not([data-theme]) .cap.off { color: #8a93a3; }
+  /* ⚠️ 与上面 `html[data-theme='light'] .rank-track` 成对 —— 漏一个就是「某种模式下出错」 */
+  html:not([data-theme]) .rank-track { background: #e8ebf0; }
+  html:not([data-theme]) .rank-idx { background: #eef1f5; }
   /* ⚠️ 与上面 `html[data-theme='light'] .kpi` 成对 —— 漏一个就是「只有某种模式出错」 */
   html:not([data-theme]) .kpi {
     box-shadow: 0 1px 2px rgba(0,0,0,.04), 0 10px 20px -12px rgba(0,0,0,.18);

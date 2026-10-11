@@ -482,7 +482,13 @@ test('⚠️ 所有表格必须包在 .table-wrap 里（否则手机上横向溢
   const wrapped = calls.filter((c) => c === 'wrapTable').length
   // 允许 buildTable 的定义体本身（`function buildTable(`）
   assert.equal(bare, 1, `buildTable 只应在定义处出现一次裸调用，实际 ${bare}`)
-  assert.ok(wrapped >= 5, `应有至少 5 处 wrapTable(buildTable(...))，实际 ${wrapped}`)
+  // ⚠️ **不写死「至少 N 处」** —— 那是个会随界面改版失效的魔数。
+  // 本轮把「按模型/按账号」两张表换成了**排名列表**（不存在表格，也就无需包裹），
+  // 数量从 5 掉到 4 —— 而**真正要守的约束没变**：
+  // 「凡是用表格的地方，必须包在 `.table-wrap` 里」。
+  // 上面那条 `bare === 1`（只允许定义处）已经等价地守住了它，
+  // 故这里只要求「还有表格在用这套包装」，不再钉具体数字。
+  assert.ok(wrapped >= 1, `应仍有用 wrapTable 包裹的表格，实际 ${wrapped}`)
 
   assert.ok(css.includes('.table-wrap'), 'CSS 必须有 .table-wrap 规则')
   assert.ok(/\.table-wrap\s*\{[^}]*overflow-x:\s*auto/.test(css), '.table-wrap 必须横向可滚动')
@@ -1194,6 +1200,9 @@ function makeEl(tag) {
       contains(c) { return this._s.has(c) },
     },
     get firstChild() { return this.children[0] ?? null },
+    // ⚠️ DOM 里子节点数组叫 `childNodes`，而面板代码用 `children` ——
+    // 两者都要有（我第一版只给了 children，测试读 childNodes 就拿到 undefined）。
+    get childNodes() { return this.children },
     get textContent() { return this._text ?? '' },
     set textContent(v) { this._text = String(v); this.children = [] },
     appendChild(c) { this.children.push(c); return c },
@@ -1201,7 +1210,11 @@ function makeEl(tag) {
     insertBefore(c) { this.children.unshift(c); return c },
     addEventListener() {},
     removeEventListener() {},
-    setAttribute() {},
+    // ⚠️ SVG 元素用 `setAttribute`/`getAttribute` 而不是属性赋值 ——
+    // `sparkline` 完全依赖它们，桩里必须真的存下来（否则断言读不到 d）。
+    _attrs: {},
+    setAttribute(k, v) { this._attrs[k] = String(v) },
+    getAttribute(k) { return Object.prototype.hasOwnProperty.call(this._attrs, k) ? this._attrs[k] : null },
     getBoundingClientRect() { return { top: 0, height: 0, left: 0, width: 0 } },
     querySelectorAll() { return [] },
     querySelector() { return null },
@@ -1229,6 +1242,9 @@ function runPanelJs(fnSource) {
       return els.get(id)
     },
     createElement: (tag) => makeEl(tag),
+    // ⚠️ SVG 必须走 `createElementNS`（命名空间）—— `sparkline` 用它建 svg/path。
+    // 桩里直接复用同一个元素实现即可（我们只关心属性与子节点）。
+    createElementNS: (_ns, tag) => makeEl(tag),
     querySelectorAll: () => [],
     querySelector: () => null,
     documentElement: makeEl('html'),
@@ -1316,4 +1332,81 @@ test('⚠️ 用量页不得有「清空」按钮（用户要求删除）', () =
   // ⚠️ 后端端点**保留**：用户只要求删按钮，没说删能力
   const idx = readFileSync('src/index.ts', 'utf8')
   assert.ok(idx.includes("'/admin/usage/clear'"), '后端清空端点应保留（只删了按钮）')
+})
+
+test('⚠️ sparkline 的边界：少于 2 个点必须返回空（不能编造一条平线）', async () => {
+  // 照参考项目 KPI 卡底部的趋势线。三个边界都必须对：
+  //   1. < 2 个点 ⇒ 连不成线，返回**空**（硬画会得到一条假水平线，
+  //      那是在**编造**「数据很平稳」）；
+  //   2. 全平（max === min）⇒ 画中线，**不能**除零（NaN 会让整条 path 不渲染）；
+  //   3. 正常序列 ⇒ 画出 path。
+  const rt = runPanelJs('sparkline')
+  // ① 0 / 1 个点 → 空
+  for (const vals of [[], [5]]) {
+    const svg = rt.sparkline(vals, 'blue')
+    assert.equal(svg.childNodes.length, 0,
+      `⚠️ ${vals.length} 个点时应返回空 SVG（不能画假线）`)
+  }
+  // ② 全平 → 有 path 且 d 里**不含 NaN**
+  const flat = rt.sparkline([7, 7, 7], 'green')
+  assert.equal(flat.childNodes.length, 1, '全平也应画出线（中线）')
+  const flatD = flat.childNodes[0].getAttribute('d')
+  assert.ok(!/NaN/.test(String(flatD)), `⚠️ 全平时不得出现 NaN（实际 ${flatD}）`)
+  // ③ 正常 → 有 path 且点数正确（3 个点 ⇒ 2 段 L）
+  const norm = rt.sparkline([1, 5, 3], 'purple')
+  assert.equal(norm.childNodes.length, 1, '正常序列应画出线')
+  const d = String(norm.childNodes[0].getAttribute('d'))
+  assert.ok(d.startsWith('M'), 'path 应以 M 开头')
+  assert.equal((d.match(/L/g) ?? []).length, 2, '3 个点应有 2 段直线')
+})
+
+test('⚠️ KPI 卡只在真有 ≥2 个点时加 sparkline（否则留一段空白）', () => {
+  const js = stripJsComments(panelAsset('/panel/app.js')?.body ?? '')
+  const fn = js.slice(js.indexOf('function kpiCard'))
+  assert.ok(/sparkValues\.length >= 2/.test(fn),
+    '⚠️ 少于 2 个点时不得加 sparkline（空 SVG 会撑出空白）')
+  // ⚠️ 还要判 sparkline 真的产出了内容（它内部可能因边界返回空 SVG）
+  assert.ok(/childNodes\.length > 0/.test(fn),
+    '⚠️ 加之前要确认 sparkline 真产出了内容')
+})
+
+test('⚠️ 耗时卡**故意不**给 sparkline（拿了会误导）', () => {
+  // 我们只存了「按天的合计耗时」，而卡上显示的是**均值** ——
+  // 拿合计画趋势会把「请求多的一天」画成「很慢的一天」。
+  // ⚠️ 宁可不画，也不给一张错图。
+  const js = stripJsComments(panelAsset('/panel/app.js')?.body ?? '')
+  const i = js.indexOf("'平均耗时'")
+  assert.ok(i > 0, '应有平均耗时卡')
+  // ⚠️ 判据要**简单**：直接确认那一行之后**紧接着**就是副标题参数、
+  // 然后调用结束（没有第 6 个参数）。前面两版写法都太脆：
+  //   · 用「正则匹配结尾」——实参跨两行且含模板字符串，匹配不到；
+  //   · 数顶层逗号 —— 会把 `? :` 三元与嵌套调用的括号算错。
+  const twoLines = js.split('\n')
+  const at = twoLines.findIndex((l) => l.includes("'平均耗时'"))
+  assert.ok(at > 0, '应能找到平均耗时卡那一行')
+  const call = twoLines.slice(at, at + 2).join('\n')
+  assert.ok(/kpiCard\('orange',\s*'⏱',\s*'平均耗时',\s*fmtDuration\(avgMs\),/.test(call),
+    '平均耗时卡应只到 fmtDuration(avgMs) 为止')
+  // 关键：紧接的第二行必须以 `))` 收尾（第 5 个参数结束、调用结束）
+  assert.ok(/\+\s*' 次请求的平均'\)\)\s*$/.test(call.trim().split('\n')[1] ?? ''),
+    '⚠️ 平均耗时卡不得传第 6 个参数（sparkline）—— 合计 ≠ 均值，画出来是误导')
+})
+test('⚠️ 排名列表：占比用总数为分母、条宽用最大值为分母', () => {
+  // 两者的分母**故意不同**：
+  //   · 占比文字答「占多少份额」⇒ 用**总请求数**
+  //   · 条宽答「相对第一名多长」⇒ 用**最大值**（让第一名铺满，更好读）
+  // 混用会让「占比 40% 的条」和「条长 40%」在视觉上打架。
+  const js = stripJsComments(panelAsset('/panel/app.js')?.body ?? '')
+  const fn = js.slice(js.indexOf('function renderUsageRanking'))
+  assert.ok(/totalCount === 0 \? '' : \(\(r\.count \/ totalCount\) \* 100\)/.test(fn),
+    '⚠️ 占比文字应以**总请求数**为分母')
+  assert.ok(/\(r\.count \/ max\) \* 100/.test(fn),
+    '⚠️ 条宽应以**最大值**为分母')
+  // 空数据要给提示而不是白板
+  assert.ok(/无数据/.test(fn), '空数据应给提示')
+  // ⚠️ 长名断行用 overflow-wrap（不是 break-all —— 项目单测禁止后者）
+  const css = panelAsset('/panel/style.css')?.body ?? ''
+  const nameRule = css.slice(css.indexOf('.rank-name {'))
+  assert.ok(/overflow-wrap:\s*anywhere/.test(nameRule.slice(0, nameRule.indexOf('}'))),
+    '⚠️ 长模型名/uid 要能断行（用 overflow-wrap，不是 break-all）')
 })

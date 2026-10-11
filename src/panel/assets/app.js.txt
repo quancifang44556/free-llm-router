@@ -712,6 +712,63 @@ function usageDays() {
 }
 
 /**
+ * 迷你折线（sparkline）—— 照参考项目 KPI 卡底部那条趋势线。
+ *
+ * ## 为什么手写 SVG 而不是引图表库
+ *
+ * 面板是**手写 CSS + 明暗两套主题**，且产物要经 Worker 下发（体积敏感）。
+ * 一条折线只需要一个 `<svg><path d="M…L…"/></svg>` ——
+ * 引 Chart.js / ECharts（几百 KB）来画它完全不划算。
+ *
+ * ## 关键取舍
+ *
+ * - **点数 < 2 时直接返回空**（一个点连不成线；硬画会得到一条假水平线，
+ *   那是在**编造**「数据很平稳」）；
+ * - 高度归一化用 `min..max` 而不是 `0..max`：日用量常常整体在
+ *   一个不接近 0 的区间里波动，从 0 起画会把差异压成一条直线；
+ * - ⚠️ `max === min`（全平）时折中画在中线，**不除以 0**；
+ * - 用 `preserveAspectRatio="none"` 让 SVG 自适应容器宽度（不按比例留边）。
+ *
+ * @param values - 数值序列（**按时间正序**；调用方负责排序）
+ * @param tone - 色系键（与 KPI 卡一致，决定描边色）
+ */
+function sparkline(values, tone) {
+  const svgNS = 'http://www.w3.org/2000/svg'
+  const svg = document.createElementNS(svgNS, 'svg')
+  svg.setAttribute('class', 'spark spark-' + (tone || 'blue'))
+  svg.setAttribute('viewBox', '0 0 100 28')
+  svg.setAttribute('preserveAspectRatio', 'none')
+  svg.setAttribute('aria-hidden', 'true')
+
+  const nums = (Array.isArray(values) ? values : [])
+    .map((v) => (typeof v === 'number' && Number.isFinite(v) ? v : 0))
+  // ⚠️ 少于 2 个点连不成线 —— 返回空 SVG（调用方据 className 决定要不要占位）
+  if (nums.length < 2) return svg
+
+  const max = Math.max(...nums)
+  const min = Math.min(...nums)
+  const span = max - min
+  const H = 28
+  const step = 100 / (nums.length - 1)
+  const pts = nums.map((v, i) => {
+    // ⚠️ span 为 0（全平）时画在中线，避免除零得到 NaN（NaN 会让整条 path 不渲染）
+    const ratio = span === 0 ? 0.5 : (v - min) / span
+    // y 轴向下 ⇒ 值越大 y 越小；上下各留 3px 免得描边被裁
+    const y = 3 + (1 - ratio) * (H - 6)
+    return `${(i * step).toFixed(2)},${y.toFixed(2)}`
+  })
+  const path = document.createElementNS(svgNS, 'path')
+  path.setAttribute('d', 'M' + pts.join(' L'))
+  path.setAttribute('fill', 'none')
+  path.setAttribute('stroke-width', '2')
+  path.setAttribute('stroke-linecap', 'round')
+  path.setAttribute('stroke-linejoin', 'round')
+  path.setAttribute('vector-effect', 'non-scaling-stroke')
+  svg.appendChild(path)
+  return svg
+}
+
+/**
  * 一张 KPI 卡片（照参考项目：彩色图标章 + 大数字 + 带单位副标题）。
  *
  * @param tone - 色系：blue / purple / green / orange / cyan / pink / red
@@ -720,7 +777,7 @@ function usageDays() {
  * @param value - **大号主数字**（已格式化）
  * @param sub - 副标题（**必须带单位**，见调用处的说明）
  */
-function kpiCard(tone, icon, label, value, sub) {
+function kpiCard(tone, icon, label, value, sub, sparkValues) {
   const card = document.createElement('div')
   card.className = 'kpi ' + tone
   const chip = document.createElement('div'); chip.className = 'kpi-chip'; chip.textContent = icon
@@ -728,6 +785,12 @@ function kpiCard(tone, icon, label, value, sub) {
   const vv = document.createElement('div'); vv.className = 'kpi-value'; vv.textContent = value
   const sb = document.createElement('div'); sb.className = 'kpi-sub'; sb.textContent = sub
   card.appendChild(chip); card.appendChild(lb); card.appendChild(vv); card.appendChild(sb)
+  // 迷你趋势线（照参考项目：KPI 卡底部一条 sparkline）
+  // ⚠️ 只在真有 ≥2 个点时加 —— 否则留一个空 SVG 会撑出一段空白
+  if (Array.isArray(sparkValues) && sparkValues.length >= 2) {
+    const sp = sparkline(sparkValues, tone)
+    if (sp.childNodes.length > 0) card.appendChild(sp)
+  }
   return card
 }
 
@@ -1027,22 +1090,39 @@ async function loadUsage() {
   // 因为它是**运行时**错误）。改渲染顺序时必须确认所有 `const` 都在使用点之前。
   const rangeLabel = (USAGE_RANGES.find((r) => r.key === usageRangeKey) || {}).label || '今日'
   const successRate = total === 0 ? 0 : (ok / total) * 100
+
+  // sparkline 的数据源：**按天正序**（老 → 新）的序列。
+  // ⚠️ 必须是正序 —— sparkline 从左到右画，倒序会让趋势看起来完全相反。
+  // ⚠️ 单日窗口只有 1 个点，连不成线（`sparkline` 会返回空），这是**诚实**的：
+  //    今日没有「趋势」可言，不该硬画一条假的水平线。
+  const dayAsc = [...byDayMap.values()].sort((a, b) => a.day.localeCompare(b.day))
+  const sparkReq = dayAsc.map((d) => d.count)
+  const sparkTok = dayAsc.map((d) => d.tokens)
+  const sparkInput = dayAsc.map((d) => d.input)
+  const sparkOutput = dayAsc.map((d) => d.output)
+  // 成功率序列：某天没请求时记为 100（不该把它算成「失败」拉低趋势）
+  const sparkRate = dayAsc.map((d) => (d.count === 0 ? 100 : ((d.count - d.failed) / d.count) * 100))
+
   box.appendChild(kpiCard('blue', 'Σ', rangeLabel + '总请求', fmtNum(total),
-    `${activeDays} 天有记录`))
+    `${activeDays} 天有记录`, sparkReq))
   box.appendChild(kpiCard('green', '✓', '成功', fmtNum(ok),
-    `成功率 ${successRate.toFixed(1)}%`))
+    `成功率 ${successRate.toFixed(1)}%`, sparkRate))
   // ⚠️ 图标用 `×`（U+00D7，拉丁字母区，所有字体都有），**不要**用
   // `✕`（U+2715，杂项符号区）—— 项目实测后者在部分手机字体缺字形、
   // 会渲染成空框（单测明确禁止，见 tests/panel.test.ts 的 RISKY 列表）。
   // 这与本项目其它地方（能力标签）的约定一致。
   box.appendChild(kpiCard(failed > 0 ? 'red' : 'cyan', '×', '失败', fmtNum(failed),
-    failed > 0 ? `占 ${((failed / total) * 100).toFixed(1)}%` : '无失败'))
+    failed > 0 ? `占 ${((failed / total) * 100).toFixed(1)}%` : '无失败',
+    dayAsc.map((d) => d.failed)))
   box.appendChild(kpiCard('purple', '↓', '输入 token', fmtTokensShort(inputTokens),
-    fmtNum(inputTokens) + ' tokens'))
+    fmtNum(inputTokens) + ' tokens', sparkInput))
   box.appendChild(kpiCard('pink', '↑', '输出 token', fmtTokensShort(outputTokens),
-    fmtNum(outputTokens) + ' tokens'))
+    fmtNum(outputTokens) + ' tokens', sparkOutput))
   box.appendChild(kpiCard('orange', '⏱', '平均耗时', fmtDuration(avgMs),
     fmtNum(total) + ' 次请求的平均'))
+  // ⚠️ 耗时**故意不给 sparkline**：我们只存了「按天的合计耗时」，
+  // 而卡上显示的是**均值** —— 拿合计画趋势会把「请求多的一天」画成
+  // 「很慢的一天」，那是**误导**。宁可不画，也不给一张错图。
 
   // ── 数据边界说明（关键：解释「为什么明细比总数少」）──
   const scope = $('usage-scope')
@@ -1060,25 +1140,77 @@ async function loadUsage() {
   renderUsageTrend([...byDayMap.values()].sort((a, b) => b.day.localeCompare(a.day)), windowDays)
   renderUsageHours([...byHourMap.values()].sort((a, b) => a.hour.localeCompare(b.hour)), windowDays)
 
-  const models = $('usage-models'); clear(models)
-  const modelRows = mergeDims('byModel', 'model')
-  if (modelRows.length) {
-    models.appendChild(wrapTable(buildTable(
-      ['模型', '请求', '输入', '输出', '失败'],
-      modelRows.map((m) => [m.model, fmtNum(m.count), fmtNum(m.input), fmtNum(m.output), fmtNum(m.failed)]),
-      1,
-    )))
-  } else { const p = document.createElement('p'); p.className = 'hint'; p.textContent = '无数据'; models.appendChild(p) }
+  // ── 排名列表（照参考项目：序号 + 占比条 + 行内指标）──
+  //
+  // ⚠️ 从「表格」改成「排名行」的理由：表格只给绝对数字，而用户真正想知道的
+  // 是**「谁占大头」** —— 占比条一眼就能看出来，表格要自己心算。
+  // 参考项目的 Top Models 就是这种形态。
+  renderUsageRanking($('usage-models'), mergeDims('byModel', 'model'), 'model',
+    (r) => r.model)
+  renderUsageRanking($('usage-accounts'), mergeDims('byAccount', 'uid'), 'uid',
+    (r) => r.uid)
+}
 
-  const accts = $('usage-accounts'); clear(accts)
-  const acctRows = mergeDims('byAccount', 'uid')
-  if (acctRows.length) {
-    accts.appendChild(wrapTable(buildTable(
-      ['账号', '请求', '输入', '输出', '失败'],
-      acctRows.map((a) => [a.uid, fmtNum(a.count), fmtNum(a.input), fmtNum(a.output), fmtNum(a.failed)]),
-      1,
-    )))
-  } else { const p = document.createElement('p'); p.className = 'hint'; p.textContent = '无数据'; accts.appendChild(p) }
+/**
+ * 渲染一个「排名列表」（照参考项目的 Top Models / Usage Distribution）。
+ *
+ * 每行：`序号徽章 · 名称 · 占比条 · 数值 · 请求数 · 失败数`
+ *
+ * @param box - 容器
+ * @param rows - 已按 count 降序的行
+ * @param key - 行的标识字段名（用于 title）
+ * @param labelOf - 从行取展示名
+ */
+function renderUsageRanking(box, rows, key, labelOf) {
+  clear(box)
+  if (!Array.isArray(rows) || rows.length === 0) {
+    const p = document.createElement('p'); p.className = 'hint'; p.textContent = '无数据'
+    box.appendChild(p)
+    return
+  }
+  const max = Math.max(1, ...rows.map((r) => r.count))
+  const totalCount = rows.reduce((n, r) => n + r.count, 0)
+  rows.forEach((r, i) => {
+    const row = document.createElement('div'); row.className = 'rank-row'
+    row.title = `${labelOf(r)}\n请求 ${fmtNum(r.count)} 次`
+      + `\n输入 ${fmtNum(r.input)} tokens · 输出 ${fmtNum(r.output)} tokens`
+      + (r.failed > 0 ? `\n失败 ${fmtNum(r.failed)} 次` : '')
+
+    // 序号（前三名高亮，照参考项目的排名徽章）
+    const rank = document.createElement('span')
+    rank.className = 'rank-idx' + (i < 3 ? ' top' + (i + 1) : '')
+    rank.textContent = String(i + 1)
+
+    const main = document.createElement('div'); main.className = 'rank-main'
+    const head = document.createElement('div'); head.className = 'rank-head'
+    const name = document.createElement('span'); name.className = 'rank-name'
+    name.textContent = labelOf(r)
+    const share = document.createElement('span'); share.className = 'rank-share'
+    // ⚠️ 占比用**总请求数**做分母（不是 max）——「占多少」问的是整体份额，
+    // 而条的**宽度**用 max 归一（让第一名铺满，视觉上更好读）。
+    share.textContent = totalCount === 0 ? '' : ((r.count / totalCount) * 100).toFixed(1) + '%'
+    head.appendChild(name); head.appendChild(share)
+    // 占比条
+    const track = document.createElement('div'); track.className = 'rank-track'
+    const fill = document.createElement('div')
+    fill.className = 'rank-fill' + (r.failed > 0 ? ' bad' : '')
+    fill.style.width = Math.round((r.count / max) * 100) + '%'
+    track.appendChild(fill)
+    main.appendChild(head); main.appendChild(track)
+
+    const metrics = document.createElement('div'); metrics.className = 'rank-metrics'
+    const mk = (v, t) => { const e = document.createElement('span'); e.textContent = v; if (t) e.title = t; return e }
+    metrics.appendChild(mk(fmtNum(r.count) + ' 次请求'))
+    metrics.appendChild(mk(fmtTokensShort(r.input + r.output) + ' tok'))
+    if (r.failed > 0) {
+      const f = mk(fmtNum(r.failed) + ' 失败')
+      f.className = 'rank-failed'
+      metrics.appendChild(f)
+    }
+
+    row.appendChild(rank); row.appendChild(main); row.appendChild(metrics)
+    box.appendChild(row)
+  })
 }
 
 // ─────────────────────────── 模型 ───────────────────────────
