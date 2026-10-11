@@ -14,6 +14,21 @@
  */
 
 import { test } from 'node:test'
+import {
+  EXPIRY_NEVER,
+  EXPIRY_UNUSABLE,
+  buildVirtualModels,
+  expiryLabel,
+  pickSoonestProvider,
+  rankCandidates,
+} from '../src/gateway/aggregate.js'
+import {
+  canonicalDisplayName,
+  canonicalKeyFor,
+  normalizeModelKey,
+  normalizeNameKey,
+  priceFactorFromName,
+} from '../src/providers/canonical-models.js'
 import { existsSync, readFileSync } from 'node:fs'
 import assert from 'node:assert/strict'
 
@@ -1288,4 +1303,815 @@ test('⚠️ Loomy 的模型条目判据是 `type === "chat"`（实测上游该�
   const fn = src.slice(src.indexOf('export function isLoomyChatModel'))
   assert.ok(/type/.test(fn.slice(0, 600)), '⚠️ isLoomyChatModel 的判据应基于 type 字段')
   assert.ok(/chat/.test(fn.slice(0, 600)), "⚠️ 应判 `type === 'chat'`")
+})
+
+// ─────────────────── 聚合：规范模型名归一 ───────────────────
+
+test('🔴 规范名归一：线上 8 个渠道的 DeepSeek V4.1 Flash 必须归到同一个键', () => {
+  // 用**线上实测的真实 id** 做断言（不是编造的）——这是本模块存在的全部理由：
+  // 同一个真实模型在各渠道叫法完全不同，用户在选择器里看到多条同名条目。
+  const cases: Array<[string, string, string, string]> = [
+    ['buddy', 'deepseek-v4.1-flash', 'DeepSeek-V4.1-Flash', 'deepseek-v4-1-flash'],
+    ['workbuddy', 'deepseek-v4.1-flash', 'DeepSeek-V4.1-Flash', 'deepseek-v4-1-flash'],
+    ['trae', 'deepseek-v4.1-flash', 'DeepSeek-V4.1-Flash', 'deepseek-v4-1-flash'],
+    ['codearts', 'deepseek-v4.1-flash', 'DeepSeek-V4.1-Flash', 'deepseek-v4-1-flash'],
+    // cline 的 id 带「免费通道」前缀，前缀不是模型名的一部分
+    ['cline', 'cline-free/deepseek-v4.1-flash', 'DeepSeek V4.1 Flash', 'deepseek-v4-1-flash'],
+    // ⚠️ lobsterai 的 id 与规范键**没有字面关系**，只能靠显式补丁
+    ['lobsterai', 'deepseek-flash', 'DeepSeek V4.1 Flash', 'deepseek-v4-1-flash'],
+    // raccoon 的 `sn-` 前缀
+    ['raccoon', 'sn-deepseek-v4-1-flash', 'DeepSeek V4.1 Flash', 'deepseek-v4-1-flash'],
+    // loomy 的展示名形态（大写 + 点）
+    ['loomy', 'DeepSeek-V4.1-Flash', 'DeepSeek V4.1 Flash', 'deepseek-v4-1-flash'],
+  ]
+  for (const [p, id, name, want] of cases) {
+    const got = canonicalKeyFor(p, id, name)
+    assert.equal(got?.key, want, `⚠️ ${p}:${id} 应归到 ${want}（实际 ${got?.key}）`)
+  }
+})
+
+test('🔴 通用名必须排除（尤其 `auto` —— 它是聚合自己的保留名）', () => {
+  // ⚠️ `loomy/auto` 是**线上真实存在的模型**，但 `auto` 是聚合 provider 的
+  // 保留名。不排除会让两者撞车。
+  assert.equal(canonicalKeyFor('loomy', 'auto', 'Auto'), undefined, '⚠️ auto 必须排除')
+  for (const name of ['default-model', 'fast-model', 'balanced-model', 'primary-model', 'deep-model']) {
+    assert.equal(canonicalKeyFor('buddy', name, name), undefined, `⚠️ ${name} 必须排除（各家含义不同）`)
+  }
+})
+
+test('⚠️ 归一化细节：点替换而非删除；日期快照后缀不剥', () => {
+  // 点是**替换**成连字符，不能删掉 —— `v4.1`→`v4-1`，若删成 `v41` 会与真的 `v41` 撞车
+  assert.equal(normalizeModelKey('deepseek-v4.1-flash'), 'deepseek-v4-1-flash')
+  assert.notEqual(normalizeModelKey('deepseek-v4.1'), normalizeModelKey('deepseek-v41'))
+  // 日期快照是**不同的模型**，剥掉会让用户选到不知道的版本
+  assert.notEqual(normalizeModelKey('deepseek-v4-flash-0731'), normalizeModelKey('deepseek-v4-flash'))
+  // `-official` 同理
+  assert.equal(normalizeModelKey('deepseek-v4-flash-official'), 'deepseek-v4-flash-official')
+  // `:free` 后缀要剥
+  assert.equal(normalizeModelKey('some-model:free'), 'some-model')
+  // 空白 → 连字符
+  assert.equal(normalizeModelKey('DeepSeek V4.1 Flash'), 'deepseek-v4-1-flash')
+})
+
+test('⚠️ 展示名归一要剥掉渠道的倍率/免费装饰', () => {
+  assert.equal(normalizeNameKey('GLM-5.3-Flash · x0.8'), 'glm-5-3-flash')
+  assert.equal(normalizeNameKey('MiniMax M3 · x4.0'), 'minimax-m3')
+  assert.equal(normalizeNameKey('某模型 免费'), '某模型')
+  // ⚠️ 不带 `·` 的数字不能被误读（模型名里本来就有数字）
+  assert.equal(normalizeNameKey('gpt-4o'), 'gpt-4o')
+})
+
+test('🔴 原型链守卫：`constructor` 这类键不得命中 Object 构造函数', () => {
+  // 模型 id 是**外部输入**。`CANONICAL_NAMES['constructor']` 用直接取值会拿到
+  // `Object` 构造函数（真值）⇒ 展示名成了个函数 ⇒ 目录校验失败 ⇒
+  // **整份聚合目录消失**。故两处表都必须用 `Object.hasOwn` 查。
+  const name = canonicalDisplayName('constructor')
+  assert.equal(typeof name, 'string', '⚠️ 展示名必须是字符串（不能是函数）')
+  assert.equal(name, 'constructor', '未登记的键应回落到键本身')
+  // 补丁表同样要守
+  const got = canonicalKeyFor('constructor', 'constructor', 'constructor')
+  assert.ok(got === undefined || typeof got.key === 'string',
+    '⚠️ 不得返回非字符串键')
+})
+
+test('⚠️ 价格倍率解析：`·` 分隔符必需，促销箭头取后者', () => {
+  assert.equal(priceFactorFromName('GLM-5.3-Flash · x0.8'), 0.8)
+  assert.equal(priceFactorFromName('MiniMax M3 · x4.0'), 4)
+  // 促销箭头：取**箭头后**的实际计费倍率
+  assert.equal(priceFactorFromName('GLM-5.3 · x1.0 → x0.5'), 0.5)
+  assert.equal(priceFactorFromName('某模型 免费'), 0, '免费应为 0')
+  // ⚠️ 没有 `·` 时不得把模型名里的数字当倍率
+  assert.equal(priceFactorFromName('kimi-k2.5'), Number.POSITIVE_INFINITY)
+  assert.equal(priceFactorFromName('deepseek-v4.1-flash'), Number.POSITIVE_INFINITY)
+})
+
+// ─────────────────── 聚合：虚拟模型与临期优先 ───────────────────
+
+test('🔴 构建虚拟模型：同一真实模型跨渠道归到一条，且顺序稳定', () => {
+  const cats = [
+    { provider: 'buddy', models: [
+      { id: 'deepseek-v4.1-flash', name: 'DeepSeek-V4.1-Flash' },
+      { id: 'glm-5.3-flash', name: 'GLM-5.3-Flash' },
+    ] },
+    { provider: 'lobsterai', models: [
+      { id: 'deepseek-flash', name: 'DeepSeek V4.1 Flash · x0.8' },
+      { id: 'glm-5.3-flashx', name: 'GLM-5.3-FlashX · x1.2' },
+    ] },
+    { provider: 'raccoon', models: [{ id: 'sn-deepseek-v4-1-flash', name: 'DeepSeek V4.1 Flash · x2.0' }] },
+    // ⚠️ loomy 的 `auto` 必须被丢弃（通用名，且是聚合的保留名）
+    { provider: 'loomy', models: [
+      { id: 'auto', name: 'Auto' },
+      { id: 'DeepSeek-V4.1-Flash', name: 'DeepSeek V4.1 Flash · x1.0' },
+    ] },
+  ]
+  const vms = buildVirtualModels(cats)
+  const ds = vms.find((v) => v.key === 'deepseek-v4-1-flash')
+  assert.ok(ds !== undefined, '应有 deepseek-v4-1-flash 虚拟模型')
+  // 4 个渠道都归到这一条
+  assert.deepEqual(ds.candidates.map((c) => c.provider).sort(),
+    ['buddy', 'lobsterai', 'loomy', 'raccoon'],
+    '⚠️ 4 个渠道应归到同一个虚拟模型')
+  assert.equal(ds.name, 'DeepSeek V4.1 Flash', '展示名应是官方拼写')
+  // ⚠️ `auto` 不得出现为虚拟模型
+  assert.ok(!vms.some((v) => v.key === 'auto'), '⚠️ auto 必须被排除（保留名）')
+  // ⚠️ 顺序必须稳定：候选数降序，同数按键升序
+  const keys = vms.map((v) => v.key)
+  assert.deepEqual(keys, [...keys].sort((a, b) => {
+    const ca = vms.find((v) => v.key === a)?.candidates.length ?? 0
+    const cb = vms.find((v) => v.key === b)?.candidates.length ?? 0
+    return cb - ca || a.localeCompare(b)
+  }), '⚠️ 输出顺序必须确定（否则目录每次刷新都在跳）')
+})
+
+test('🔴 临期优先：最快作废的先烧；「长期」排最后但仍可选中', () => {
+  const base = [
+    { provider: 'buddy', realId: 'm', realName: 'M', price: 1 },
+    { provider: 'cheap', realId: 'm', realName: 'M · x0.5', price: 0.5 },
+    { provider: 'forever', realId: 'm', realName: 'M', price: 1 },
+    { provider: 'unknown', realId: 'm', realName: 'M', price: 1 },
+  ]
+  const now = Date.now()
+  const expiry = {
+    buddy: now + 5 * 60_000,      // 5 分钟后
+    cheap: now + 60 * 60_000,     // 1 小时后（更便宜，但更不临期）
+    forever: EXPIRY_NEVER,        // 长期
+    unknown: EXPIRY_UNUSABLE,     // 查不到
+  }
+  const ranked = rankCandidates(base, (c) => expiry[c.provider as keyof typeof expiry])
+
+  // ⚠️ 「查不到」必须被**剔除**（不是排最后）——我们不知道它能不能用
+  assert.ok(!ranked.some((c) => c.provider === 'unknown'),
+    '⚠️ EXPIRY_UNUSABLE 必须剔除，不能只排到最后')
+  // 到期时刻升序：buddy(5min) → cheap(1h) → forever(长期)
+  assert.deepEqual(ranked.map((c) => c.provider), ['buddy', 'cheap', 'forever'])
+  // ⚠️ 「长期」必须**仍在**列表里（可用，只是不急）
+  assert.ok(ranked.some((c) => c.provider === 'forever'),
+    '⚠️ EXPIRY_NEVER 必须仍可被选中（有永久额度的渠道是可用的）')
+})
+
+test('🔴 同到期时刻时按价格排序（便宜的先用）', () => {
+  const now = Date.now()
+  const base = [
+    { provider: 'pricey', realId: 'm', realName: 'M · x4.0', price: 4 },
+    { provider: 'cheap', realId: 'm', realName: 'M · x0.5', price: 0.5 },
+    { provider: 'free', realId: 'm', realName: 'M 免费', price: 0 },
+  ]
+  const ranked = rankCandidates(base, () => now + 60_000)
+  assert.deepEqual(ranked.map((c) => c.provider), ['free', 'cheap', 'pricey'])
+})
+
+test('🔴 pickSoonestProvider：「全部长期」不得报成「没有账号」', () => {
+  // ⚠️ 这是参考实现记录过的真实缺陷形态：把「还没找到赢家」与
+  // 「当前最优时刻」都初始化为 Infinity，会让「全部候选都是长期有效」时
+  // 返回 undefined ⇒ 界面报「没有账号登录」——而账号好得很。
+  assert.equal(pickSoonestProvider([]), undefined, '空列表应为 undefined')
+
+  const allForever = [
+    { provider: 'a', expiry: EXPIRY_NEVER },
+    { provider: 'b', expiry: EXPIRY_NEVER },
+  ]
+  assert.equal(pickSoonestProvider(allForever), 'a',
+    '⚠️ 全部长期时必须返回第一个，不能返回 undefined')
+
+  // 全部不可用 → undefined（真的没得选）
+  assert.equal(pickSoonestProvider([
+    { provider: 'a', expiry: EXPIRY_UNUSABLE },
+  ]), undefined, '全部不可用应为 undefined')
+
+  // 混合：跳过不可用，取最早
+  const now = Date.now()
+  assert.equal(pickSoonestProvider([
+    { provider: 'unknown', expiry: EXPIRY_UNUSABLE },
+    { provider: 'later', expiry: now + 3600_000 },
+    { provider: 'sooner', expiry: now + 60_000 },
+  ]), 'sooner')
+})
+
+test('⚠️ 到期标签：查不到 / 长期 / 已过期 三者语义不同', () => {
+  const now = Date.now()
+  // ⚠️ 「查不到」不能说成「已过期」——前者是「没能确定」，后者是「确定没了」，
+  // 用户该采取的行动不同。
+  assert.equal(expiryLabel(EXPIRY_UNUSABLE, now), '查不到')
+  assert.equal(expiryLabel(EXPIRY_NEVER, now), '长期')
+  assert.equal(expiryLabel(now - 1000, now), '已过期')
+  assert.equal(expiryLabel(now + 30 * 60_000, now), '30 分钟后')
+  assert.equal(expiryLabel(now + 3 * 3600_000, now), '3 小时后')
+  assert.equal(expiryLabel(now + 72 * 3600_000, now), '3 天后')
+})
+
+test('⚠️ 脏目录不得让聚合整体失败（空 id 必须丢弃）', () => {
+  const vms = buildVirtualModels([
+    { provider: 'x', models: [
+      { id: '', name: '' },
+      { id: '   ', name: 'blank' },
+      { id: 'good-model', name: '' },
+    ] },
+  ])
+  assert.equal(vms.length, 1, '⚠️ 空/空白 id 必须丢弃，否则会产出无效目录')
+  // 展示名为空时回落到 id
+  assert.equal(vms[0].candidates[0].realId, 'good-model')
+})
+
+// ─────────────────── Gemini（Cloud Code Assist） ───────────────────
+
+/**
+ * 捕获一次**异步**抛错，并断言它确实是 `ProviderError`。
+ *
+ * ⚠️ 不用 `assert.rejects`：它不返回错误对象，于是「`retryable` 对不对」
+ * 这类**最关键的断言**根本写不出来 —— 与 `catchError` 存在的理由同源。
+ *
+ * ⚠️ 没抛错时**主动抛出**（而不是返回 `undefined`）：静默返回会让后续的
+ * `error.message` 变成 `TypeError`，把「本该失败却成功了」这个真正的结论
+ * 掩盖成一句驴唇不对马嘴的报错。
+ */
+async function catchProviderError(fn: () => Promise<unknown>): Promise<ProviderError> {
+  let caught: unknown
+  let threw = false
+  try {
+    await fn()
+  } catch (error) {
+    caught = error
+    threw = true
+  }
+  if (!threw) throw new Error('⚠️ 期望抛出 ProviderError，但调用成功了')
+  if (!(caught instanceof ProviderError)) {
+    throw new Error(`⚠️ 期望 ProviderError，实际是：${String(caught)}`)
+  }
+  return caught
+}
+
+/** 造一个只含 `sub` / `email` 的假 `id_token`（**不验签**，本项目只用它取身份）。 */
+function idTokenWith(payload: Record<string, unknown>): string {
+  const encode = (value: unknown): string =>
+    Buffer.from(JSON.stringify(value), 'utf8').toString('base64url')
+  return `${encode({ alg: 'RS256', typ: 'JWT' })}.${encode({ iss: 'https://accounts.google.com', ...payload })}.sig`
+}
+
+// ## 为什么这一组断言值得单独写
+//
+// Gemini 是**唯一一个必须靠 `matchesShape` 才能被自动识别认领**的家
+// （它的 `access_token` 字段名与 buddy / lobsterai 完全重合），
+// 也是唯一一个**模型名必须带档位后缀**才能过上游准入的家。
+// 两件事写错的症状都是**静默**的：
+// - 判别式缺失/太宽 ⇒ 凭据被别家认走，或把别家凭据吞下（一发消息就 401）；
+// - 档位后缀丢失 ⇒ 上游 404，而错误信息完全不指向「后缀」这件事。
+
+test('🔴 Gemini 凭据解析：必须认出 OAuth 形态，且拒绝只带 access_token 的对象', async () => {
+  const { parseCredential, looksLikeGeminiCredential } = await import('../src/providers/gemini.ts')
+
+  // ① 参考实现的原始形态（snake_case + `expiry` RFC3339 + project）
+  const full = parseCredential({
+    access_token: 'ya29.token',
+    refresh_token: '1//refresh',
+    expiry: '2030-01-01T00:00:00.000Z',
+    cloudaicompanionProject: 'aicode-consumers',
+    sub: '10500520',
+    email: 'user@example.com',
+  })
+  assert.equal(full.provider, 'gemini')
+  assert.equal(full.accessToken, 'ya29.token')
+  assert.equal(full.refreshToken, '1//refresh')
+  assert.equal(full.uid, '10500520', 'uid 必须优先用 OIDC 的 sub（邮箱可改、sub 不变）')
+  assert.equal(full.nickname, 'user@example.com')
+  assert.equal(full.extras['project'], 'aicode-consumers')
+  assert.equal(new Date(full.expiresAt).toISOString(), '2030-01-01T00:00:00.000Z')
+
+  // ② camelCase 形态（本项目其余家都用 camelCase，用户可能转写）
+  const camel = parseCredential({
+    accessToken: 'ya29.camel',
+    refreshToken: '1//r2',
+    expiresIn: 3600,
+    cloudaicompanionProject: 'proj-1',
+  })
+  assert.equal(camel.accessToken, 'ya29.camel')
+  assert.equal(camel.refreshToken, '1//r2')
+  assert.ok(camel.expiresAt > Date.now(), '`expires_in`（秒）必须在导入时折算成绝对毫秒')
+
+  // ③ 嵌套包装层（`{credential:{…}}`）也要认
+  const wrapped = parseCredential({ credential: { access_token: 'ya29.n', id_token: 'a.b.c' } })
+  assert.equal(wrapped.accessToken, 'ya29.n')
+
+  // ④ 🔴 **只带 `access_token` 必须拒绝** —— 那是 buddy / lobsterai 的形态，
+  // 认下来只会产出一个必然 401 的假账号，而用户看到的是「导入成功」。
+  assert.equal(looksLikeGeminiCredential({ access_token: 'x' }), false)
+  assert.throws(
+    () => parseCredential({ access_token: 'x' }),
+    (error: unknown) => error instanceof ProviderError && error.provider === 'gemini',
+    '⚠️ 只带 access_token 的对象必须拒绝（否则会吞掉别家凭据）',
+  )
+  // 非对象一律拒绝
+  assert.throws(() => parseCredential('ya29.bare-token'))
+})
+
+test('🔴 Gemini matchesShape：必须认自己，且**不得**认领 buddy / lobsterai / raccoon 的凭据', async () => {
+  const { geminiProvider } = await import('../src/providers/gemini.ts')
+  const matches = geminiProvider.matchesShape
+  assert.equal(typeof matches, 'function',
+    '⚠️ 没有 matchesShape 的供应商在自动识别时**永远轮不到**（凭据会被别家认走）')
+
+  // ── 接受：四种 Gemini 合法形态 ──
+  assert.equal(matches!({ access_token: 't', cloudaicompanionProject: 'p' }), true)
+  assert.equal(matches!({ access_token: 't', cloudaicompanion_project: 'p' }), true,
+    'snake_case 变体也要认')
+  assert.equal(matches!({ access_token: 't', refresh_token: 'r', expiry: '2030-01-01T00:00:00Z' }), true)
+  assert.equal(matches!({ access_token: 't', refresh_token: 'r', expires_in: 3600 }), true,
+    '⚠️ `expires_in` 是**数字**，判别式只认字符串的话这里会假失败')
+  assert.equal(matches!({ access_token: 't', id_token: 'a.b.c' }), true)
+
+  // ── 拒绝：别家的凭据 ──
+  // buddy / workbuddy 的形态（DSH 扁平 + Go 嵌套）
+  assert.equal(matches!({ accessToken: 'jwt', uid: 'u1', refreshToken: 'r' }), false,
+    '⚠️ buddy 凭据（uid + refreshToken，**没有** expiry/expires_in/id_token）必须拒绝')
+  assert.equal(matches!({ access_token: 'jwt', uid: 'u1', expiresAt: 1700000000000 }), false,
+    '⚠️ `expiresAt` 不是 Gemini 的字段（那是 buddy/lobsterai 的），不得据此认领')
+  // lobsterai 的形态
+  assert.equal(matches!({
+    access_token: 'jwt', refresh_token: 'r', user_id: '116092', uuid: 'x',
+    first_keyfrom: 'a', latest_keyfrom: 'b',
+  }), false, '⚠️ lobsterai 凭据必须拒绝')
+  // raccoon 的形态
+  assert.equal(matches!({ access_token: 'jwt', user_id: '116092', phone: '13800000000' }), false,
+    '⚠️ raccoon 凭据必须拒绝')
+  // cline 的形态
+  assert.equal(matches!({ accessToken: 'workos:abc', accountId: 'acc-1', refreshToken: 'r' }), false,
+    '⚠️ cline 凭据必须拒绝（`workos:` 前缀 + accountId）')
+  // 空对象 / 只有 refresh_token
+  assert.equal(matches!({}), false)
+  assert.equal(matches!({ refresh_token: 'r', expiry: '2030-01-01T00:00:00Z' }), false,
+    '⚠️ 没有 access_token 就不是可用凭据')
+
+  // ── 判别式与 parseCredential **必须共用同一份判据** ──
+  // 分叉的症状是「自动识别选中了 Gemini，导入却报错」。
+  const accepted = { access_token: 't', id_token: 'a.b.c' }
+  assert.equal(matches!(accepted), true)
+  assert.doesNotThrow(() => geminiProvider.parseCredential(accepted))
+  const rejected = { access_token: 't' }
+  assert.equal(matches!(rejected), false)
+  assert.throws(() => geminiProvider.parseCredential(rejected))
+})
+
+test('Gemini 续期：必须回写**轮换后的** refresh_token，且缺 refresh_token 时明确要「重新登录」', async () => {
+  const { refreshGeminiCredential } = await import('../src/providers/gemini.ts')
+  const base = {
+    provider: 'gemini',
+    uid: 'sub-1',
+    accessToken: 'old-access',
+    refreshToken: 'old-refresh',
+    expiresAt: 0,
+    nickname: 'u@example.com',
+    extras: { project: 'p1', sub: 'sub-1', email: 'u@example.com' },
+  }
+
+  // ── ① 缺 refresh_token：终态，文案必须能指导行动 ──
+  const noRefresh = await catchProviderError(() =>
+    refreshGeminiCredential({ ...base, refreshToken: '' }, AbortSignal.timeout(1000)))
+  assert.ok(noRefresh instanceof ProviderError, '缺 refresh_token 必须抛 ProviderError')
+  assert.equal(noRefresh.retryable, false, '缺材料是**终态**，重试无意义')
+  assert.match(noRefresh.message, /重新登录/, '⚠️ 文案必须含「重新登录」（调用方靠这个子串判定终态）')
+
+  // ── ② 成功 + 轮换写回 ──
+  const realFetch = globalThis.fetch
+  let seenUrl = ''
+  let seenBody = ''
+  let seenContentType = ''
+  globalThis.fetch = (async (url: string | URL, init: RequestInit = {}) => {
+    seenUrl = String(url)
+    seenBody = String(init.body ?? '')
+    seenContentType = String((init.headers as Record<string, string>)['Content-Type'] ?? '')
+    return new Response(JSON.stringify({
+      access_token: 'new-access',
+      // ⚠️ Google **会轮换** refresh_token：给了新的就必须回写，
+      // 否则下一次续期用的是一份已作废的旧值。
+      refresh_token: 'rotated-refresh',
+      expires_in: 3600,
+      token_type: 'Bearer',
+      id_token: idTokenWith({ sub: 'sub-1', email: 'u@example.com' }),
+    }), { status: 200, headers: { 'content-type': 'application/json' } })
+  }) as unknown as typeof fetch
+
+  try {
+    const next = await refreshGeminiCredential(base, AbortSignal.timeout(5000))
+    assert.equal(seenUrl, 'https://oauth2.googleapis.com/token')
+    assert.equal(seenContentType, 'application/x-www-form-urlencoded')
+    // 表单字段**逐字**：四个字段一个都不能少、顺序也照参考实现。
+    assert.match(seenBody, /^client_id=1071006060591-tmhssin2h21lcre235vtolojh4g403ep\.apps\.googleusercontent\.com/)
+    assert.ok(seenBody.includes('client_secret=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'),
+      '⚠️ 缺 client_secret 会回 `client_secret is missing`')
+    assert.ok(seenBody.includes('refresh_token=old-refresh'))
+    assert.ok(seenBody.endsWith('grant_type=refresh_token'), 'grant_type 必须是 refresh_token')
+
+    assert.equal(next.accessToken, 'new-access')
+    assert.equal(next.refreshToken, 'rotated-refresh', '⚠️ 轮换后的 refresh_token 必须写回')
+    assert.equal(next.uid, 'sub-1', '⚠️ uid 必须保持不变（重建对象会在池里堆出一条新账号）')
+    assert.ok(next.expiresAt > Date.now(), '`expires_in` 必须折算成绝对毫秒')
+    assert.equal(next.extras['project'], 'p1', 'extras 必须整份保留')
+
+    // ── ③ 上游**没给**新 refresh_token 时必须保留旧值 ──
+    globalThis.fetch = (async () => new Response(
+      JSON.stringify({ access_token: 'newer-access', expires_in: 1800 }),
+      { status: 200, headers: { 'content-type': 'application/json' } },
+    )) as unknown as typeof fetch
+    const kept = await refreshGeminiCredential(next, AbortSignal.timeout(5000))
+    assert.equal(kept.refreshToken, 'rotated-refresh',
+      '⚠️ 没给新值时**保留旧值** —— 写成 `?? ""` 会让账号续期一次后永久不可续期')
+
+    // ── ④ 终态失败（invalid_grant）→ 不可重试 + 「重新登录」 ──
+    globalThis.fetch = (async () => new Response(
+      JSON.stringify({ error: 'invalid_grant', error_description: 'Token has been expired or revoked.' }),
+      { status: 400, headers: { 'content-type': 'application/json' } },
+    )) as unknown as typeof fetch
+    const terminal = await catchProviderError(() =>
+      refreshGeminiCredential(base, AbortSignal.timeout(5000)))
+    assert.ok(terminal instanceof ProviderError)
+    assert.equal(terminal.retryable, false, 'invalid_grant 是终态，不该换号重试')
+    assert.match(terminal.message, /重新登录/)
+    assert.match(terminal.message, /invalid_grant/, '⚠️ 必须带上游原文（否则无法归因）')
+
+    // ── ⑤ 瞬时失败（500）→ **可重试** ──
+    globalThis.fetch = (async () => new Response('upstream boom', { status: 500 })) as unknown as typeof fetch
+    const transient = await catchProviderError(() =>
+      refreshGeminiCredential(base, AbortSignal.timeout(5000)))
+    assert.ok(transient instanceof ProviderError)
+    assert.equal(transient.retryable, true, '5xx 是瞬时故障，必须可重试（与 invalid_grant 区分开）')
+  } finally {
+    globalThis.fetch = realFetch
+  }
+})
+
+test('Gemini 信封：键序必须是**字母序**，模型名必须带档位后缀', async () => {
+  const { buildGeminiInferPayload, GEMINI_IDENTITY_HEADERS } = await import('../src/providers/gemini.ts')
+  const credential = {
+    provider: 'gemini',
+    uid: 'sub-1',
+    accessToken: 'tok',
+    refreshToken: 'r',
+    expiresAt: 0,
+    nickname: 'n',
+    extras: { project: 'proj-x' },
+  }
+
+  const prepared = buildGeminiInferPayload(credential, 'gemini-3.8-flash', {
+    messages: [
+      { role: 'system', content: '你是助手' },
+      { role: 'user', content: '你好' },
+    ],
+    max_tokens: 123,
+    temperature: 0.5,
+    tools: [{
+      type: 'function',
+      function: {
+        name: 'get_weather',
+        description: '查天气',
+        // ⚠️ 白名单外的键（`$schema` / `additionalProperties`）必须被删掉 ——
+        // 上游对未知键是**硬 400**。
+        parameters: {
+          $schema: 'http://json-schema.org/draft-07/schema#',
+          type: 'object',
+          additionalProperties: false,
+          properties: { city: { type: ['string', 'null'], description: '城市' } },
+          required: ['city'],
+        },
+      },
+    }],
+    tool_choice: 'auto',
+  })
+
+  // ── ① 模型名带默认档位后缀（**上游的准入钥匙**：裸名 404）──
+  assert.equal(prepared.upstreamModel, 'gemini-3.8-flash-medium')
+  assert.equal(prepared.tier, 'medium')
+
+  // ── ② 键序：顶层字母序 ──
+  const body = prepared.body
+  const order = ['"model"', '"project"', '"request"', '"requestId"', '"userAgent"']
+  const positions = order.map((key) => body.indexOf(key))
+  assert.ok(positions.every((p) => p >= 0), '信封顶层必须含全部五个键')
+  assert.deepEqual([...positions].sort((a, b) => a - b), positions,
+    '⚠️ 顶层键必须是字母序（Go 的 encoding/json 对 map 自动排序，TS 的 JSON.stringify 不会）')
+
+  // ── ③ 键序：`request` 内部也是字母序，且 `model` 在 `project` 之前 ──
+  const requestAt = body.indexOf('"request"')
+  const reqOrder = ['"contents"', '"generationConfig"', '"sessionId"', '"systemInstruction"', '"toolConfig"', '"tools"']
+  const reqPositions = reqOrder.map((key) => body.indexOf(key, requestAt))
+  assert.ok(reqPositions.every((p) => p > requestAt))
+  assert.deepEqual([...reqPositions].sort((a, b) => a - b), reqPositions,
+    '⚠️ request 内部键也必须是字母序')
+
+  // ── ④ project / requestId / userAgent / 档位预算 ──
+  assert.ok(body.includes('"project":"proj-x"'), 'project 必须取凭据里的值（缺失才回落兜底串）')
+  assert.match(body, /"userAgent":"antigravity"/)
+  assert.match(body, /"requestId":"agent\/\d+\/[0-9a-f]{8}"/)
+  assert.match(body, /"maxOutputTokens":123/)
+  assert.match(body, /"includeThoughts":true/, '「关闭思考」是假关，必须恒 true')
+  assert.match(body, /"thinkingBudget":4000/, 'medium 档的预算是 4000')
+  // system 走顶层 systemInstruction，**不**混进 contents
+  assert.match(body, /"systemInstruction":\{"parts":\[\{"text":"你是助手"\}\],"role":"system"\}/)
+  assert.ok(!body.includes('"role":"system","parts"'), 'contents 里不得出现 system 角色')
+  // 工具 schema 清洗：白名单外的键必须消失，数组型 type 收敛 + nullable
+  assert.ok(!body.includes('$schema'), '⚠️ `$schema` 必须被删除（上游对未知键硬 400）')
+  assert.ok(!body.includes('additionalProperties'), '⚠️ `additionalProperties` 必须被删除')
+  assert.match(body, /"city":\{"description":"城市","nullable":true,"type":"string"\}/,
+    '数组型 type 应收敛为单个 type 并补 nullable')
+
+  // ── ⑤ 请求头：身份五头逐字 + **不带 Accept** ──
+  assert.equal(prepared.headers['Authorization'], 'Bearer tok')
+  for (const [key, value] of Object.entries(GEMINI_IDENTITY_HEADERS)) {
+    assert.equal(prepared.headers[key], value, `${key} 必须逐字写死`)
+  }
+  assert.equal(prepared.headers['Accept'], undefined,
+    '⚠️ 流式请求**刻意不带 Accept**（抓包一致）')
+  assert.equal(prepared.headers['x-goog-api-key'], undefined, '⚠️ 不得带 x-goog-api-key')
+
+  // ── ⑥ 档位：模型名后缀 > reasoning_effort > 默认 medium ──
+  const viaEffort = buildGeminiInferPayload(credential, 'gemini-3.8-flash', {
+    messages: [{ role: 'user', content: 'hi' }],
+    reasoning_effort: 'high',
+  })
+  assert.equal(viaEffort.upstreamModel, 'gemini-3.8-flash-high')
+  assert.match(viaEffort.body, /"thinkingBudget":10000/)
+  // 未知 effort 回落 medium（不编造档位）
+  const unknownEffort = buildGeminiInferPayload(credential, 'gemini-3.8-flash', {
+    messages: [{ role: 'user', content: 'hi' }],
+    reasoning_effort: 'ultra',
+  })
+  assert.equal(unknownEffort.tier, 'medium')
+  // 模型名里**显式**的档位优先于 reasoning_effort
+  const explicit = buildGeminiInferPayload(credential, 'gemini-3.8-flash-low', {
+    messages: [{ role: 'user', content: 'hi' }],
+    reasoning_effort: 'high',
+  })
+  assert.equal(explicit.upstreamModel, 'gemini-3.8-flash-low',
+    '⚠️ 模型名里的显式后缀优先（listModels 暴露的就是四个独立变体）')
+  assert.match(explicit.body, /"thinkingBudget":1000/)
+  // tiered 档**不发** thinkingBudget（交给上游自适应）
+  const tiered = buildGeminiInferPayload(credential, 'gemini-3.8-flash-tiered', {
+    messages: [{ role: 'user', content: 'hi' }],
+  })
+  assert.ok(!tiered.body.includes('thinkingBudget'), 'tiered 档只带 includeThoughts')
+  assert.match(tiered.body, /"includeThoughts":true/)
+
+  // ── ⑦ 未知模型名必须**本地拒绝**（放行会让用户静默拿到错模型的答案）──
+  assert.throws(
+    () => buildGeminiInferPayload(credential, 'gemini-9.9-fake', {
+      messages: [{ role: 'user', content: 'hi' }],
+    }),
+    (error: unknown) => error instanceof ProviderError && error.httpStatus === 404,
+  )
+  // 空消息同样必须拒绝（发空请求上游 400，且报错不指向真因）
+  assert.throws(() => buildGeminiInferPayload(credential, 'gemini-3.8-flash', { messages: [] }))
+})
+
+test('Gemini SSE 转换：text + thought + tool_call + usage + finish_reason 全部要落地', async () => {
+  const { geminiSseToOpenAiSse } = await import('../src/providers/gemini.ts')
+
+  // ⚠️ 上游帧的真实形状（自带 `usageMetadata` 的收尾帧与 `{"response":{…}}` 信封）。
+  const frames = [
+    // 信封形态 + 思考
+    'data: {"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"想一下","thought":true}]}}]}}',
+    // 裸 Response 形态 + 正文
+    'data: {"candidates":[{"content":{"parts":[{"text":"你好"}]}}]}',
+    // 工具调用（上游的 functionCall 是**完整**的，不是增量）
+    'data: {"candidates":[{"content":{"parts":[{"functionCall":{"name":"get_weather","args":{"city":"北京","unit":"c"}}}]}}],"usageMetadata":{"promptTokenCount":100,"candidatesTokenCount":5,"totalTokenCount":105}}',
+    // 纯 usage 帧（没有 candidates）—— 必须只记用量、不算内容
+    'data: {"usageMetadata":{"promptTokenCount":120,"cachedContentTokenCount":20,"candidatesTokenCount":9,"thoughtsTokenCount":4,"totalTokenCount":129}}',
+    // 收尾帧
+    'data: {"candidates":[{"finishReason":"STOP"}]}',
+    'data: [DONE]',
+    '',
+  ]
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      const encoder = new TextEncoder()
+      // ⚠️ 故意在**一行中间**切断，验证 `buffer` 会把半个事件拼回来
+      // （不拼的后果是那一整帧被静默丢弃 —— 正好是最容易漏的末帧形态）。
+      const raw = frames.join('\n\n') + '\n\n'
+      const cut = raw.indexOf('"name":"get_weather"') + 5
+      assert.ok(cut > 5, '切断点必须落在工具调用那一行里')
+      controller.enqueue(encoder.encode(raw.slice(0, cut)))
+      controller.enqueue(encoder.encode(raw.slice(cut)))
+      controller.close()
+    },
+  })
+
+  const out = await new Response(geminiSseToOpenAiSse(stream, 'gemini-3.8-flash-medium')).text()
+  assert.ok(out.endsWith('data: [DONE]\n\n'), '必须以 [DONE] 收尾')
+
+  const chunks = out.split('\n\n')
+    // ⚠️ 必须用 `data: `（**带空格**）剥前缀：JSON 里可能出现 `data:` 字样，
+    // 用 `replace('data:', …)` 之类的宽判据会切坏正文。
+    .map((frame) => (frame.startsWith('data: ') ? frame.slice(6) : frame))
+    .filter((payload) => payload !== '' && payload !== '[DONE]')
+    .map((payload) => JSON.parse(payload) as Record<string, unknown>)
+
+  // ── 首帧必须带 role，后续帧不得重复带 ──
+  const firstChoices = chunks[0]?.['choices'] as Array<{ delta: Record<string, unknown> }> | undefined
+  assert.equal(firstChoices?.length, 1, '每一帧都必须恰好有一个 choice')
+  assert.equal(firstChoices![0]!.delta['role'], 'assistant', '首帧必须宣告 role')
+  // ⚠️ **用量帧的 `choices` 是空数组**（OpenAI 规范允许，且参考实现也这么做）——
+  // 遍历时必须跳过它，否则 `choices[0].delta` 会抛 undefined。
+  // 这是本测试第一版的真实缺陷（假失败），不是转换器的缺陷。
+  const withChoice = chunks.filter((c) => Array.isArray(c['choices']) && (c['choices'] as unknown[]).length > 0)
+  assert.ok(withChoice.length >= 3, '至少有 role / 正文 / 收尾三个带 choice 的帧')
+  for (const chunk of withChoice.slice(1)) {
+    const delta = (chunk['choices'] as Array<{ delta: Record<string, unknown> }>)[0]!.delta
+    assert.equal(delta['role'], undefined, '⚠️ 后续帧不得重复带 role（部分客户端会重开会话）')
+  }
+
+  // ── 思考走 reasoning_content，正文走 content ──
+  const deltas = withChoice.map((chunk) =>
+    (chunk['choices'] as Array<{ delta: Record<string, unknown> }>)[0]!.delta)
+  assert.ok(deltas.some((d) => d['reasoning_content'] === '想一下'), '思考必须映射到 reasoning_content')
+  assert.ok(deltas.some((d) => d['content'] === '你好'), '正文必须映射到 content')
+
+  // ── 工具调用：name + 已解析的参数 + 本地生成的 id ──
+  const toolDelta = deltas.find((d) => d['tool_calls'] !== undefined)
+  assert.ok(toolDelta !== undefined, 'functionCall 必须映射成 tool_calls')
+  const call = (toolDelta!['tool_calls'] as Array<Record<string, unknown>>)[0]!
+  assert.equal(call['type'], 'function')
+  assert.ok(typeof call['id'] === 'string' && String(call['id']).startsWith('gemini_tool_'),
+    '上游不给 id，必须本地生成')
+  const fn = call['function'] as Record<string, unknown>
+  assert.equal(fn['name'], 'get_weather')
+  assert.deepEqual(JSON.parse(String(fn['arguments'])), { city: '北京', unit: 'c' })
+
+  // ── finish_reason：有工具调用就必须是 tool_calls（否则客户端不会继续执行工具）──
+  const finish = withChoice.find((chunk) =>
+    (chunk['choices'] as Array<{ finish_reason: unknown }>)[0]!.finish_reason !== null)
+  assert.equal(
+    (finish!['choices'] as Array<{ finish_reason: unknown }>)[0]!.finish_reason,
+    'tool_calls',
+    '⚠️ 有工具调用时必须报 tool_calls（报 stop 会让工具循环停下来）',
+  )
+
+  // ── usage：input 扣掉缓存、reasoning **不叠加**进 output、取 total 最大的那一份 ──
+  const usageFrame = chunks.find((chunk) => chunk['usage'] !== undefined)
+  assert.ok(usageFrame !== undefined, '必须发出 usage 帧（网关据此记账）')
+  const usage = usageFrame!['usage'] as Record<string, unknown>
+  assert.equal(usage['prompt_tokens'], 100, '⚠️ input = promptTokenCount - cachedContentTokenCount（120-20）')
+  assert.equal(usage['completion_tokens'], 9, '⚠️ output 只含 candidatesTokenCount，thoughts **不叠加**')
+  assert.equal(usage['total_tokens'], 129, '必须用上游自报的最大 totalTokenCount')
+  assert.deepEqual(usage['prompt_tokens_details'], { cached_tokens: 20 })
+  assert.deepEqual(usage['completion_tokens_details'], { reasoning_tokens: 4 })
+})
+
+test('Gemini SSE 兜底：空响应必须**显式报错**，截断的末帧也不得被丢弃', async () => {
+  const { geminiSseToOpenAiSse } = await import('../src/providers/gemini.ts')
+
+  // ── ① 完全没有内容的 200 响应 → 错误帧（**绝不静默空回复**）──
+  const empty = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode('data: {"usageMetadata":{"totalTokenCount":7}}\n\n'))
+      controller.close()
+    },
+  })
+  const emptyOut = await new Response(geminiSseToOpenAiSse(empty, 'm')).text()
+  assert.match(emptyOut, /"error"/, '⚠️ 空响应必须显式报错（空回复比报错更糟）')
+  assert.ok(!emptyOut.includes('[DONE]'), '⚠️ 报错后不得再补 [DONE]（那会把失败伪装成正常结束）')
+
+  // ── ② 上游**没给空行结尾**的末帧（被截断的流）：finish/usage 仍在余量里，
+  //      必须按整行再走一遍，否则末帧被静默丢弃 ──
+  const truncated = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode(
+        'data: {"candidates":[{"content":{"parts":[{"text":"答"}]}}]}\n\n'
+        + 'data: {"candidates":[{"finishReason":"MAX_TOKENS"}],"usageMetadata":{"promptTokenCount":3,"candidatesTokenCount":1,"totalTokenCount":4}}',
+      ))
+      controller.close()
+    },
+  })
+  const truncatedOut = await new Response(geminiSseToOpenAiSse(truncated, 'm')).text()
+  assert.ok(truncatedOut.includes('"content":"答"'))
+  assert.ok(truncatedOut.includes('"finish_reason":"length"'),
+    '⚠️ 截断流里的 MAX_TOKENS 末帧必须被处理（映射为 length）')
+  assert.ok(truncatedOut.includes('"prompt_tokens":3'), '⚠️ 截断流里的 usage 不得被丢弃')
+
+  // ── ③ 非 JSON 的 data: 载荷必须显式报错（不静默忽略）──
+  const garbage = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode('data: {not json\n\n'))
+      controller.close()
+    },
+  })
+  const garbageOut = await new Response(geminiSseToOpenAiSse(garbage, 'm')).text()
+  assert.match(garbageOut, /"error"/, '⚠️ 形状不可识别的帧必须报错并带原文片段')
+  assert.match(garbageOut, /not json/, '错误里必须带上游原文片段')
+
+  // ── ④ 心跳注释行（`:` 开头）必须被跳过，不能当数据 ──
+  const heartbeat = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode(
+        ': keep-alive\n\ndata: {"candidates":[{"content":{"parts":[{"text":"ok"}]}}]}\n\n',
+      ))
+      controller.close()
+    },
+  })
+  const heartbeatOut = await new Response(geminiSseToOpenAiSse(heartbeat, 'm')).text()
+  assert.ok(heartbeatOut.includes('"content":"ok"'))
+  assert.ok(!heartbeatOut.includes('"error"'), '⚠️ 心跳行不是数据，不得被当成坏帧')
+})
+
+test('Gemini 余额：只认两个 bucketId，比例如实报成百分比（不伪造 token 数）', async () => {
+  const { balance, parseGeminiQuotaWindows, toGeminiProviderBalance } =
+    await import('../src/providers/gemini.ts')
+  const credential = {
+    provider: 'gemini',
+    uid: 'u',
+    accessToken: 'tok',
+    refreshToken: 'r',
+    expiresAt: 0,
+    nickname: 'n',
+    extras: {},
+  }
+
+  // ── ① 上游形状（含一个别的产品线的桶、一个不可解析 resetTime 的桶）──
+  const upstream = {
+    groups: [
+      { displayName: 'Gemini Models', buckets: [
+        { bucketId: 'gemini-weekly', window: 'weekly', resetTime: '2030-01-08T00:00:00Z', remainingFraction: 0.9 },
+        { bucketId: 'gemini-5h', window: '5h', resetTime: '2030-01-01T05:00:00Z', remainingFraction: 0.82 },
+      ] },
+      { displayName: 'Claude and GPT models', buckets: [
+        { bucketId: '3p-claude', window: '5h', resetTime: '2030-01-01T05:00:00Z', remainingFraction: 0.1 },
+      ] },
+      { displayName: 'Broken', buckets: [
+        // ⚠️ 不可解析的 resetTime ⇒ **整条桶丢弃**（编一个空串会显示成「永不过期」）
+        { bucketId: 'gemini-5h', window: '5h', resetTime: 'not-a-time', remainingFraction: 0.5 },
+      ] },
+    ],
+  }
+  const parsed = parseGeminiQuotaWindows(upstream)
+  assert.equal(parsed.fiveHour?.remainingFraction, 0.82, '⚠️ 判据是 bucketId，且先命中的那条胜出')
+  assert.equal(parsed.weekly?.remainingFraction, 0.9)
+  const mapped = toGeminiProviderBalance(parsed.fiveHour, parsed.weekly)
+  assert.equal(mapped.packages.length, 2, '只认 gemini-5h / gemini-weekly 两个桶')
+  const fiveHour = mapped.packages.find((p) => p.name.includes('5 小时窗口'))!
+  assert.equal(fiveHour.amount, 82, 'amount 是**百分点**（上游给的是比例，没有绝对数量）')
+  assert.match(fiveHour.name, /剩余比例/, '⚠️ 包名必须写明这是比例，不是 token 数（否则面板会骗人）')
+  assert.ok(!fiveHour.name.includes('积分'), '⚠️ 这不是积分，文案不得写成积分')
+  assert.equal(mapped.earliestExpiry, Date.parse('2030-01-01T05:00:00Z'),
+    'earliestExpiry 取两个窗口里**最早的重置时刻**（epoch ms）')
+  assert.equal(mapped.expiring, 0, '配额窗口没有「即将过期额度」的语义，不得编造')
+  assert.equal(mapped.total, 86, 'total 取两窗口百分点的平均值')
+
+  // ── ② 认不出任何一个桶 ⇒ 抛错（**不伪造 100%**）──
+  assert.deepEqual(parseGeminiQuotaWindows({ groups: [{ buckets: [{ bucketId: '3p-claude' }] }] }), {})
+  const realFetch = globalThis.fetch
+  let sawBody = ''
+  globalThis.fetch = (async (_url: string | URL, init: RequestInit = {}) => {
+    sawBody = String(init.body ?? '')
+    return new Response(JSON.stringify({ groups: [] }), {
+      status: 200, headers: { 'content-type': 'application/json' },
+    })
+  }) as unknown as typeof fetch
+  try {
+    const error = await catchProviderError(() => balance(credential, AbortSignal.timeout(5000)))
+    assert.ok(error instanceof ProviderError, '认不出桶必须抛错，不能静默返回 0')
+    // ⚠️ 字段名必须是 `project`（`cloudaicompanionProject` 会 400 Cannot find field）
+    assert.equal(sawBody, JSON.stringify({ project: 'aicode-consumers' }),
+      '⚠️ 配额请求体的字段名必须是 `project`，值取凭据缺失时的兜底串')
+
+    // ── ③ 403 SUBSCRIPTION_REQUIRED：如实报出上游 reason（不能一概说「凭据已失效」）──
+    globalThis.fetch = (async () => new Response(JSON.stringify({
+      error: { code: 403, message: 'You do not have a valid license of this product.',
+        status: 'PERMISSION_DENIED', details: [{ reason: 'SUBSCRIPTION_REQUIRED' }] },
+    }), { status: 403, headers: { 'content-type': 'application/json' } })) as unknown as typeof fetch
+    const denied = await catchProviderError(() => balance(credential, AbortSignal.timeout(5000)))
+    assert.ok(denied instanceof ProviderError)
+    assert.match(denied.message, /SUBSCRIPTION_REQUIRED/, '⚠️ 必须把上游 reason 透出来（否则会误导去重新登录）')
+    assert.equal(denied.httpStatus, 403)
+  } finally {
+    globalThis.fetch = realFetch
+  }
+})
+
+test('Gemini 能力声明：login=false 必须给出可读原因，checkin=false 同理', async () => {
+  const { geminiProvider, listModels } = await import('../src/providers/gemini.ts')
+  assert.equal(geminiProvider.id, 'gemini')
+  assert.equal(geminiProvider.name, 'Gemini (Cloud Code Assist)')
+  assert.deepEqual(geminiProvider.capabilities.login, false)
+  // ⚠️ 登录不可用**必须解释为什么**（用户才知道该怎么办），
+  // 空文案或「不支持」会让用户以为是本服务的缺陷。
+  assert.match(geminiProvider.capabilities.loginBlockedReason ?? '', /localhost|回调/,
+    'login=false 必须说明是本地回调不可用')
+  assert.equal(geminiProvider.capabilities.checkin, false)
+  assert.ok((geminiProvider.capabilities.checkinBlockedReason ?? '').length > 10)
+  // ⚠️ 刻意不声明裸字符串判别式：Gemini 凭据只有 JSON 对象形态，
+  // 声明一个宽松的裸串匹配只会把任意文本吞成必然失败的账号。
+  assert.equal(geminiProvider.bareStringPattern, undefined)
+
+  // ── 模型目录：裸名 + 四个档位变体（**必须带后缀**，它是上游准入钥匙）──
+  const models = await listModels(
+    { provider: 'gemini', uid: 'u', accessToken: 't', refreshToken: '', expiresAt: 0, nickname: '', extras: {} },
+    AbortSignal.timeout(1000),
+  )
+  const ids = models.map((m) => m.id)
+  assert.ok(ids.includes('gemini-3.8-flash'), '必须暴露裸名（调用方只写一个名字时回落默认档）')
+  for (const tier of ['low', 'medium', 'high', 'tiered']) {
+    assert.ok(ids.includes(`gemini-3.8-flash-${tier}`), `必须暴露档位变体 -${tier}`)
+  }
+  assert.ok(!ids.some((id) => id.includes('lite')),
+    '⚠️ 不得暴露 lite（上游恒 404，暴露即坑）')
+  for (const model of models) {
+    assert.ok(model.contextWindow > 0, '⚠️ contextWindow 必须用参考实现记录的值，不得为 0 或编造')
+    assert.ok(model.maxOutput > 0)
+  }
 })

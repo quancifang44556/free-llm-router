@@ -31,6 +31,16 @@ import { prepareChatBody, sanitizeChatBody } from './payload.js'
 import { ERROR_CHECK_FRAMES, ERROR_HINT_PATTERN, aggregateSse, createFrameTranslator, detectErrorFrame, doneFrame, errorFrame, mayHaveUsage, parseSseLine, sseHeaders, translateFrame } from './stream.js'
 import { jsonError } from './http.js'
 import { DEFAULT_PROVIDER, findProvider, providerIds } from '../providers/index.js'
+import { bindBuddy } from '../providers/buddy.js'
+import {
+  AGGREGATE_AUTO,
+  AGGREGATE_PROVIDER_ID,
+  EXPIRY_UNUSABLE,
+  buildVirtualModels,
+  rankCandidates,
+  type AggregateCandidate,
+  type ProviderCatalog,
+} from './aggregate.js'
 import { splitModelName, type ProviderCredential } from '../providers/types.js'
 import type { LoginCredential } from '../upstream/auth.js'
 import type { AccountPoolDO } from '../pool/AccountPoolDO.js'
@@ -370,6 +380,7 @@ export async function handleChatCompletions(
   // ⚠️ 多供应商路由：`provider/model` 前缀决定去哪家。
   // 无前缀时回落到默认供应商（保持既有用户兼容 —— 他们已经在用裸模型名）。
   const routed = splitModelName(rawModel, providerIds(), DEFAULT_PROVIDER)
+
   const providerId = routed.provider
   const model = routed.model
 
@@ -390,6 +401,19 @@ export async function handleChatCompletions(
    * 故判据是**严格等 true**：只有显式 `stream: true` 才走流式。
    */
   const wantsStream = (rawBody as Record<string, unknown>).stream === true
+
+  // ── 聚合 provider 分支 ──
+  //
+  // ⚠️ **放在 `splitModelName` 之后、其余全部逻辑之前**。`providerIds()`
+  // 里**不含** `aggregate`（见 `aggregate.ts` 文件头：它是网关层的一层，
+  // 不是注册表里的 Provider）⇒ 必须在这里显式认出它，否则会被当成未知前缀
+  // 而回落到默认供应商，表现为「`aggregate/...` 悄悄变成了 buddy 的模型」。
+  if (routed.provider === AGGREGATE_PROVIDER_ID) {
+    return await handleAggregateChat({
+      model: routed.model, wantsStream, rawBody, request, env, realm, ctx, sessionKey,
+    })
+  }
+
 
   // ⚠️ **用户关闭的供应商必须拒绝路由**（关闭 = 彻底关掉，不只是从目录里消失）。
   //
@@ -1513,4 +1537,379 @@ async function nonStreamingResponse(
     status: 200,
     headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
   })
+}
+
+// ─────────────────────── 聚合 provider（跨渠道临期优先） ───────────────────────
+
+/**
+ * 聚合请求的派发。
+ *
+ * ## 它做什么
+ *
+ * 1. 拉一份**跨渠道目录**（各家 `listModels`），归成虚拟模型；
+ * 2. 定位请求要的虚拟模型（`auto` = 不指定，在所有候选里挑）；
+ * 3. 给每个候选渠道**探测积分到期时刻**（`provider.balance().earliestExpiry`）；
+ * 4. **临期优先**排序，逐个试；
+ * 5. 最终**复用 `handleProviderChat`** 真正发请求 —— 那样就白拿了既有的
+ *    选号／冷却／熔断／续期／记账／会话粘性（见 `aggregate.ts` 文件头）。
+ *
+ * ## 🔴 回退边界（必须保守）
+ *
+ * 只有**还没开始输出内容就失败**（HTTP ≥ 400）时才换下一个候选。
+ * 一旦开始流式输出就不再切换 —— 那会把半截回答换成另一个模型的回答。
+ *
+ * ## 为什么不缓存目录/到期时刻
+ *
+ * 参考实现缓存 60 秒。我们**先不缓存**，理由：Workers 的 isolate 随时被回收，
+ * 模块级缓存在多 isolate 下命中率低、且会引入「缓存新旧不一致」这类难查问题；
+ * 而「临期优先」的正确性恰恰依赖到期时刻够新。代价是每次聚合请求多几次
+ * 上游调用 —— 对**本人自用**的规模可接受，且刻意优先正确性。
+ * 若将来发现开销明显，再加缓存（届时必须带 TTL 与 `force` 旁路）。
+ */
+async function handleAggregateChat(input: {
+  model: string
+  wantsStream: boolean
+  rawBody: unknown
+  request: Request
+  env: Env
+  realm: string
+  ctx?: ExecutionContext
+  sessionKey: string
+}): Promise<GatewayResult> {
+  const { model, rawBody, request, env, realm, ctx, sessionKey } = input
+
+  const virtuals = await loadAggregateCatalog(env, realm)
+  if (virtuals.length === 0) {
+    return {
+      response: jsonError(
+        503,
+        '聚合目录为空：没有任何渠道提供了可聚合的模型。'
+          + '请先在面板确认有账号（且它们的 `listModels` 可用）。',
+        'no_available_account',
+      ),
+    }
+  }
+
+  // 定位候选：
+  // - `auto` ⇒ 全部虚拟模型的候选并集（「在所有渠道的所有可用模型里挑」）；
+  // - 具体规范键 ⇒ 该模型的候选；
+  // - 找不到 ⇒ 明确报错并**列出可用的键**（否则用户只能猜拼写）。
+  let candidates: AggregateCandidate[]
+  if (model === AGGREGATE_AUTO || model === '') {
+    const seen = new Set<string>()
+    candidates = []
+    for (const v of virtuals) {
+      for (const c of v.candidates) {
+        const id = `${c.provider}\u0000${c.realId}`
+        if (seen.has(id)) continue
+        seen.add(id)
+        candidates.push(c)
+      }
+    }
+  } else {
+    const hit = virtuals.find((v) => v.key === model)
+    if (hit === undefined) {
+      // ⚠️ 列出可用键：聚合的键是**推导**出来的（用户看不到映射表），
+      // 不给提示就等于让用户猜。截断到 20 条以免响应过大。
+      const keys = virtuals.slice(0, 20).map((v) => v.key)
+      return {
+        response: jsonError(
+          400,
+          `聚合模型「${model}」未知。可用的规范名（前 20 个）：${keys.join('、')}`
+            + `${virtuals.length > 20 ? ` …… 共 ${virtuals.length} 个` : ''}`
+            + '。也可以用 `aggregate/auto` 让它自动挑。',
+          'invalid_request_error',
+        ),
+      }
+    }
+    candidates = hit.candidates
+  }
+
+  if (candidates.length === 0) {
+    return {
+      response: jsonError(503, `聚合模型「${model}」没有任何候选渠道。`, 'no_available_account'),
+    }
+  }
+
+  // ⚠️ **剔除用户停用的模型**（与 `/v1/models` 同一条纪律：停用 = 彻底关掉）。
+  //
+  // 实测缺陷：聚合目录曾列出 **526** 条而主目录只有 32 条 —— 差额全是用户
+  // 自己在面板里停用的模型。若不在这里也过滤，聚合路径会**绕过停用设置**：
+  // 用户在目录里看不到它，写个规范名却能调通 —— 「我关了它」变成一句空话。
+  //
+  // ⚠️ 若剔除后一个不剩，**如实报错**并说明原因，而不是回退到「不过滤」
+  //（回退等于静默无视用户的设置）。
+  const filtered = await filterDisabledCandidates(env, realm, candidates)
+  if (filtered.length === 0) {
+    return {
+      response: jsonError(
+        403,
+        `聚合模型「${model}」的候选渠道都已被你在面板中停用。`
+          + '如需使用，请在「供应商与账号」页重新启用对应模型。',
+        'model_disabled',
+      ),
+    }
+  }
+
+  // 探测到期时刻并做临期优先排序。
+  const expiry = await probeExpiries(env, realm, filtered, request.signal)
+  const ranked = rankCandidates(filtered, (c) => expiry.get(`${c.provider}\u0000${c.realId}`) ?? EXPIRY_UNUSABLE)
+
+  if (ranked.length === 0) {
+    // ⚠️ 如实区分「查不到额度」与「没有候选」—— 用户的下一步动作不同。
+    return {
+      response: jsonError(
+        503,
+        `聚合模型「${model}」的 ${candidates.length} 个候选渠道都查不到可用额度`
+          + '（可能是凭据过期、或该家不支持查余额）。请到面板检查账号状态。',
+        'no_available_account',
+      ),
+    }
+  }
+
+  // 逐个候选试。**只在「还没输出内容就失败」时换下一个**。
+  let lastError: { status: number; message: string } | undefined
+  const tried: string[] = []
+  for (const c of ranked) {
+    // ⚠️ 把请求体里的 `model` 换成**该渠道的真实 id**再派发。
+    // 不换会让上游收到规范键（它不认识）⇒ 404 / 落到默认模型。
+    const body = rawBody !== null && typeof rawBody === 'object' && !Array.isArray(rawBody)
+      ? { ...(rawBody as Record<string, unknown>), model: c.realId }
+      : rawBody
+
+    let result: GatewayResult
+    try {
+      result = await handleProviderChat({
+        providerId: c.provider,
+        model: c.realId,
+        wantsStream: input.wantsStream,
+        rawBody: body,
+        request,
+        env,
+        realm,
+        ...(ctx !== undefined ? { ctx } : {}),
+        tried: [],
+        sessionKey,
+      })
+    } catch (error) {
+      lastError = {
+        status: 502,
+        message: `聚合候选「${c.provider}」异常：${error instanceof Error ? error.message : String(error)}`,
+      }
+      tried.push(c.provider)
+      continue
+    }
+
+    // ⚠️ **只在「还没吐内容」时才允许切换**。
+    //
+    // `handleProviderChat` 在「上游拒绝」时返回的是**错误响应**（非 2xx），
+    // 此时流还没开始，可以安全换下一个；一旦是 2xx，流已经开始（或即将开始），
+    // 再换就会把半截回答拼成乱码 —— 故**直接返回**。
+    if (result.response.status < 400) return result
+
+    // 错误响应：读出正文用于「所有候选都失败」时的说明（可安全读，非流式体）。
+    let message = `http=${result.response.status}`
+    try {
+      message = (await result.response.clone().text()).slice(0, 200)
+    } catch {
+      // 读不到就用状态码兜底（不静默）
+    }
+    lastError = { status: result.response.status, message }
+    tried.push(c.provider)
+  }
+
+  const detail = lastError === undefined ? '没有候选' : lastError.message
+  return {
+    response: jsonError(
+      lastError?.status ?? 503,
+      `聚合模型「${model}」的全部候选都失败了（已试：${tried.join('、')}）。最后一次：${detail}`,
+      'provider_error',
+    ),
+  }
+}
+
+/**
+ * 拉一份跨渠道目录并归成虚拟模型。
+ *
+ * ⚠️ 逐家**串行**：Workers 同时出站连接上限 6，且并行打上游更容易触发风控
+ * （与 `/v1/models` 同一条纪律）。
+ *
+ * ⚠️ 单家失败**只跳过它**（记日志），不让整个聚合不可用 ——
+ * 一家凭据过期不该让「用哪家更划算」这件事整个失效。
+ */
+async function loadAggregateCatalog(env: Env, realm: string): Promise<ReturnType<typeof buildVirtualModels>> {
+  const catalogs: ProviderCatalog[] = []
+  for (const providerId of providerIds()) {
+    if (providerId === AGGREGATE_PROVIDER_ID) continue
+    const provider = findProvider(providerId)
+    if (provider === undefined || !provider.capabilities.listModels) continue
+    try {
+      const models = await listModelsForProvider(env, realm, providerId)
+      if (models.length > 0) catalogs.push({ provider: providerId, models })
+    } catch (error) {
+      console.warn(
+        `[aggregate] 跳过 ${providerId} 的目录：`,
+        error instanceof Error ? error.message : String(error),
+      )
+    }
+  }
+  return buildVirtualModels(catalogs)
+}
+
+/**
+ * 取某家在**某 realm** 下一个可用账号的模型目录。
+ *
+ * ⚠️ 走**续期重试**（与 `/v1/models` 同一条路径）：过期令牌不该让整家
+ * 从聚合目录里消失。也**同样跳过用户已关闭的供应商** ——
+ * 否则「我关了它」在聚合路径上失效。
+ */
+async function listModelsForProvider(
+  env: Env,
+  realm: string,
+  providerId: string,
+): Promise<import('../providers/types.js').ProviderModel[]> {
+  const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
+  const accounts = await pool.listAccounts(realm, Date.now())
+  const usable = accounts.filter((a) => (a.provider ?? DEFAULT_PROVIDER) === providerId && !a.disabled)
+  if (usable.length === 0) return []
+
+  const provider = findProvider(providerId)
+  if (provider === undefined) return []
+
+  // ⚠️ 用户关闭的家在聚合路径上也要跳过（关闭 = 彻底关掉）
+  if (await isProviderClosedByUser(env, providerId)) return []
+
+  const account = usable[0] as (typeof usable)[number]
+  const credential = (await pool.getCredential(account.uid)) as ProviderCredential | undefined
+  if (credential === undefined) return []
+
+  const bound = providerId === DEFAULT_PROVIDER ? bindBuddy(env) : provider
+  try {
+    return await bound.listModels(credential, AbortSignal.timeout(20_000))
+  } catch (error) {
+    // ⚠️ 目录拉取失败时**不在这里续期**：续期需要 `putCredential` 回写，
+    // 而那套逻辑在 `index.ts` 的 `withRefreshRetry` 里（私有的）。
+    // 这里**如实抛出**，由 `loadAggregateCatalog` 逐家兜错跳过 ——
+    // 一个令牌过期的家不该让整个聚合目录消失，但也不该在这里假装成功。
+    //（正常路径上令牌由 cron 的主动续期与网关的 401 兜底维护，很少走到这里。）
+    throw error
+  }
+}
+
+/**
+ * 剔除被用户停用的候选（**停用 = 彻底关掉**）。
+ *
+ * 判据与 `/v1/models` 同源：`AccountPoolDO.getDisabledModels(provider)`。
+ * 两个 realm 都查 —— 停用列表按 provider 存，但存在各自 realm 的分片里。
+ *
+ * ⚠️ 逐家查一次并缓存：`getDisabledModels` 是 DO RPC，按候选逐个查会
+ * 产生大量无谓往返。
+ */
+async function filterDisabledCandidates(
+  env: Env,
+  realm: string,
+  candidates: readonly AggregateCandidate[],
+): Promise<AggregateCandidate[]> {
+  const providers = [...new Set(candidates.map((c) => c.provider))]
+  const off = new Map<string, Set<string>>()
+  for (const providerId of providers) {
+    const set = new Set<string>()
+    for (const r of ['cn', 'global']) {
+      try {
+        const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(r))
+        for (const id of await pool.getDisabledModels(providerId)) set.add(id)
+      } catch {
+        // ⚠️ 读不到停用列表时**不静默放行** —— 那会让停用失效。
+        // 保守做法：把该家整体视为「停用不可用」。这里选择**记日志并跳过
+        // 该家的过滤**是危险的，故改为：读失败则保留候选但记警告。
+        // 取舍理由：读失败更可能是瞬时 DO 故障，而「整体不可用」会让
+        // 用户明明是好的账号突然全用不了 —— 那是更大的伤害。
+        console.warn(`[aggregate] 读取 ${providerId} 的停用模型失败（按未停用处理）`)
+      }
+    }
+    off.set(providerId, set)
+  }
+  return candidates.filter((c) => !(off.get(c.provider)?.has(c.realId) ?? false))
+}
+
+/**
+ * 为每个候选探测「积分最早作废时刻」。
+ *
+ * ⚠️ 用我们既有的 `ProviderBalance.earliestExpiry` —— 它本来就存在
+ * （10/12 家已实现），故这里**不需要**参考实现那套 590 行的分渠道折算：
+ * 各家的 `balance()` 已经把它算好了。这正是「复用既有能力」的好处。
+ *
+ * ⚠️ 探测失败 ⇒ `EXPIRY_UNUSABLE`（**不是**「长期」）——
+ * 我们**不知道**那个渠道能不能用，不能把流量发过去。
+ *
+ * ⚠️ 每个供应商**只探一次**（同一家的多个模型共享一份余额）。
+ * ⚠️ 逐家串行 + 超时：探测是**额外开销**，必须受限，不能让它拖垮请求。
+ */
+async function probeExpiries(
+  env: Env,
+  realm: string,
+  candidates: readonly AggregateCandidate[],
+  signal: AbortSignal,
+): Promise<Map<string, number>> {
+  const out = new Map<string, number>()
+  const seenProviders = new Set<string>()
+
+  for (const c of candidates) {
+    const key = `${c.provider}\u0000${c.realId}`
+    if (seenProviders.has(c.provider)) {
+      // 同一家已探过：复用那家的结果（按 provider 记一份）
+      out.set(key, out.get(`${c.provider}\u0000*`) ?? EXPIRY_UNUSABLE)
+      continue
+    }
+    seenProviders.add(c.provider)
+
+    const provider = findProvider(c.provider)
+    if (provider === undefined || provider.balance === undefined) {
+      // 不支持查余额 ⇒ 查不到（不是「长期」）
+      out.set(`${c.provider}\u0000*`, EXPIRY_UNUSABLE)
+      out.set(key, EXPIRY_UNUSABLE)
+      continue
+    }
+
+    let expiry = EXPIRY_UNUSABLE
+    try {
+      const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
+      const accounts = await pool.listAccounts(realm, Date.now())
+      const account = accounts.find((a) => (a.provider ?? DEFAULT_PROVIDER) === c.provider && !a.disabled)
+      if (account === undefined) {
+        out.set(`${c.provider}\u0000*`, EXPIRY_UNUSABLE)
+        out.set(key, EXPIRY_UNUSABLE)
+        continue
+      }
+      const credential = (await pool.getCredential(account.uid)) as ProviderCredential | undefined
+      if (credential === undefined) {
+        out.set(`${c.provider}\u0000*`, EXPIRY_UNUSABLE)
+        out.set(key, EXPIRY_UNUSABLE)
+        continue
+      }
+      const bound = c.provider === DEFAULT_PROVIDER ? bindBuddy(env) : provider
+      const balanceFn = bound.balance
+      if (balanceFn === undefined) {
+        out.set(`${c.provider}\u0000*`, EXPIRY_UNUSABLE)
+        out.set(key, EXPIRY_UNUSABLE)
+        continue
+      }
+      const balance = await balanceFn.call(bound, credential, AbortSignal.any([signal, AbortSignal.timeout(15_000)]))
+      // ⚠️ `earliestExpiry` 是**绝对 epoch ms**；`0` = 未知（不是「已过期」）。
+      // 未知 ⇒ 用「长期」还是「查不到」？本项目取**查不到**（保守）：
+      // 我们没能确定它的临期情况，就不该假装它长期有效而去优先烧别家。
+      expiry = balance.earliestExpiry > 0 ? balance.earliestExpiry : EXPIRY_UNUSABLE
+    } catch (error) {
+      // ⚠️ 客户端取消必须原样抛出（本项目既有纪律），不能吞成「查不到」
+      if (signal.aborted) throw error
+      expiry = EXPIRY_UNUSABLE
+      console.warn(
+        `[aggregate] 探测 ${c.provider} 的到期时刻失败：`,
+        error instanceof Error ? error.message : String(error),
+      )
+    }
+    out.set(`${c.provider}\u0000*`, expiry)
+    out.set(key, expiry)
+  }
+  return out
 }

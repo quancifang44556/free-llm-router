@@ -66,6 +66,62 @@ import { handleChatCompletions } from './gateway/server.js'
 import { fetchBalance } from './upstream/checkin.js'
 import { listTasks } from './upstream/tasks.js'
 import { listModels, pickCredential } from './gateway/models.js'
+/**
+ * 为 `/v1/models` 取聚合目录（跨 realm）。
+ *
+ * ⚠️ 与 `gateway/server.ts` 的 `loadAggregateCatalog` **同一个目的**，
+ * 但那一份是私有的、且按单个 realm 取。这里为目录接口跨 realm 汇总。
+ *
+ * ⚠️ 逐家串行 + 单家兜错：一家凭据过期不该让聚合目录整个消失。
+ */
+async function loadAggregateCatalogForModels(
+  env: Env,
+  realms: readonly string[],
+  closedProviders: ReadonlySet<string>,
+  disabledModels: ReadonlyMap<string, ReadonlySet<string>>,
+): Promise<ReturnType<typeof buildVirtualModels>> {
+  const catalogs: ProviderCatalog[] = []
+  for (const providerId of providerIds()) {
+    if (providerId === AGGREGATE_PROVIDER_ID) continue
+    const provider = findProvider(providerId)
+    if (provider === undefined || !provider.capabilities.listModels) continue
+    // 用户关闭的家不出现在目录里（与主目录同一条纪律）
+    if (closedProviders.has(providerId)) continue
+    for (const realm of realms) {
+      try {
+        const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
+        const accounts = await pool.listAccounts(realm, Date.now())
+        const account = accounts.find(
+          (a) => (a.provider ?? DEFAULT_PROVIDER) === providerId && !a.disabled,
+        )
+        if (account === undefined) continue
+        const credential = (await pool.getCredential(account.uid)) as ProviderCredential | undefined
+        if (credential === undefined) continue
+        const bound = providerId === DEFAULT_PROVIDER ? bindBuddy(env) : provider
+        const models = await bound.listModels(credential, AbortSignal.timeout(20_000))
+        // ⚠️ **必须过滤用户停用的模型**（与主目录 `disabled.has(m.id)` 同一条纪律）。
+        //
+        // 实测缺陷：不过滤时聚合目录列出 **526** 条，而主目录只有 32 条 ——
+        // 差额全是用户**自己在面板里停用**的模型。把它们重新暴露出来，
+        // 等于让用户在聚合路径上又一次看到自己明确关掉的东西，
+        // 而且「停用」这件事在聚合路径上**失效**了。
+        const off = disabledModels.get(providerId)
+        const kept = off === undefined || off.size === 0
+          ? models
+          : models.filter((m) => !off.has(m.id))
+        if (kept.length > 0) catalogs.push({ provider: providerId, models: kept })
+        break // 该家已取到目录，不必再试别的 realm
+      } catch (error) {
+        console.warn(
+          `[aggregate] ${providerId}/${realm} 目录拉取失败：`,
+          error instanceof Error ? error.message : String(error),
+        )
+      }
+    }
+  }
+  return buildVirtualModels(catalogs)
+}
+
 import { jsonError } from './gateway/http.js'
 import { bindBuddy, WORKBUDDY_INTL } from './providers/buddy.js'
 import {
@@ -77,6 +133,12 @@ import {
   PROVIDERS,
 } from './providers/index.js'
 import { splitModelName, ProviderError, type ProviderCredential } from './providers/types.js'
+import {
+  AGGREGATE_AUTO,
+  AGGREGATE_PROVIDER_ID,
+  buildVirtualModels,
+  type ProviderCatalog,
+} from './gateway/aggregate.js'
 import {
   buildCodeArtsCallbackUrl,
   buildCodeArtsLoginUrl,
@@ -2735,6 +2797,48 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
           error: error instanceof Error ? error.message : String(error),
         })
       }
+    }
+
+    // ── 聚合 provider 的虚拟模型（用户要求「同步聚合模型功能」）──
+    //
+    // ⚠️ 它**不是注册表里的 Provider**（见 `gateway/aggregate.ts` 文件头），
+    // 故不会被上面那个 `byProvider` 循环列出来 —— 必须在这里显式追加，
+    // 否则用户看不到 `aggregate/auto` 与各规范名。
+    //
+    // ⚠️ 单家失败只跳过它（`loadAggregateCatalogForModels` 内部逐家兜错）：
+    // 聚合目录缺席不该让**整个** `/v1/models` 失败。
+    try {
+      // ⚠️ 读齐**每家的停用模型**（与主目录同源：都存在各自 realm 的分片里）。
+      // 两个 realm 都要读，否则「国际版关掉的模型」在国内分片里查不到、会冒出来。
+      const disabledModels = new Map<string, Set<string>>()
+      for (const providerId of providerIds()) {
+        const set = new Set<string>()
+        for (const p of pools.values()) {
+          for (const id of await p.getDisabledModels(providerId)) set.add(id)
+        }
+        if (set.size > 0) disabledModels.set(providerId, set)
+      }
+      const virtuals = await loadAggregateCatalogForModels(
+        env, realms, userDisabledProviders, disabledModels,
+      )
+      // `auto` 放最前（它是「不指定模型」的入口）
+      data.push({
+        id: `${AGGREGATE_PROVIDER_ID}/${AGGREGATE_AUTO}`,
+        object: 'model',
+        owned_by: AGGREGATE_PROVIDER_ID,
+      })
+      for (const v of virtuals) {
+        data.push({
+          id: `${AGGREGATE_PROVIDER_ID}/${v.key}`,
+          object: 'model',
+          owned_by: AGGREGATE_PROVIDER_ID,
+        })
+      }
+    } catch (error) {
+      errors.push({
+        provider: AGGREGATE_PROVIDER_ID,
+        error: error instanceof Error ? error.message : String(error),
+      })
     }
 
     if (data.length === 0 && errors.length === 0) {
