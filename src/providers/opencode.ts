@@ -658,19 +658,6 @@ export type OpencodeErrorKind =
   | 'server'
   | 'transport'
 
-/** 从响应头解析 `retry-after`（秒数或 HTTP 日期）→ 毫秒。 */
-export function parseRetryAfterMs(headers: Headers | undefined): number | undefined {
-  const raw = headers?.get('retry-after')
-  if (raw === undefined || raw === null || raw === '') return undefined
-  // ⚠️ **只放行纯数字**：`Date.parse('900')` 会得到 1970 年的时刻，
-  // 算出巨大负数被 `Math.max(0, …)` 抹成 0（「立即解除」）—— 那会让额度刚用尽的
-  // 账号马上被重选，形成无限空转（`src/opencode-product.ts:172-184`）。
-  const seconds = Number(raw)
-  if (Number.isFinite(seconds) && seconds >= 0) return Math.ceil(seconds * 1000)
-  const at = Date.parse(raw)
-  return Number.isFinite(at) ? Math.max(0, at - Date.now()) : undefined
-}
-
 /**
  * 把一次失败的 HTTP 响应归类为语义化的错误。
  *

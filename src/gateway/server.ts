@@ -29,7 +29,7 @@ import { classify, type ErrorKind } from '../upstream/client.js'
 import { deriveDeviceId, referenceChatHeaders } from '../upstream/headers.js'
 import { prepareChatBody, sanitizeChatBody } from './payload.js'
 import { ERROR_CHECK_FRAMES, ERROR_HINT_PATTERN, aggregateSse, createFrameTranslator, detectErrorFrame, doneFrame, errorFrame, mayHaveUsage, parseSseLine, sseHeaders, translateFrame } from './stream.js'
-import { jsonError } from './http.js'
+import { jsonError, parseRetryAfterMs } from './http.js'
 import { DEFAULT_PROVIDER, findProvider, providerIds } from '../providers/index.js'
 import { bindBuddy } from '../providers/buddy.js'
 import {
@@ -1130,6 +1130,20 @@ async function handleProviderChat(input: {
       // 复用与 buddy 路径相同的细分判据，避免两条路径口径分叉
       //（此前 buddy 路径已细分、这里没有 —— 同一个 bug 修了一半）。
       const refined = refineModelScoped(upstream.status === 429 ? 'rate_limited' : 'unknown', text)
+      // ⚠️ **文案解析不到时，退回标准的 `Retry-After` 头**。
+      //
+      // 上游文案格式**随时可能改**（`reset at … UTC+8` 是我们逆向出来的），
+      // 而 `Retry-After` 是 HTTP 标准头 —— 两者都能给就用文案的（更精确），
+      // 文案给不出时才用头。没有这一步就只剩「我们自己猜 6 小时」。
+      //
+      // ⚠️ `parseRetryAfterMs` 只放行**纯数字**秒数：`Date.parse('900')`
+      // 会得到 1970 年，算出巨大负数被夹成 0 ⇒ 刚限流的账号马上被重选，
+      // 形成无限空转（该函数自己的注释记录了这条踩坑）。
+      const retryAfterMs = refined.resetAt === undefined
+        ? parseRetryAfterMs(upstream.headers)
+        : undefined
+      const resolvedResetAt = refined.resetAt
+        ?? (retryAfterMs === undefined ? undefined : Date.now() + retryAfterMs)
       const failureKind: 'soft' | 'hard' | 'model' | 'breaker' =
         upstream.status === 402
           ? 'hard'
@@ -1142,9 +1156,10 @@ async function handleProviderChat(input: {
           kind: failureKind,
           now: Date.now(),
           ...(model !== '' ? { model } : {}),
-          // ⚠️ 带上上游给的重置时刻（文案里有 `reset at … UTC+8`）：
-          // 模型级冷却据此对齐上游墙钟，而不是我们自己猜 6 小时。
-          ...(refined.resetAt !== undefined ? { resetAt: refined.resetAt } : {}),
+          // ⚠️ 带上上游给的重置时刻（文案里的 `reset at … UTC+8`，
+          // 或标准 `Retry-After` 头）：模型级冷却据此对齐上游墙钟，
+          // 而不是我们自己猜 6 小时。
+          ...(resolvedResetAt !== undefined ? { resetAt: resolvedResetAt } : {}),
           reason: `${providerId} http=${upstream.status}: ${text.slice(0, 160)}`,
         })
         .catch(() => {})

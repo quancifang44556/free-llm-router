@@ -47,6 +47,7 @@ import {
   translateMaxCompletionTokens,
 } from '../src/gateway/payload.ts'
 import { ERROR_CHECK_FRAMES, ERROR_HINT_PATTERN, aggregateSse, createFrameTranslator, detectErrorFrame, doneFrame, errorFrame, mayHaveUsage, needsNormalize, normalizeFrame, normalizeToolCalls, parseSseLine, sseHeaders, translateFrame } from '../src/gateway/stream.ts'
+import { parseRetryAfterMs } from '../src/gateway/http.ts'
 import { extractModels } from '../src/gateway/models.ts'
 import { clientStatusFor, isAuthLikeFailure, mapErrorToPunishment, parseBusinessCode, parseResetAt, punishmentForStreamError, refineModelScoped } from '../src/gateway/server.ts'
 
@@ -1500,4 +1501,44 @@ test('⚠️ splitModelName 对未知前缀的行为（上一条测试的前提�
   const ok = splitModelName('cline/deepseek-v4.1-flash', ids, 'buddy')
   assert.equal(ok.provider, 'cline')
   assert.equal(ok.model, 'deepseek-v4.1-flash')
+})
+
+test('⚠️ parseRetryAfterMs：纯数字秒数 vs HTTP-date，且不得把「900」当 1970 年', () => {
+  // 这是 HTTP 标准头解析，网关的模型级冷却用它对齐上游墙钟
+  //（原先只存在于 opencode.ts，本轮提到 gateway/http.ts 共享）。
+  const h = (v: string | null) => (v === null ? undefined : new Headers({ 'retry-after': v }))
+  // ① 纯数字 = 秒
+  assert.equal(parseRetryAfterMs(h('900')), 900_000)
+  assert.equal(parseRetryAfterMs(h('0')), 0)
+  // ⚠️ 关键：`Date.parse('900')` 会得到 1970 年 ⇒ 巨大负数 ⇒ 夹成 0 ⇒
+  // 「刚限流就立刻解除」的无限空转。必须走「纯数字」分支。
+  assert.ok((parseRetryAfterMs(h('900')) ?? 0) > 0, '⚠️ 数字不得被当成 1970 年')
+  // ② HTTP-date = 绝对时刻，结果应为「距现在的毫秒数」
+  const future = new Date(Date.now() + 60_000).toUTCString()
+  const ms = parseRetryAfterMs(h(future))
+  assert.ok(ms !== undefined && ms > 50_000 && ms <= 60_000,
+    `⚠️ HTTP-date 应换算成距今毫秒，实际 ${ms}`)
+  // ③ 缺失/空 → undefined（不得默认成 0，那等于「不冷却」）
+  assert.equal(parseRetryAfterMs(h(null)), undefined)
+  assert.equal(parseRetryAfterMs(h('')), undefined)
+  assert.equal(parseRetryAfterMs(undefined), undefined)
+  // ④ 无法解析 → undefined
+  assert.equal(parseRetryAfterMs(h('not-a-date')), undefined)
+})
+
+test('⚠️ parseRetryAfterMs 必须在共享层（provider 无关），且网关用它兜底', () => {
+  // ⚠️ 它曾只存在于 opencode.ts —— 而网关的模型级冷却也需要它。
+  // 让网关去 import 一个**供应商模块**是层次颠倒，故提到 gateway/http.ts。
+  const http = readFileSync('src/gateway/http.ts', 'utf8')
+  assert.ok(/export function parseRetryAfterMs/.test(http),
+    '⚠️ parseRetryAfterMs 应在 gateway/http.ts（共享层）')
+  const oc = readFileSync('src/providers/opencode.ts', 'utf8')
+  assert.ok(!/export function parseRetryAfterMs/.test(oc),
+    '⚠️ 不应再留在 opencode.ts（会逼网关跨层 import）')
+  // 网关确实用它做兜底：文案解析不出 resetAt 时才用头
+  const server = readFileSync('src/gateway/server.ts', 'utf8')
+  assert.ok(/parseRetryAfterMs\(upstream\.headers\)/.test(server),
+    '⚠️ 网关应在文案解析不到时退回 Retry-After 头')
+  assert.ok(/refined\.resetAt === undefined/.test(server),
+    '⚠️ 应是「文案优先、头兜底」，不是反过来')
 })
