@@ -680,9 +680,41 @@ function readInputModalities(entry: Record<string, unknown>): string[] {
  */
 export function parseLoomyModels(payload: unknown): ProviderModel[] {
   const envelope = parseLoomyEnvelope<unknown>(payload)
+  // ## 🔴 必须认**三种**形态，不是两种（实测缺陷）
+  //
+  // 1. **业务信封**：`{code:'000000', data:[...]}` —— `envelope.ok` 为真；
+  // 2. **裸数组**：`[...]`；
+  // 3. **裸对象 + `data[]`**（⚠️ 实测 `/models` 的真实形态，此前**漏了**）。
+  //
+  // 第 3 种的实测原文顶层键是：
+  // ```
+  // { reasoning_enabled, reasoning_catalog_version, object, data: [ …13 条… ] }
+  // ```
+  // ⚠️ **它根本没有 `code` 字段** —— 是 OpenAI 风格的列表信封
+  //（`object: "list"` + `data[]`），**不是** Loomy 的业务信封。
+  //
+  // 而 `parseLoomyEnvelope` 要求 `code === LOOMY_OK_CODE`（`'000000'`），
+  // 拿不到 `code` 就判 `ok: false`（那对**业务端点**是对的，见它的注释）；
+  // 于是这里落到 `Array.isArray(payload)` 分支 ——
+  // 而 `payload` 是**对象**，不是数组 ⇒ **恒得空列表** ⇒
+  // `listModels` 报「目录为空：上游响应形状可能已变化」。
+  //
+  // ⚠️ 症状极具误导性：错误文案让人以为**上游改了接口**，
+  // 于是去查上游；而真实原因是**我们自己少认了一种形态** ——
+  // 数据一直好好地躺在 `data[]` 里（13 个模型）。
+  //
+  // ⚠️ 注意 `listModels` 里的 `isEnvelope` 判据是
+  // `typeof payload.code === 'string'`，与本函数的 `code === '000000'`
+  // **不是同一个判据** —— 两者对这份响应都判「非信封」，但只有前者
+  // 不会因此丢掉数据。**同一个概念两处判据不一致**正是本缺陷的温床。
+  const bareObjectData = (() => {
+    if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) return undefined
+    const data = (payload as Record<string, unknown>)['data']
+    return Array.isArray(data) ? data : undefined
+  })()
   const list = envelope.ok
     ? (Array.isArray(envelope.data) ? envelope.data : [])
-    : (Array.isArray(payload) ? payload : [])
+    : (Array.isArray(payload) ? payload : (bareObjectData ?? []))
 
   const models: ProviderModel[] = []
   for (const item of list) {
@@ -718,18 +750,6 @@ export function parseLoomyModels(payload: unknown): ProviderModel[] {
  */
 async function listModels(credential: ProviderCredential, signal: AbortSignal): Promise<ProviderModel[]> {
   const payload = await loomyBusinessRaw(credential, '/models', { method: 'GET' }, signal)
-
-  // 形态 ①：业务信封 —— 失败必须在这里就抛（带上业务码与原文）
-  const envelope = parseLoomyEnvelope<unknown>(payload)
-  const isEnvelope = typeof payload === 'object' && payload !== null && !Array.isArray(payload)
-    && typeof (payload as Record<string, unknown>).code === 'string'
-  if (isEnvelope && !envelope.ok) {
-    throw new ProviderError({
-      provider: 'loomy',
-      message: `Loomy 模型目录失败：${describeLoomyCode(envelope.code, envelope.message)}`,
-    })
-  }
-
   const models = parseLoomyModels(payload)
   if (models.length === 0) {
     // ⚠️ 空目录必须显式失败，不能返回空数组「冒充成功」——
@@ -1068,18 +1088,30 @@ export const loomyProvider: Provider = {
     /**
      * ✅ **短信验证码登录已接线**（`/admin/providers/login/start` + `/login/loomy/sms`）。
      *
-     * ## ⚠️ 它为什么在 Workers 上可行（与 loomy 的微信扫码相反）
+     * 短信路径是**纯 HTTP 三步**（发码 → 用户输入 → 校验），不需要任何本地监听。
      *
-     * 短信路径是**纯 HTTP 三步**（发码 → 用户输入 → 校验），
-     * `loomy-oauth.ts` 里 `127.0.0.1` 出现 **0 次**（实测 grep）——
-     * 不需要任何本地回调监听。
+     * ## 🔴 更正：微信扫码那条**也是可行的**（本文件曾错误地判定它不可行）
      *
-     * ⚠️ 而**微信扫码**那条需要本地服务器承载弹窗页
-     *（`loomy-wechat-login.ts:11-13`：`127.0.0.1:随机端口` 上的 `/wechat/qr`
-     * 与 `/wechat/poll`），Workers 拉不起本地端口 ⇒ **那条不可行**。
-     * 故面板上 loomy 只提供**短信**一种方式。
+     * 本注释此前写着「微信扫码需要本地服务器承载弹窗页 ⇒ Workers 不可行」。
+     * **那个判断是错的** —— 它把「承载二维码**展示页**」与「登录协议本身」
+     * 混为一谈了。实测本文件里微信流程的每一个网络调用都是**出站 HTTPS**：
      *
-     * 依据：参考实现 `deepseek-harness-codearts/src/loomy-oauth.ts:6-7,131-186`。
+     * | 步骤 | 端点 |
+     * |---|---|
+     * | 拉授权页取 uuid | `open.weixin.qq.com/connect/qrconnect` |
+     * | 长轮询扫码结果 | `long.open.weixin.qq.com/connect/l/qrconnect` |
+     * | 二维码图片 | `open.weixin.qq.com/connect/qrcode/<uuid>`（**纯字符串拼接**，无 I/O） |
+     * | 绑定 / 发码 / 校验 / 跳过 | `account.xfinfr.com`（`postLoomyAccount`） |
+     *
+     * `grep -nE 'createServer|\.listen\(|127\.0\.0\.1|localhost'` 在本文件里
+     * **只命中注释、零命中代码** ⇒ 没有任何 socket。
+     *
+     * ⚠️ 参考实现里那个 `createServer` **只是给浏览器展示二维码用的 HTML 壳**
+     *（它需要起一个本地页把二维码画出来）—— 那件事**本该由本服务的面板承担**
+     *（面板直接渲染 `buildLoomyWechatQrImageUrl(uuid)` 即可）。
+     *
+     * ⚠️ 故 `login: true` 是**如实的**：短信已接线，微信扫码**可以接线**
+     *（属于待接功能，不是「不可行」）。
      */
     login: true,
     listModels: true,

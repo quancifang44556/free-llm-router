@@ -34,6 +34,13 @@ import { isValidUid, LOGIN_STATE_TTL_MS, pollLogin, startLogin } from './upstrea
  */
 const RACCOON_LOGIN_STATE_TTL_MS = 10 * 60 * 1000
 /**
+ * loomy 微信扫码登录会话的存活时长。
+ *
+ * ⚠️ 与 raccoon 同量级（10 分钟）：微信二维码本身的有效期也在这个尺度，
+ * 更长只会让用户拿到一个已经失效的二维码去扫。
+ */
+const LOOMY_LOGIN_STATE_TTL_MS = 10 * 60 * 1000
+/**
  * cline 设备码登录的节流下限（毫秒）。
  *
  * ⚠️ 与 `src/providers/cline.ts` 的 `CLINE_DEVICE_MIN_INTERVAL_MS` 同值。
@@ -66,6 +73,62 @@ import { handleChatCompletions } from './gateway/server.js'
 import { fetchBalance } from './upstream/checkin.js'
 import { listTasks } from './upstream/tasks.js'
 import { listModels, pickCredential } from './gateway/models.js'
+/**
+ * 为 `/v1/models` 取聚合目录（跨 realm）。
+ *
+ * ⚠️ 与 `gateway/server.ts` 的 `loadAggregateCatalog` **同一个目的**，
+ * 但那一份是私有的、且按单个 realm 取。这里为目录接口跨 realm 汇总。
+ *
+ * ⚠️ 逐家串行 + 单家兜错：一家凭据过期不该让聚合目录整个消失。
+ */
+async function loadAggregateCatalogForModels(
+  env: Env,
+  realms: readonly string[],
+  closedProviders: ReadonlySet<string>,
+  disabledModels: ReadonlyMap<string, ReadonlySet<string>>,
+): Promise<ReturnType<typeof buildVirtualModels>> {
+  const catalogs: ProviderCatalog[] = []
+  for (const providerId of providerIds()) {
+    if (providerId === AGGREGATE_PROVIDER_ID) continue
+    const provider = findProvider(providerId)
+    if (provider === undefined || !provider.capabilities.listModels) continue
+    // 用户关闭的家不出现在目录里（与主目录同一条纪律）
+    if (closedProviders.has(providerId)) continue
+    for (const realm of realms) {
+      try {
+        const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
+        const accounts = await pool.listAccounts(realm, Date.now())
+        const account = accounts.find(
+          (a) => (a.provider ?? DEFAULT_PROVIDER) === providerId && !a.disabled,
+        )
+        if (account === undefined) continue
+        const credential = (await pool.getCredential(account.uid)) as ProviderCredential | undefined
+        if (credential === undefined) continue
+        const bound = providerId === DEFAULT_PROVIDER ? bindBuddy(env) : provider
+        const models = await bound.listModels(credential, AbortSignal.timeout(20_000))
+        // ⚠️ **必须过滤用户停用的模型**（与主目录 `disabled.has(m.id)` 同一条纪律）。
+        //
+        // 实测缺陷：不过滤时聚合目录列出 **526** 条，而主目录只有 32 条 ——
+        // 差额全是用户**自己在面板里停用**的模型。把它们重新暴露出来，
+        // 等于让用户在聚合路径上又一次看到自己明确关掉的东西，
+        // 而且「停用」这件事在聚合路径上**失效**了。
+        const off = disabledModels.get(providerId)
+        const kept = off === undefined || off.size === 0
+          ? models
+          : models.filter((m) => !off.has(m.id))
+        if (kept.length > 0) catalogs.push({ provider: providerId, models: kept })
+        break // 该家已取到目录，不必再试别的 realm
+      } catch (error) {
+        console.warn(
+          `[aggregate] ${providerId}/${realm} 目录拉取失败：`,
+          error instanceof Error ? error.message : String(error),
+        )
+      }
+    }
+  }
+  return buildVirtualModels(catalogs)
+}
+
 import { jsonError } from './gateway/http.js'
 import { bindBuddy, WORKBUDDY_INTL } from './providers/buddy.js'
 import {
@@ -77,6 +140,12 @@ import {
   PROVIDERS,
 } from './providers/index.js'
 import { splitModelName, ProviderError, type ProviderCredential } from './providers/types.js'
+import {
+  AGGREGATE_AUTO,
+  AGGREGATE_PROVIDER_ID,
+  buildVirtualModels,
+  type ProviderCatalog,
+} from './gateway/aggregate.js'
 import {
   buildCodeArtsCallbackUrl,
   buildCodeArtsLoginUrl,
@@ -1188,6 +1257,14 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
   if (path === '/admin/providers/login/start' && request.method === 'POST') {
     const body = (await request.json().catch(() => ({}))) as {
       provider?: string; realm?: string; phone?: string
+      /**
+       * 登录方式（仅 loomy 用）：`'wechat'` 走微信扫码，缺省走短信。
+       *
+       * ⚠️ 两种方式**都可行**（微信流程全是出站 HTTPS）——
+       * 见 `providers/loomy.ts` 的 `capabilities.login` 注释（那里更正过
+       * 一条「微信不可行」的错误判断）。
+       */
+      mode?: string
     }
     const providerId = body.provider ?? ''
     // ⚠️ 会话分片必须与**账号将要落入的分片**一致，否则轮询时找不到会话
@@ -1492,12 +1569,16 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
     // > 那 7 个都是「返回 loginUrl → 前端 window.open → 轮询 login.poll」。
     // > 短信登录**没有 URL 可打开**，故走「发验证码 → 用户输入 → 提交」三步。
     //
-    // ## ✅ 为什么它在 Workers 上**可行**（与微信扫码相反）
+    // ## ✅ 为什么它在 Workers 上**可行**
     //
-    // 短信路径是**纯 HTTP 三步**，`loomy-oauth.ts` 里 `127.0.0.1` 出现 **0 次**
-    //（实测 grep）—— 不需要任何本地回调监听。
-    // ⚠️ 而 loomy 的**微信扫码**路径需要本地服务器承载弹窗页
-    //（`loomy-wechat-login.ts:11-13` 的 `127.0.0.1:随机端口`），那条**不可行**。
+    // 短信路径是**纯 HTTP 三步**，不需要任何本地回调监听。
+    //
+    // ⚠️ **更正**：此处曾写「loomy 的微信扫码需要本地服务器承载弹窗页 ⇒ 不可行」。
+    // **那个判断是错的** —— 它把「展示二维码的 HTML 壳」与「登录协议本身」
+    // 混为一谈。微信流程的每个网络调用都是出站 HTTPS
+    //（`open.weixin.qq.com` / `long.open.weixin.qq.com` / `account.xfinfr.com`），
+    // 而展示二维码本该由面板渲染 `buildLoomyWechatQrImageUrl(uuid)` 承担。
+    // 详见 `providers/loomy.ts` 的 `capabilities.login` 注释。
     //
     // ## 流程
     //
@@ -1507,6 +1588,57 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
     // ⚠️ `msgid` 必须持久化在登录会话里（Workers 无跨请求内存）——
     // 丢了它第二步会被服务端判「msgid 无效」，而那个报错与真实原因无关
     //（参考实现 `loomy-oauth.ts:141-144` 专门为此不返回空串）。
+    // ── loomy：**微信扫码**（二维码由本服务渲染，与 raccoon 同形态） ──
+    //
+    // ⚠️ 面板默认给 loomy 走短信（见 `startModalLogin`），
+    // 但只要显式传 `mode: 'wechat'` 就走这条 —— 两条路径**都可行**，
+    // 因为微信流程全是出站 HTTPS（见 `providers/loomy.ts` 的更正说明）。
+    //
+    // 流程（`providers/loomy.ts`）：
+    // ① 拉微信授权页 → 正则取 `uuid`；
+    // ② 面板渲染 `qrImageUrl`（`open.weixin.qq.com/connect/qrcode/<uuid>`）；
+    // ③ 轮询 `long.open.weixin.qq.com/connect/l/qrconnect` 拿一次性 `code`；
+    // ④ 用 `code` 换 `rcode`（`bindLoomyThirdAccount`）→ 视 `bind` 走 skip 或绑手机号。
+    //
+    // ⚠️ 会话里存 `uuid` 与 `lastErrcode`：轮询**必须原样回传**，
+    // 而 Workers 没有跨请求内存（面板每几秒发一个独立请求）。
+    if (providerId === 'loomy' && body.mode === 'wechat') {
+      const { fetchLoomyWechatUuid, buildLoomyWechatQrImageUrl } = await import('./providers/loomy.js')
+      try {
+        const uuid = await fetchLoomyWechatUuid(
+          crypto.randomUUID().replace(/-/g, ''),
+          AbortSignal.timeout(30_000),
+        )
+        const state = crypto.randomUUID()
+        await pool.saveLoginSession(
+          state,
+          {
+            provider: 'loomy',
+            kind: 'loomy-wechat',
+            realm: loginRealm,
+            uuid,
+            // ⚠️ 长轮询要求带上一次的 errcode（`last` 参数），
+            // 故它必须**持久化**，不能放模块变量。
+            lastErrcode: '',
+            createdAt: Date.now(),
+          },
+          Date.now() + LOOMY_LOGIN_STATE_TTL_MS,
+        )
+        return json({
+          ok: true,
+          provider: 'loomy',
+          state,
+          // 面板用 `<img src>` 直接显示（微信官方图片端点，无需前端 QR 库）
+          qrImageUrl: buildLoomyWechatQrImageUrl(uuid),
+          realm: loginRealm,
+          expiresInMs: LOOMY_LOGIN_STATE_TTL_MS,
+        })
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        return jsonError(502, `微信二维码获取失败：${message}`, 'wechat_qr_failed')
+      }
+    }
+
     if (providerId === 'loomy') {
       const { sendLoomySmsCode } = await import('./providers/loomy.js')
       // 🔴 **必须复用上面已经解析过的 `body`，不能再次 `request.json()`**。
@@ -1678,6 +1810,82 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
     }
   }
 
+  // ── loomy 微信扫码：补绑手机号（`bind === 0` 时才走到这里） ──
+  //
+  // 两个动作共用本端点（`action` 区分）：
+  //   · `send`  ⇒ 向该手机号下发验证码（`bindLoomySendMsg`）
+  //   · `check` ⇒ 校验验证码并完成绑定 + 登录（`bindLoomyCheckCode`）
+  //
+  // ⚠️ 为什么不复用短信端点：那条走的是 `/login/phone/*`（手机号**直接登录**），
+  // 而这里是 `/login/thirdAccount/bind/*`（**给微信账号补绑手机号**）——
+  // 端点与语义都不同。混用会让「微信登录」变成「手机号登录」，
+  // 用户拿到的账号与他扫的那个微信无关。
+  if (path === '/admin/providers/login/loomy/bind' && request.method === 'POST') {
+    const body = (await request.json().catch(() => ({}))) as {
+      state?: string; action?: string; phone?: string; code?: string; realm?: string
+    }
+    const state = typeof body.state === 'string' ? body.state : ''
+    const action = body.action === 'check' ? 'check' : 'send'
+    if (state === '') return jsonError(400, 'state 必填（重新发起登录）', 'missing_state')
+
+    const saved = await findLoginSession(env, state)
+    if (saved === undefined) {
+      return jsonError(404, '登录会话不存在或已过期，请重新发起登录', 'session_not_found')
+    }
+    if (saved.payload['kind'] !== 'loomy-wechat') {
+      return jsonError(400, '该会话不是微信登录，请重新发起', 'wrong_flow')
+    }
+    const rcode = typeof saved.payload['rcode'] === 'string' ? saved.payload['rcode'] : ''
+    if (rcode === '') {
+      // ⚠️ 还没扫码成功就来绑手机号 ⇒ 如实说明，别让用户以为是自己填错了
+      return jsonError(400, '尚未完成微信扫码，请先扫码', 'wechat_not_confirmed')
+    }
+
+    const { bindLoomySendMsg, bindLoomyCheckCode } = await import('./providers/loomy.js')
+    if (action === 'send') {
+      const phone = typeof body.phone === 'string' ? body.phone.trim() : ''
+      if (!/^1\d{10}$/.test(phone)) {
+        return jsonError(400, '请填写 11 位手机号（以 1 开头）', 'invalid_phone')
+      }
+      try {
+        const msgid = await bindLoomySendMsg(rcode, phone, AbortSignal.timeout(30_000))
+        // ⚠️ `msgid` 与 `phone` 必须写回会话：校验那一步两个都要用，
+        // 而 Workers 无跨请求内存。
+        await saved.pool.saveLoginSession(
+          state,
+          { ...saved.payload, msgid, phone },
+          Date.now() + LOOMY_LOGIN_STATE_TTL_MS,
+        )
+        return json({ ok: true, sent: true })
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        return jsonError(502, `验证码发送失败：${message}`, 'bind_send_failed')
+      }
+    }
+
+    // action === 'check'
+    const code = typeof body.code === 'string' ? body.code.trim() : ''
+    if (!/^\d{4,8}$/.test(code)) return jsonError(400, '请填写收到的验证码', 'invalid_code')
+    const msgid = typeof saved.payload['msgid'] === 'string' ? saved.payload['msgid'] : ''
+    if (msgid === '') {
+      await saved.pool.removeLoginSession(state)
+      return jsonError(400, '登录会话缺少 msgid，请重新发送验证码', 'session_incomplete')
+    }
+    try {
+      const result = await bindLoomyCheckCode(rcode, code, msgid, AbortSignal.timeout(30_000))
+      // ⚠️ 验证码一次性：无论成败都清会话（与短信端点同口径）
+      await saved.pool.removeLoginSession(state)
+      return json(await persistProviderCredential(env, result.credential, Date.now()))
+    } catch (error) {
+      await saved.pool.removeLoginSession(state)
+      const message = error instanceof Error ? error.message : String(error)
+      return json(
+        { error: { message: `验证码校验失败：${message}。请重新获取验证码后再试。`, type: 'bind_failed' } },
+        400,
+      )
+    }
+  }
+
   // ── 轮询供应商登录结果 ──
   if (path === '/admin/providers/login/poll' && request.method === 'GET') {
     const state = url.searchParams.get('state') ?? ''
@@ -1721,6 +1929,77 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
         const credential = await pollZcodeLogin(saved.payload['flow'] as never, AbortSignal.timeout(20_000))
         if (credential === undefined) return json({ done: false, message: '等待授权中…' })
         return json(await persistProviderCredential(env, credential, now))
+      }
+      // ── loomy：微信扫码（二维码由本服务渲染；扫完可能还要绑手机号） ──
+      //
+      // ⚠️ 与 raccoon 的**关键差异**：微信授权成功后还要看讯飞侧是否已绑手机号
+      //（`bindLoomyThirdAccount` 返回的 `bind`）：
+      //   · `bind === 1` ⇒ 直接 `bindLoomySkip` 换 session，**一次轮询就完成**；
+      //   · `bind === 0` ⇒ 需要用户补手机号：先把 `rcode` 存回会话，
+      //     返回 `need_phone`，由面板收集手机号后再调 `/login/loomy/bind`。
+      //
+      // ⚠️ `rcode` 必须**持久化**（Workers 无跨请求内存），
+      // 且微信 `code` 只用一次 ⇒ 拿到 `rcode` 后立刻替换掉会话里的 `uuid`，
+      // 避免重复用同一个 code 去换（第二次必然失败）。
+      if (saved.payload['kind'] === 'loomy-wechat') {
+        const { pollLoomyWechatOnce, bindLoomyThirdAccount, bindLoomySkip } =
+          await import('./providers/loomy.js')
+        // 已经拿到 rcode 却还在轮询 ⇒ 说明在等用户补手机号，不该再扫一次
+        const existingRcode = saved.payload['rcode']
+        if (typeof existingRcode === 'string' && existingRcode !== '') {
+          return json({ done: false, status: 'need_phone', message: '请补填手机号完成绑定' })
+        }
+        const uuid = saved.payload['uuid']
+        if (typeof uuid !== 'string' || uuid === '') {
+          return json({ done: false, status: 'failed', message: '登录会话缺少 uuid，请重新发起' })
+        }
+        const lastErrcode = typeof saved.payload['lastErrcode'] === 'string'
+          ? saved.payload['lastErrcode'] : ''
+        const polled = await pollLoomyWechatOnce(uuid, lastErrcode, AbortSignal.timeout(20_000))
+
+        // ⚠️ 把本次 errcode 写回会话：长轮询的 `last` 参数依赖它，
+        // 丢了会让服务端每次都当「新会话」返回 waiting。
+        const bound = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(saved.realm))
+        const base = { ...saved.payload, lastErrcode: polled.errcode }
+        await bound.saveLoginSession(
+          state, base, Date.now() + LOOMY_LOGIN_STATE_TTL_MS,
+        ).catch(() => {})
+
+        if (polled.status === 'cancelled') {
+          return json({ done: false, status: 'canceled', message: '用户已取消授权，请重新发起' })
+        }
+        if (polled.status === 'expired') {
+          return json({ done: false, status: 'expired', message: '二维码已失效，请重新发起' })
+        }
+        if (polled.status === 'error') {
+          // ⚠️ 网络抖动不当作失败：如实回 waiting，让面板继续轮询
+          return json({ done: false, status: 'waiting', message: '等待扫码…' })
+        }
+        if (polled.status !== 'confirmed' || polled.code === '') {
+          return json({ done: false, status: polled.status, message: '等待扫码…' })
+        }
+
+        // 已确认 ⇒ 用一次性 code 换 rcode
+        const auth = await bindLoomyThirdAccount(polled.code, AbortSignal.timeout(20_000))
+        if (auth.bind === 1) {
+          // 讯飞侧已绑手机号 ⇒ 直接换 session，登录完成
+          const result = await bindLoomySkip(auth.rcode, AbortSignal.timeout(20_000))
+          const done = await persistProviderCredential(env, result.credential, now)
+          await bound.removeLoginSession(state)
+          return json(done)
+        }
+        // 需要补手机号：把 rcode 写回会话，等面板提交手机号
+        await bound.saveLoginSession(
+          state,
+          { ...base, rcode: auth.rcode, ...(auth.nickname === undefined ? {} : { nickname: auth.nickname }) },
+          Date.now() + LOOMY_LOGIN_STATE_TTL_MS,
+        )
+        return json({
+          done: false,
+          status: 'need_phone',
+          message: '该微信号还没绑手机号，请填写手机号完成绑定',
+          ...(auth.nickname === undefined ? {} : { nickname: auth.nickname }),
+        })
       }
       // ── raccoon：微信扫码（二维码由本服务渲染，用户扫完即完成） ──
       if (saved.payload['kind'] === 'raccoon') {
@@ -2284,8 +2563,23 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
   // ── 用量统计 ──
   if (path === '/admin/usage' && request.method === 'GET') {
     const realm = url.searchParams.get('realm') ?? 'cn'
+    // ⚠️ 时间窗：`days` 参数（1 = 今日 / 7 / 30 / 0 = 全部）。
+    //
+    // ## 🔴 为什么必须有这个参数（用户报「用量始终是 500 不动」）
+    //
+    // 那不是 HTTP 500 —— 是旧实现的 `total` **撞上了明细环形缓冲的上限**
+    //（`USAGE_RING_SIZE = 500`），且**完全没有时间窗概念**：无论用多久、
+    // 用多少，概览永远显示 500，且答不出「今天/本周用了多少」。
+    //
+    // ⇒ 现在汇总走**按天聚合**（跨天保留 90 天），窗口内的数量不再被封顶。
+    //
+    // ⚠️ 非法值一律回退「全部」（= 0），**不猜**用户意图：
+    // 传 `days=abc` 时报错还是给全部？给全部更安全（不会让页面空白）。
+    const rawDays = url.searchParams.get('days')
+    const parsedDays = rawDays === null ? 0 : Number(rawDays)
+    const days = Number.isFinite(parsedDays) && parsedDays > 0 ? Math.floor(parsedDays) : 0
     const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
-    const summary = await pool.usageSummary()
+    const summary = await pool.usageSummary(days)
     return json({ realm, ...summary })
   }
   if (path === '/admin/usage/clear' && request.method === 'POST') {
@@ -2781,6 +3075,54 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
       }
     }
 
+    // ── 聚合 provider 的虚拟模型（用户要求「同步聚合模型功能」）──
+    //
+    // ⚠️ 它**不是注册表里的 Provider**（见 `gateway/aggregate.ts` 文件头），
+    // 故不会被上面那个 `byProvider` 循环列出来 —— 必须在这里显式追加，
+    // 否则用户看不到 `aggregate/auto` 与各规范名。
+    //
+    // ⚠️ 单家失败只跳过它（`loadAggregateCatalogForModels` 内部逐家兜错）：
+    // 聚合目录缺席不该让**整个** `/v1/models` 失败。
+    try {
+      // ⚠️ 读齐**每家的停用模型**（与主目录同源：都存在各自 realm 的分片里）。
+      // 两个 realm 都要读，否则「国际版关掉的模型」在国内分片里查不到、会冒出来。
+      const disabledModels = new Map<string, Set<string>>()
+      for (const providerId of providerIds()) {
+        const set = new Set<string>()
+        for (const p of pools.values()) {
+          for (const id of await p.getDisabledModels(providerId)) set.add(id)
+        }
+        if (set.size > 0) disabledModels.set(providerId, set)
+      }
+      const virtuals = await loadAggregateCatalogForModels(
+        env, realms, userDisabledProviders, disabledModels,
+      )
+      // `auto` 放最前（它是「不指定模型」的入口）
+      // ⚠️ `name` **必须给**：面板「模型」页有「名称」列，
+      // 缺了就是**整列空白**（实测反馈：19 个 aggregate 条目名称列全空，
+      // 看起来像渲染失败）。`VirtualModel` 本来就有 `name` 字段，只是没往外发。
+      data.push({
+        id: `${AGGREGATE_PROVIDER_ID}/${AGGREGATE_AUTO}`,
+        object: 'model',
+        owned_by: AGGREGATE_PROVIDER_ID,
+        name: '自动选择（临期优先）',
+      })
+      for (const v of virtuals) {
+        data.push({
+          id: `${AGGREGATE_PROVIDER_ID}/${v.key}`,
+          object: 'model',
+          owned_by: AGGREGATE_PROVIDER_ID,
+          // ⚠️ 兜底到 key：万一某条目 name 为空，也不该给一个空单元格
+          name: v.name || v.key,
+        })
+      }
+    } catch (error) {
+      errors.push({
+        provider: AGGREGATE_PROVIDER_ID,
+        error: error instanceof Error ? error.message : String(error),
+      })
+    }
+
     if (data.length === 0 && errors.length === 0) {
       return jsonError(
         503,
@@ -2993,13 +3335,15 @@ async function scheduled(event: ScheduledController, env: Env): Promise<void> {
 
   const hour = hourUtc8(now)
   const job = SCHEDULE_UTC8[hour]
+  const plan = job?.plan
 
   // 非任务时点：**续期已经做过了**，这里再返回。
   // ⚠️ 注意：续期在 return **之前** —— 这正是「非任务时点也保持登录态」的关键。
-  if (job === undefined) {
+  if (plan === undefined) {
     console.log(`[cron] ${event.cron} UTC+8 ${hour} 时点无任务，已做完续期扫描`)
     return
   }
+  if (job === undefined) return
 
   const realm = 'cn'
   const stub = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))

@@ -15,6 +15,14 @@
  */
 
 import { test } from 'node:test'
+import { splitModelName } from '../src/providers/types.js'
+import {
+  emptyUsageState,
+  recordUsageInto,
+  summarizeUsageState,
+  utc8DayKey,
+  windowStartDayKey,
+} from '../src/store/usage.js'
 import { referenceChatHeaders } from '../src/upstream/headers.ts'
 import { classify } from '../src/upstream/client.ts'
 
@@ -39,6 +47,7 @@ import {
   translateMaxCompletionTokens,
 } from '../src/gateway/payload.ts'
 import { ERROR_CHECK_FRAMES, ERROR_HINT_PATTERN, aggregateSse, createFrameTranslator, detectErrorFrame, doneFrame, errorFrame, mayHaveUsage, needsNormalize, normalizeFrame, normalizeToolCalls, parseSseLine, sseHeaders, translateFrame } from '../src/gateway/stream.ts'
+import { parseRetryAfterMs } from '../src/gateway/http.ts'
 import { extractModels } from '../src/gateway/models.ts'
 import { clientStatusFor, isAuthLikeFailure, mapErrorToPunishment, parseBusinessCode, parseResetAt, punishmentForStreamError, refineModelScoped } from '../src/gateway/server.ts'
 
@@ -1332,4 +1341,234 @@ test('🔴 鉴权失败判据必须认 `invalid access token`（正则跨度写�
   assert.equal(isAuthLikeFailure(403, 'whatever'), true)
   // CodeArts 走 HTTP 400 + 业务码，必须靠**内容**判
   assert.equal(isAuthLikeFailure(400, '{"error_code":"APIG.0602"}'), true)
+})
+
+// ─────────────────── 用量：时间窗与按天聚合 ───────────────────
+
+test('🔴 用量汇总必须走**按天聚合**，不能被 500 条明细环封顶', () => {
+  // ## 实测缺陷（用户报「这个用量怎么始终是 500 不动」）
+  //
+  // 那不是 HTTP 500 —— 是旧实现的 `total` **撞上了明细环形缓冲的上限**
+  //（`USAGE_RING_SIZE = 500`）。旧实现**只有明细**这一份数据，
+  // 于是无论用多久、用多少，概览永远显示 500。
+  //
+  // ⇒ 现在拆成两份独立数据：
+  //   · 明细环 `ring`（最近 500 条）—— 答「每一笔长什么样」
+  //   · 按天聚合 `days`（保留 90 天）—— 答「今天/本周/本月用了多少」
+  const state = emptyUsageState()
+  const base = Date.UTC(2026, 9, 9, 4, 0, 0) // UTC+8 的 12:00
+  // 造 1200 笔（远超 500 上限），跨 3 天
+  for (let i = 0; i < 1200; i++) {
+    const at = base - Math.floor(i / 400) * 24 * 60 * 60 * 1000
+    recordUsageInto(state, {
+      at, uid: `u${i % 3}`, model: i % 2 === 0 ? 'm-a' : 'm-b',
+      input: 10, output: 5, ok: i % 10 !== 0, ms: 100,
+    }, base)
+  }
+
+  const all = summarizeUsageState(state, 0, base)
+  // ⚠️ 关键断言：总数**必须**是 1200，不是 500
+  assert.equal(all.total, 1200, '⚠️ 不得被明细环上限截断')
+  assert.equal(all.detailCount, 500, '明细环仍应只留 500 条')
+  assert.ok(all.detailCapped, '应如实标记「明细已封顶」')
+
+  // 明细环只覆盖最后 400 笔（最后一天的），但聚合覆盖全部
+  assert.equal(all.activeDays, 3, '3 天都应有聚合数据')
+  assert.equal(all.inputTokens, 12000)
+  assert.equal(all.outputTokens, 6000)
+})
+
+test('🔴 时间窗必须按 **UTC+8 日界**过滤（不能用本机时区）', () => {
+  const state = emptyUsageState()
+  // UTC 2026-10-09 16:30 = UTC+8 的 2026-10-10 00:30（**已是第二天**）
+  const now = Date.UTC(2026, 9, 9, 16, 30, 0)
+  const todayKey = utc8DayKey(now)
+  assert.equal(todayKey, '2026-10-10', 'UTC+8 日键应为 10-10（不是 UTC 的 10-09）')
+
+  // 记在「UTC+8 今天」与「昨天」
+  recordUsageInto(state, { at: now, uid: 'u', model: 'm', input: 1, output: 1, ok: true, ms: 1 }, now)
+  recordUsageInto(state, {
+    at: now - 24 * 60 * 60 * 1000, uid: 'u', model: 'm', input: 10, output: 10, ok: true, ms: 1,
+  }, now)
+
+  const today = summarizeUsageState(state, 1, now)
+  assert.equal(today.total, 1, '「今日」应只含今天那笔')
+  assert.equal(today.inputTokens, 1)
+
+  const week = summarizeUsageState(state, 7, now)
+  assert.equal(week.total, 2, '「近 7 天」应含两天')
+
+  // ⚠️ 窗口起点也必须是 UTC+8 日界：`days=1` 的 cutoff 就是今天
+  assert.equal(windowStartDayKey(1, now), '2026-10-10')
+  assert.equal(windowStartDayKey(2, now), '2026-10-09')
+  assert.equal(windowStartDayKey(0, now), undefined, '0 = 全部（无 cutoff）')
+})
+
+test('⚠️ 按小时只对「今日」聚合（跨天的小时标签会互相覆盖）', () => {
+  // 跨天的 `09:00` 是两个不同的时刻，合并起来没有解释力。
+  const state = emptyUsageState()
+  const now = Date.UTC(2026, 9, 9, 4, 0, 0)
+  const yesterday = now - 24 * 60 * 60 * 1000
+  recordUsageInto(state, { at: yesterday, uid: 'u', model: 'm', input: 1, output: 1, ok: true, ms: 1 }, now)
+  recordUsageInto(state, { at: now, uid: 'u', model: 'm', input: 1, output: 1, ok: true, ms: 1 }, now)
+
+  const week = summarizeUsageState(state, 7, now)
+  const hourTotal = week.byHour.reduce((n, h) => n + h.count, 0)
+  assert.equal(hourTotal, 1, '⚠️ 按小时只应统计今日那笔（不是 2）')
+  assert.equal(week.byDay.length, 2, '但按天趋势应有两天')
+})
+
+test('⚠️ 清空用量必须同时清明细与按天聚合', () => {
+  // 只清明细会让「近 30 天」仍报出旧数字，而用户刚点了「清空」——
+  // 那是「状态看着对、行为不对」型缺陷。
+  const src = readFileSync('src/pool/AccountPoolDO.ts', 'utf8')
+  const i = src.indexOf('async clearUsage()')
+  const block = src.slice(i, i + 700)
+  assert.ok(/emptyUsageState\(\)/.test(block),
+    '⚠️ 清空必须写入空状态（同时清掉 ring 与 days）')
+  assert.ok(/delete\(LEGACY_USAGE_RING_KEY\)/.test(block),
+    '⚠️ 也要清掉旧 key，否则下次迁移会把旧数据搬回来')
+})
+
+test('⚠️ 旧版数据必须能迁移（用户已有历史不能凭空消失）', () => {
+  const src = readFileSync('src/pool/AccountPoolDO.ts', 'utf8')
+  assert.ok(/migrateUsageState\(legacy, Date\.now\(\)\)/.test(src),
+    '⚠️ 必须把旧版裸明细数组迁移成按天聚合')
+  assert.ok(/LEGACY_USAGE_RING_KEY = 'usage:ring'/.test(src), '旧 key 名应保持不变')
+  // ⚠️ 明细环与按天聚合必须修在**同一个 key** 里：
+  // 拆成两个 key 会让每笔请求写两次，白白翻倍 DO 行写入配额。
+  assert.ok(/const USAGE_STATE_KEY = 'usage:state'/.test(src), '应合并为一个 key')
+  assert.ok(/await this\.ctx\.storage\.put\(USAGE_STATE_KEY, state\)/.test(src),
+    '⚠️ recordUsage 必须只写一次')
+})
+
+test('⚠️ /admin/usage 的 days 参数：非法值回退「全部」而不是报错', () => {
+  const src = readFileSync('src/index.ts', 'utf8')
+  const i = src.indexOf("path === '/admin/usage'")
+  const block = src.slice(i, i + 1600)
+  assert.ok(/url\.searchParams\.get\('days'\)/.test(block), '应读 days 参数')
+  assert.ok(/parsedDays > 0 \? Math\.floor\(parsedDays\) : 0/.test(block),
+    '⚠️ 非法/非正数应回退 0（全部），不能报错让页面空白')
+  assert.ok(/usageSummary\(days\)/.test(block), '应把窗口传给 DO')
+})
+
+test('🔴 聚合前缀必须在 `splitModelName` **之前**剥掉（否则会被记成模型级冷却）', () => {
+  // ## 实测缺陷（聚合首次上线时踩到）
+  //
+  // `aggregate` **不在 `providerIds()`** 里（它是网关层的一层，不是注册表里的
+  // Provider）。而 `splitModelName` 对**未知前缀**的处理是：回落到默认供应商，
+  // 并把**整串**当模型名 —— 实测：
+  //   splitModelName('aggregate/deepseek-v4-1-flash', ids, 'buddy')
+  //     ⇒ { provider: 'buddy', model: 'aggregate/deepseek-v4-1-flash' }
+  //
+  // 后果**比报错严重得多**：那个名字上游当然不认识，回 11102
+  // `model [...] service info not found`，被归类为 `model_unavailable`
+  // ⇒ **给这个模型写 6 小时模型级冷却** —— 一个纯粹由我方前缀引起的失败，
+  // 被记成了「上游没有这个模型」。之后所有同名请求都选不到号。
+  //
+  // ⇒ 判据现在是 `rawModel === id || rawModel.startsWith(id + '/')`，
+  //   在 `splitModelName` **之前**处理，且**用 `rawModel` 而不是 `routed`**。
+  const src = readFileSync('src/gateway/server.ts', 'utf8')
+  const code = stripComments(src)
+
+  // ① 必须有手写剥前缀
+  assert.ok(/const AGG_PREFIX = `\$\{AGGREGATE_PROVIDER_ID\}\/`/.test(code),
+    '⚠️ 必须手写剥聚合前缀（splitModelName 不认识它）')
+  // ② 判据必须是**完全前缀匹配**，不能是「包含」
+  assert.ok(/rawModel === AGGREGATE_PROVIDER_ID \|\| rawModel\.startsWith\(AGG_PREFIX\)/.test(code),
+    '⚠️ 必须是完全前缀匹配（否则 buddy/aggregate/x 会被误吞）')
+  // ③ 传进聚合的 model 必须是**剥过前缀**的
+  assert.ok(/model: rawModel\.slice\(AGG_PREFIX\.length\)/.test(code),
+    '⚠️ 必须传剥过前缀的裸键')
+  // ④ ⚠️ 剥前缀的分支必须在 `splitModelName` **之前**执行
+  //    （在之后的话 routed 已经错了）
+  const aggAt = code.indexOf('const AGG_PREFIX')
+  const splitAt = code.indexOf('const routed = splitModelName')
+  assert.ok(aggAt > 0 && splitAt > 0, '两处都应存在')
+  assert.ok(aggAt < splitAt,
+    '⚠️ 聚合分支必须在 splitModelName **之前** —— 否则 routed 已经把整串当模型名了')
+})
+
+test('⚠️ splitModelName 对未知前缀的行为（上一条测试的前提）', () => {
+  // 上一条测试断言「必须自己剥」，其前提是 splitModelName 对未知前缀
+  // 会回落到默认供应商并把整串当模型名。这个前提若变了，那条断言就失去意义。
+  const ids = ['buddy', 'workbuddy', 'cline']
+  const r = splitModelName('aggregate/deepseek-v4-1-flash', ids, 'buddy')
+  assert.equal(r.provider, 'buddy', '未知前缀应回落到默认供应商')
+  assert.equal(r.model, 'aggregate/deepseek-v4-1-flash',
+    '⚠️ 未知前缀时整串都被当成模型名 —— 这正是必须在之前剥的原因')
+  // 已知前缀仍正常
+  const ok = splitModelName('cline/deepseek-v4.1-flash', ids, 'buddy')
+  assert.equal(ok.provider, 'cline')
+  assert.equal(ok.model, 'deepseek-v4.1-flash')
+})
+
+test('⚠️ parseRetryAfterMs：纯数字秒数 vs HTTP-date，且不得把「900」当 1970 年', () => {
+  // 这是 HTTP 标准头解析，网关的模型级冷却用它对齐上游墙钟
+  //（原先只存在于 opencode.ts，本轮提到 gateway/http.ts 共享）。
+  const h = (v: string | null) => (v === null ? undefined : new Headers({ 'retry-after': v }))
+  // ① 纯数字 = 秒
+  assert.equal(parseRetryAfterMs(h('900')), 900_000)
+  assert.equal(parseRetryAfterMs(h('0')), 0)
+  // ⚠️ 关键：`Date.parse('900')` 会得到 1970 年 ⇒ 巨大负数 ⇒ 夹成 0 ⇒
+  // 「刚限流就立刻解除」的无限空转。必须走「纯数字」分支。
+  assert.ok((parseRetryAfterMs(h('900')) ?? 0) > 0, '⚠️ 数字不得被当成 1970 年')
+  // ② HTTP-date = 绝对时刻，结果应为「距现在的毫秒数」
+  const future = new Date(Date.now() + 60_000).toUTCString()
+  const ms = parseRetryAfterMs(h(future))
+  assert.ok(ms !== undefined && ms > 50_000 && ms <= 60_000,
+    `⚠️ HTTP-date 应换算成距今毫秒，实际 ${ms}`)
+  // ③ 缺失/空 → undefined（不得默认成 0，那等于「不冷却」）
+  assert.equal(parseRetryAfterMs(h(null)), undefined)
+  assert.equal(parseRetryAfterMs(h('')), undefined)
+  assert.equal(parseRetryAfterMs(undefined), undefined)
+  // ④ 无法解析 → undefined
+  assert.equal(parseRetryAfterMs(h('not-a-date')), undefined)
+})
+
+test('⚠️ parseRetryAfterMs 必须在共享层（provider 无关），且网关用它兜底', () => {
+  // ⚠️ 它曾只存在于 opencode.ts —— 而网关的模型级冷却也需要它。
+  // 让网关去 import 一个**供应商模块**是层次颠倒，故提到 gateway/http.ts。
+  const http = readFileSync('src/gateway/http.ts', 'utf8')
+  assert.ok(/export function parseRetryAfterMs/.test(http),
+    '⚠️ parseRetryAfterMs 应在 gateway/http.ts（共享层）')
+  const oc = readFileSync('src/providers/opencode.ts', 'utf8')
+  assert.ok(!/export function parseRetryAfterMs/.test(oc),
+    '⚠️ 不应再留在 opencode.ts（会逼网关跨层 import）')
+  // 网关确实用它做兜底：文案解析不出 resetAt 时才用头
+  const server = readFileSync('src/gateway/server.ts', 'utf8')
+  assert.ok(/parseRetryAfterMs\(upstream\.headers\)/.test(server),
+    '⚠️ 网关应在文案解析不到时退回 Retry-After 头')
+  assert.ok(/refined\.resetAt === undefined/.test(server),
+    '⚠️ 应是「文案优先、头兜底」，不是反过来')
+})
+
+test('🔴 loomy 微信扫码登录已接线（后端两个端点 + 会话字段齐全）', () => {
+  // ## 背景：一条**错误的可行性判断**曾永久排除这个功能
+  //
+  // `loomy.ts` 与 `index.ts` 都曾注释「微信扫码需要本地服务器承载弹窗页
+  // ⇒ Workers 不可行」。**那是错的** —— 它把「承载二维码展示页」与
+  // 「登录协议本身」混为一谈。实测微信流程的每个网络调用都是出站 HTTPS
+  //（`open.weixin.qq.com` / `long.open.weixin.qq.com` / `account.xfinfr.com`），
+  // 而展示二维码本该由面板渲染。
+  //
+  // 本测试钉住：后端两个端点都在，且会话字段齐全。
+  const idx = readFileSync('src/index.ts', 'utf8')
+  // ① start：必须能走 wechat 模式，且返回 qrImageUrl（不是 authUrl）
+  assert.ok(/body\.mode === 'wechat'/.test(idx),
+    '⚠️ start 端点应支持 mode=wechat')
+  assert.ok(/qrImageUrl: buildLoomyWechatQrImageUrl\(uuid\)/.test(idx),
+    '⚠️ 应返回 qrImageUrl（面板用 <img src> 直接显示，无需前端 QR 库）')
+  // ② poll：必须处理 loomy-wechat 会话
+  assert.ok(/kind'\] === 'loomy-wechat'/.test(idx),
+    '⚠️ poll 端点应处理 loomy-wechat 会话')
+  // ③ 补绑手机号端点（bind===0 时必须能完成登录）
+  assert.ok(/providers\/login\/loomy\/bind/.test(idx),
+    '⚠️ 应有补绑手机号的端点（否则 bind===0 的用户永远登不进去）')
+  // ④ 会话必须持久化 uuid 与 lastErrcode ——
+  //    长轮询的 `last` 参数依赖后者，丢了会让服务端每次都当新会话。
+  assert.ok(/lastErrcode: ''/.test(idx), '⚠️ 会话里应初始化 lastErrcode')
+  assert.ok(/lastErrcode: polled\.errcode/.test(idx), '⚠️ 每次轮询应把 errcode 写回会话')
+  // ⑤ 微信 code 只用一次 ⇒ 拿到 rcode 后必须替换掉 uuid
+  assert.ok(/rcode: auth\.rcode/.test(idx), '⚠️ 拿到 rcode 后应写回会话（避免重复用同一个 code）')
 })

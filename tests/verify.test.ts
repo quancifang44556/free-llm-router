@@ -18,6 +18,7 @@ import assert from 'node:assert/strict'
 
 import { CLAIM_POLL_ATTEMPTS, CLAIM_POLL_GAP_MS } from '../src/taskrunner/verify.ts'
 import { planByName, planGrowth, zeroCostActions } from '../src/taskrunner/plans.ts'
+import { registeredActions } from '../src/taskrunner/actions.ts'
 import { NEEDS_REAL_CHAT, registeredActions } from '../src/taskrunner/actions.ts'
 import { effectiveAccessToken, needsCredentialFetch } from '../src/taskrunner/steps.ts'
 import type { Env } from '../src/env.ts'
@@ -194,7 +195,8 @@ test('⚠️ 成长计划：绝不包含需要真实对话的任务（会消耗�
 test('成长计划：零消耗动作数与动作表一致', () => {
   const actions = zeroCostActions()
   const steps = planGrowth()
-  // 每个成长任务 2 步（动作 + 回读领奖）+ 1 个初始探测 + **1 个签到**
+  // 每个成长任务 2 步（动作 + 回读领奖）+ **2 个前置探测**
+  //（初始 listTasks + acceptPending）+ **1 个签到**
   // + **3 个活动类动作**（旅行 / 连登兑换 / 抽奖，各 1 步、无回读领奖）。
   //
   // ⚠️ `+1` 的签到步是**修缺陷后新增**的：早期 `planGrowth` 没有它，
@@ -203,11 +205,20 @@ test('成长计划：零消耗动作数与动作表一致', () => {
   //
   // ⚠️ `+3` 的活动步同理：它们也是「承诺了但没接线」的功能
   //（`upstream/travel.ts` 早就实现了，计划表里却一直没有）。
+  //
+  // ⚠️ `+1` 的 `acceptPending` 步是**本轮新增**的：上游 accept 不产生进度，
+  // 但**只有已接受的任务才计分**。本引擎此前从不 accept
+  //（`acceptTasks` 实现了却零调用）⇒ 未接受的任务上报了也不点亮。
   const activitySteps = steps.filter((s) =>
     ['travel', 'redeemStreak', 'lottery'].includes(s.action),
   )
   assert.equal(activitySteps.length, 3, '三个活动动作都必须在计划里')
-  assert.equal(steps.length, actions.length * 2 + 2 + 3)
+  // ⚠️ acceptPending 必须在**第一个成长动作之前**（先接受再上报，否则白跑）
+  const acceptIdx = steps.findIndex((s) => s.action === 'acceptPending')
+  assert.ok(acceptIdx > 0, '⚠️ 计划里必须有 acceptPending（否则未接受的任务不计分）')
+  assert.ok(acceptIdx < steps.findIndex((s) => s.action === 'chat5'),
+    '⚠️ acceptPending 必须在成长动作之前')
+  assert.equal(steps.length, actions.length * 2 + 3 + 3)
 })
 
 test('⚠️ 活动类动作**不得**带 verifyAndClaim（它们没有 task code）', () => {
@@ -344,4 +355,39 @@ test('⚠️ travelDepart 的判据要覆盖多种「已派过」文案', () => 
   assert.equal(isAlreadyDeparted(10001, ''), true)
   // 真错误不得被吞
   assert.equal(isAlreadyDeparted(500, 'internal error'), false)
+})
+
+test('🔴 计划里必须有 acceptPending（上游只给「已接受」的任务计分）', () => {
+  // ## 缺陷（外部审计 + 实测定位）
+  //
+  // `upstream/tasks.ts` 的 `acceptTasks` 实现了、`acceptStatus` 也解析并暴露了，
+  // 但**没有任何地方调用它** ⇒ 未接受（`not_accepted`）的任务即使上报了行为事件
+  // **也不会点亮**，用户看到的只是「任务跑了但进度不动」。
+  //
+  // ⚠️ 上游语义：accept **不产生进度**，只是把 `not_accepted` 变成 `accepted`。
+  // 故它必须在**上报行为之前**执行，否则那一轮的上报白费。
+  const steps = planGrowth()
+  const accept = steps.find((s) => s.action === 'acceptPending')
+  assert.ok(accept !== undefined, '⚠️ 计划里必须有 acceptPending 步骤')
+
+  // 必须在第一个成长动作（chat5）之前
+  const acceptIdx = steps.findIndex((s) => s.action === 'acceptPending')
+  const firstGrowth = steps.findIndex((s) => s.action === 'chat5')
+  assert.ok(acceptIdx < firstGrowth,
+    `⚠️ acceptPending（第 ${acceptIdx} 步）必须在成长动作（第 ${firstGrowth} 步）之前`)
+
+  // 必须在初始 listTasks 之后（要先知道哪些任务未接受）
+  const probeIdx = steps.findIndex((s) => s.action === 'listTasks')
+  assert.ok(acceptIdx > probeIdx, '⚠️ 必须先 listTasks 再 acceptPending')
+
+  // ⚠️ accept 是幂等的 ⇒ 不得带 verifyAndClaim（它没有 task code 可回读）
+  assert.equal(accept?.code, '_probe',
+    '⚠️ acceptPending 是探测类步骤（无 task code），code 应为 _probe')
+
+  // ⚠️ 动作表里必须真有这个 handler，否则计划引用了**不存在的动作**
+  //（那会在运行时静默跳过该步 —— 正是「计划表与动作表脱节」这类缺陷）。
+  // 这里走**运行时注册表**而不是读源码文本：更稳，也不依赖 fs。
+  const registered = registeredActions()
+  assert.ok(registered.includes('acceptPending'),
+    `⚠️ actions.ts 的 ACTIONS 表里必须有 acceptPending，实际有：${registered.join(', ')}`)
 })

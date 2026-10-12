@@ -24,7 +24,7 @@ import { resolveUpstream, type Env } from '../env.js'
 import { billingHeaders, desktopHeaders, mpHeaders, webHeaders, deriveDeviceId, MP_MACHINE_ID } from '../upstream/headers.js'
 import { callUpstream, UpstreamError } from '../upstream/client.js'
 import { dailyCheckin, fetchBalance } from '../upstream/checkin.js'
-import { listTasks, mergeTaskLists } from '../upstream/tasks.js'
+import { acceptTasks, isMpTask, listTasks, mergeTaskLists } from '../upstream/tasks.js'
 import {
   drawAllLottery,
   lotteryDraw,
@@ -154,6 +154,54 @@ const ACTIONS: Record<string, ActionHandler> = {
   },
 
   /** 拉取任务列表（只读）。默认口径 + mp 口径合并。 */
+  /**
+   * **接受（报名）尚未接受的任务**。
+   *
+   * ## 🔴 为什么必须有这一步
+   *
+   * 上游语义（`upstream/tasks.ts` 的 `acceptTasks` 说明）：
+   * accept **不产生进度**，只是把状态从 `not_accepted` 变成 `accepted`。
+   * 进度由服务端行为事件点亮 —— 但**只有已接受的任务才会计分**。
+   *
+   * ⚠️ 本引擎此前**从不调用** `acceptTasks`：`acceptStatus` 被解析、被暴露，
+   * 却没有任何地方去接受 ⇒ 未接受的任务即使上报了行为事件也**不会点亮**，
+   * 而用户看到的只是「任务跑了但进度不动」。
+   *
+   * ⚠️ accept 是**幂等**的（重复调用无害），故本动作可以安全重放。
+   *
+   * ⚠️ 逐个只接受 `not_accepted` 的：已接受/已领的再 accept 是白打上游，
+   * 且会浪费一次反风控间隔。
+   */
+  async acceptPending(ctx, _step, env): Promise<ActionResult> {
+    try {
+      // 取两份口径（桌面 + mp）的并集 —— 与 `listTasks` 动作同口径，
+      // 否则 mp 任务永远不会被接受。
+      const base = await listTasks(ctx, env)
+      let all = base
+      try {
+        const mp = await listTasks(ctx, env, { mp: true })
+        all = mergeTaskLists(base, mp)
+      } catch {
+        // mp 口径失败不致命（与 listTasks 动作一致）
+      }
+      const need = all.filter((t) => !t.claimed && t.acceptStatus === 'not_accepted')
+      if (need.length === 0) return { ok: true, detail: '没有待接受的任务（全部已接受或已领）' }
+      // ⚠️ 一次提交多个：上游接受的是 `task_codes` 数组。
+      // 但要**逐个分类**：桌面与 mp 走不同指纹，混在一起会有一半被拒。
+      const desktopCodes = need.filter((t) => !isMpTask(t.taskCode)).map((t) => t.taskCode)
+      const mpCodes = need.filter((t) => isMpTask(t.taskCode)).map((t) => t.taskCode)
+      if (desktopCodes.length > 0) await acceptTasks(ctx, env, desktopCodes)
+      if (mpCodes.length > 0) await acceptTasks(ctx, env, mpCodes, { mp: true })
+      return {
+        ok: true,
+        detail: `已接受 ${need.length} 个任务`
+          + (mpCodes.length > 0 ? `（其中 mp ${mpCodes.length} 个）` : ''),
+      }
+    } catch (error) {
+      return { ok: false, detail: describeError(error, '接受任务') }
+    }
+  },
+
   async listTasks(ctx, _step, env): Promise<ActionResult> {
     try {
       const base = await listTasks(ctx, env)

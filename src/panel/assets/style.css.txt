@@ -1,7 +1,19 @@
 /* free-llm-router 管理面板样式 */
 :root {
   --bg: #0f1115; --panel: #171a21; --panel2: #1d2129; --line: #262b36;
-  --text: #e6e9ef; --dim: #9aa4b2; --accent: #4f8cff;
+  --text: #e6e9ef; --dim: #9aa4b2;
+  /*
+   * ⚠️ accent **拆成两个令牌** —— 它们对底色的要求相反。
+   *
+   * 背景（按钮底、导航选中、进度条填充）：上面压**白字** ⇒ 要够深，
+   *   否则白字对比度不足（WCAG AA 正文需 4.5:1）。
+   * 文字（当强调色文字、描边）：压在**深色背景**上 ⇒ 要够**亮**。
+   *
+   * 原先共用一个 `#4f8cff`：当按钮底时白字只有 **3.22:1（不达标）**，
+   * 但当文字时是 **5.97:1（很好）**。⇒ 无论往哪边调都会修一个、坏另一个。
+   * 拆开后各取所需（实测：白字 on #3b6fd4 = 4.76:1；#4f8cff 当文字 = 5.97:1）。
+   */
+  --accent: #3b6fd4; --accent-text: #4f8cff;
   --ok: #34c77b; --warn: #e0a33e; --err: #ef5f5f;
 }
 * { box-sizing: border-box; }
@@ -27,8 +39,20 @@ header {
 }
 .brand { display: flex; gap: 12px; align-items: center; }
 h1 { font-size: 15px; margin: 0; letter-spacing: .3px; }
-h2 { font-size: 14px; margin: 0 0 12px; display: flex; gap: 10px; align-items: center; }
-h3 { font-size: 13px; margin: 16px 0 8px; color: var(--dim); font-weight: 500; }
+/*
+ * 标题
+ *
+ * ⚠️ `h2` 的**下边距归零** —— 它现在总是放在 `.page-head` 里，
+ * 而那个容器自己管间距（`margin-bottom: 10px`）。
+ * 两处都加会让标题下方多出一段空白，越看越松。
+ * ⚠️ `h3` 同理：它现在总在 `.panel-head` 里，下边距由容器给。
+ * ⚠️ 但 `h3` **保留非布局场景的下边距**（少数地方 h3 是直接子元素，
+ * 如任务页的「执行结果」），故用 `:only-child` 之外的场景保留。
+ */
+h2 { font-size: 14px; margin: 0; display: flex; gap: 10px; align-items: center; }
+h3 { font-size: 13px; margin: 0; color: var(--dim); font-weight: 500; }
+/* 直接坐在视图里的 h3（不在 .panel-head 内）仍需要上下间距 */
+section.view > h3 { margin: 16px 0 8px; }
 
 nav {
   display: flex; flex-wrap: wrap; gap: 4px; padding: 8px 16px;
@@ -41,8 +65,58 @@ nav {
 .nav-item:hover { color: var(--text); background: var(--panel2); }
 .nav-item.active { color: #fff; background: var(--accent); border-color: var(--accent); }
 
-main { padding: 18px; max-width: 1180px; margin: 0 auto; display: grid; gap: 16px; }
-section.view { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px; }
+/*
+ * 页面主容器（**纯布局**，视觉边界交给内部的 `.panel` / `.kpi`）。
+ *
+ * ⚠️ `max-width` 从 1180 提到 1240：视图容器去掉内边距后内容区反而变宽，
+ * 而 KPI 卡在 1180 时刚好排成 **5 列**（我们正好 5 张卡）——
+ * 每张被压到约 210px，数字稍长就折行。放宽后是 4 列，读起来舒服得多。
+ */
+main { padding: 20px; max-width: 1240px; margin: 0 auto; display: grid; gap: 16px; }
+/*
+ * ⚠️⚠️ **视图容器本身不再是「一张卡」**（用户报「按天趋势里面不要再套一个框」）。
+ *
+ * 根因：`section.view` 原先自带 `background + border + radius`，而它内部
+ * 现在**全部是卡片**（`.panel` / `.kpi` / `.prov-card`）⇒ 每个内部卡片外围
+ * 都又多了一圈同样的框，也就是「框里套框」。
+ *
+ * 这与用户的抱怨是同一件事：他要的是**扁平的一层卡片结构**。
+ * ⇒ 视图容器退成**纯布局容器**（无背景、无边框、无内边距），
+ *   由内部的 `.panel` / `.kpi` 自己承担视觉边界。
+ *
+ * ⚠️ 仍然保留 `min-width: 0`（网格项默认不收缩，去掉会让长表格撑破页面 ——
+ * 见文件里 `main > *` 那段踩坑记录）。
+ */
+/*
+ * 视图容器 = **纯布局容器**（无背景/边框/内边距）。
+ *
+ * ⚠️ 原先是 `background + border + radius + padding` —— 那是「一张卡」。
+ * 而它内部现在**全是卡片**（`.panel` / `.kpi` / `.prov-card`）
+ * ⇒ 每个内部卡片外围又多一圈同样的框，即用户抱怨的「框里套框」。
+ * 视觉边界改由内部卡片自己承担。
+ *
+ * ⚠️ `min-width: 0` 必须保留：网格项默认不收缩，去掉会让长表格撑破页面
+ *（见下方 `main > *` 那段踩坑记录）。
+ * ⚠️ `display: grid; gap` 让视图内的多个面板有统一间距
+ *（容器不再有 padding，间距得自己给）。
+ */
+section.view { min-width: 0; display: grid; gap: 14px; align-content: start; }
+/*
+ * ⚠️⚠️ **`section.view` 的子元素也必须能收缩**（用户报「配置与状态页面在手机上
+ * 挤出屏幕了」）。
+ *
+ * 根因：上一轮我把 `section.view` 改成 `display: grid`（为拿统一下间距），
+ * 于是它的子元素成了**网格项** —— 而网格项默认 `min-width: auto`
+ *（「不小于内容的最小宽度」）。配置页的表格按 `max-content` 取宽后，
+ * 这个最小值跟着变大 ⇒ 网格轨道被撑开 ⇒ **整个页面横向溢出**。
+ *
+ * ⚠️ `main > * { min-width: 0 }` 只覆盖了 main 的**直接**子元素（即 section.view），
+ * 对**再下一层**无效。这是同一个陷阱的第二层，必须逐层清。
+ *
+ * ⚠️ 纪律：**每当引入一个新的 grid/flex 容器，就要给它的子元素加 `min-width: 0`。**
+ * 项目此前已经为 `main` 和 `.count` 各踩过一次，这是第三次。
+ */
+section.view > * { min-width: 0; }
 
 .auth { display: flex; gap: 8px; align-items: center; }
 input, select, textarea, button {
@@ -60,7 +134,14 @@ button:disabled { opacity: .5; cursor: not-allowed; }
 .row label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--dim); }
 .pill { font-size: 12px; color: var(--dim); }
 .pill.ok { color: var(--ok); } .pill.err { color: var(--err); }
-.hint { color: var(--dim); font-size: 12px; margin: 6px 0; }
+/*
+ * 说明文字。
+ *
+ * ⚠️ 上下边距**归零**：它现在多半是 `section.view` 或 `.panel` 的直接子元素，
+ * 而那两个容器都有 `gap` —— 再加 margin 就是双重间距。
+ *（`.hint` 在旧结构里靠 margin 撑开，容器改布局后必须跟着改。）
+ */
+.hint { color: var(--dim); font-size: 12px; margin: 0; }
 
 .out {
   background: #0c0f14; border: 1px solid var(--line); border-radius: 8px;
@@ -75,6 +156,26 @@ button:disabled { opacity: .5; cursor: not-allowed; }
  * 这些容器是**先占位、后填内容**的，所以空的时候直接不显示。
  */
 .out:empty { display: none; }
+
+/*
+ * ⚠️ `.out` **放在 `.panel` 里时不要再套一层框**。
+ *
+ * `.out` 自己就有 `border + radius + background`，而 `.panel` 也是同样的三件套
+ * ⇒ 又是「框里套框」（用户明确抱怨过这个观感）。
+ *
+ * 处理：保留 `.out` 的**深色背景**（它表达「这是原始输出」，是有意义的
+ * 层级差），但**去掉描边**，让外层的 `.panel` 独自承担边框。
+ * —— 相邻嵌套面必须有视觉差异（背景步进或阴影），这里用**背景步进**。
+ */
+.panel > .out { border: 0; }
+
+/*
+ * ⚠️ 空面板不应留下一个空框：`.out:empty` 自己会 `display:none`，
+ * 但外层 `.panel` 的 padding 还在，看起来像个莫名的空卡片。
+ * `:has()` 现代浏览器（Chrome 105+ / Safari 15.4+）都支持；
+ * 不支持时只是多一个空框，不影响功能。
+ */
+.panel:has(> .out:empty) { display: none; }
 
 .notice {
   background: #1a2432; border: 1px solid #2a3d57; border-radius: 10px; padding: 14px 16px;
@@ -98,12 +199,34 @@ button:disabled { opacity: .5; cursor: not-allowed; }
 }
 .banner button { background: transparent; border-color: #7a3a3a; color: #ffd9d9; }
 
-.counts { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 12px; }
-.count {
-  background: var(--panel2); border: 1px solid var(--line); border-radius: 8px;
-  padding: 8px 12px; min-width: 92px;
+/*
+ * 计数卡片组（账号总数 / 可用 / 冷却中 / 模型限流 / 已禁用 / 供应商）。
+ *
+ * ## 🔴 为什么用 grid 而不是 flex（用户报「6 个卡片在电脑上太窄了」）
+ *
+ * 原先是 `flex-wrap` + `.count { min-width: 92px }`：6 张卡只占 **602px**，
+ * 而桌面容器有 1200px ⇒ **右侧空出近 600px**，卡片又窄又挤在一角。
+ *
+ * ⚠️ 也不能简单地给 flex 加 `flex-grow: 1` —— 项目此前记录过那个坑：
+ * 卡片个数为奇数时（曾经是 5 个），`grow` 会让**最后一张被拉伸成整行宽**，
+ * 看起来像被选中的高亮项。
+ *
+ * ⇒ 改用 `grid` + `auto-fit`：**所有轨道等宽**，卡片自动铺满整行，
+ *   且因为 `auto-fit` 会折叠空轨道，**不存在「最后一张被拉宽」**的问题
+ *  （奇数个时最后一行只是左侧对齐、宽度与上面一致）。
+ *   这与 `.kpi-grid` 是同一套做法，观感统一。
+ */
+.counts {
+  display: grid; gap: 10px;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
 }
-.count b { display: block; font-size: 18px; font-weight: 600; }
+.count {
+  background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+  padding: 9px 13px; min-width: 92px;
+  box-shadow: 0 1px 2px rgba(0,0,0,.03);
+}
+/* ⚠️ 数字用 tabular-nums：计数块并排时数字宽度一致，不会左右跳动 */
+.count b { display: block; font-size: 19px; font-weight: 600; font-variant-numeric: tabular-nums; }
 .count span { font-size: 11px; color: var(--dim); }
 /*
  * 可点击的计数块（冷却中 / 模型限流）。
@@ -122,10 +245,19 @@ button:disabled { opacity: .5; cursor: not-allowed; }
 }
 
 .card {
-  border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; margin-bottom: 8px;
+  border: 1px solid var(--line); border-radius: 12px; padding: 10px 12px; margin-bottom: 8px;
   display: flex; flex-wrap: wrap; gap: 10px; align-items: center;
+  background: var(--panel);
+  /* ⚠️ 与 `.panel` / `.kpi` 用同一套阴影与圆角 —— 用户要求「把其它界面的 UI
+     也统一成这种风格」。旧值 8px 圆角 + 无阴影，与新的 16px 卡片并排会明显
+     不是一套。 */
+  box-shadow: 0 1px 2px rgba(0,0,0,.03);
 }
-.card .uid { font-family: ui-monospace, monospace; font-size: 12px; color: var(--dim); }
+/* ⚠️ uid 是长串（如 `raccoon:raccoon-9696afc62b16c498`），窄屏会撑破卡片 */
+.card .uid {
+  font-family: ui-monospace, monospace; font-size: 12px; color: var(--dim);
+  overflow-wrap: anywhere;
+}
 .card .grow { flex: 1 1 220px; }
 .tag { font-size: 11px; padding: 2px 7px; border-radius: 999px; border: 1px solid var(--line); }
 .tag.ok { color: var(--ok); border-color: #1e5b3a; }
@@ -152,30 +284,325 @@ html[data-theme='light'] .err-msg { background: #fdecec; border-color: #f0a0a0; 
 
 table { border-collapse: collapse; width: 100%; font-size: 12px; }
 th, td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--line); }
+/*
+ * ⚠️ 表格单元格必须能断行。
+ *
+ * 配置页的值里有 `AES-GCM（密钥来自 CREDENTIAL_KEY secret）`、
+ * `每小时 1 次（0 * * * *）` 这类**含长 token 的句子**。单元格默认不折行，
+ * 于是「值」这一列按最长内容取宽 ⇒ 表格变宽 ⇒ 配合网格项的
+ * `min-width: auto` 直接撑破页面（用户报「配置与状态页面在手机上挤出屏幕了」）。
+ *
+ * ⚠️ 用 `overflow-wrap: anywhere`（不是 `word-break: break-all` ——
+ * 后者会把正常英文单词也拦腰截断，项目单测明确禁止）。
+ */
+th, td { overflow-wrap: anywhere; }
 th { color: var(--dim); font-weight: 500; }
 td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 
 .bars { display: flex; flex-direction: column; gap: 3px; }
 .bar-row { display: flex; align-items: center; gap: 8px; font-size: 11px; }
-.bar-label { width: 78px; color: var(--dim); font-family: ui-monospace, monospace; }
+/* ⚠️ 时段标签是 `10-03 20:00` 这类固定宽度文本，断行会破坏对齐 ⇒ 用 nowrap */
+.bar-label {
+  width: 78px; color: var(--dim); font-family: ui-monospace, monospace;
+  white-space: nowrap;
+}
 .bar-track { flex: 1; background: #10131a; border-radius: 3px; height: 14px; position: relative; overflow: hidden; }
 .bar-fill { background: var(--accent); height: 100%; }
 .bar-fill.bad { background: var(--err); }
-.bar-val { width: 60px; text-align: right; color: var(--dim); font-variant-numeric: tabular-nums; }
+/* ⚠️ 数值列要够宽才放得下带单位的文案（如「22 次请求（失败 3）」） */
+.bar-val { width: 132px; text-align: right; color: var(--dim); font-variant-numeric: tabular-nums; }
+/* 该时段的 token 量（原版没有这一列，用户不知道每小时花了多少） */
+.bar-tokens { width: 78px; text-align: right; color: var(--dim); font-variant-numeric: tabular-nums; }
+/* 迷你表头：告诉用户右侧两个数字分别是什么 */
+.bar-head { font-size: 10px; color: var(--dim); opacity: .8; margin-bottom: 2px; }
+.bar-head span:nth-child(2) { flex: 1; }
+.bar-head span:nth-child(3) { width: 132px; text-align: right; }
+.bar-head span:nth-child(4) { width: 78px; text-align: right; }
+
+/* ─────────── 用量页：KPI 卡片（照 cpa-usage-keeper 的观感） ─────────── */
+/*
+ * 参考项目的观感要点（已从其总览截图确认）：
+ *   · 大号数字（约 28px / 粗体）+ 小号带单位副标题
+ *   · 左上角一个**彩色图标章**，每张卡一个色系（蓝/紫/绿/橙/青/粉）
+ *   · 卡片圆角 16–20px、极淡的描边 + 柔和阴影
+ *   · 深色主题下卡片比背景**略亮**，而不是更黑
+ *
+ * ⚠️ 我们的面板是**手写 CSS + 明暗两套主题**，故这里只用 CSS 变量，
+ * 不引第三方 UI 库 —— 否则要么打包体积暴涨，要么与既有主题打架。
+ */
+.kpi-grid {
+  display: grid; gap: 12px;
+  /* ⚠️ 自适应列数由 `minmax` 决定（窄屏 1 列 → 宽屏 4~5 列）。
+     ⚠️ 不写 `margin-bottom`：它总是放在 `section.view`（`gap: 14px`）里，
+     再加下边距就是**双重间距**（本项目改布局时反复踩到这一点）。 */
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+}
+.kpi {
+  position: relative;
+  border: 1px solid var(--line); border-radius: 16px;
+  padding: 14px 16px 13px;
+  background: var(--panel);
+  /* 柔和阴影（参考项目用 0 10px 18px -3px）——比纯描边更有层次 */
+  box-shadow: 0 1px 2px rgba(0,0,0,.04), 0 8px 18px -8px rgba(0,0,0,.10);
+  overflow: hidden;
+}
+/* 左上角的彩色图标章 */
+.kpi-chip {
+  width: 26px; height: 26px; border-radius: 8px;
+  display: inline-flex; align-items: center; justify-content: center;
+  font-size: 13px; line-height: 1; margin-bottom: 10px;
+  background: var(--kpi-soft, rgba(79,140,255,.14));
+  color: var(--kpi, var(--accent-text));
+}
+.kpi-label { font-size: 11px; color: var(--dim); margin-bottom: 3px; }
+/* ⚠️ 数字要大：这是整张卡的主体（参考项目约 28px/900） */
+.kpi-value {
+  font-size: 25px; font-weight: 700; line-height: 1.15;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
+  /* ⚠️ 用 `overflow-wrap` 而不是 `word-break: break-all` —— 后者会把正常
+     英文单词也拦腰截断（项目单测明确禁止，见 tests/panel.test.ts）。 */
+  overflow-wrap: anywhere;
+}
+.kpi-sub { font-size: 11px; color: var(--dim); margin-top: 5px; }
+/* 每张卡的色系（照参考项目的蓝/紫/绿/橙/青/粉） */
+.kpi.blue   { --kpi: #4f8cff; --kpi-soft: rgba(79,140,255,.14); }
+.kpi.purple { --kpi: #a855f7; --kpi-soft: rgba(168,85,247,.14); }
+.kpi.green  { --kpi: #22c55e; --kpi-soft: rgba(34,197,94,.14); }
+.kpi.orange { --kpi: #f59e0b; --kpi-soft: rgba(245,158,11,.15); }
+.kpi.cyan   { --kpi: #06b6d4; --kpi-soft: rgba(6,182,212,.14); }
+.kpi.pink   { --kpi: #ec4899; --kpi-soft: rgba(236,72,153,.14); }
+.kpi.red    { --kpi: var(--err); --kpi-soft: rgba(239,95,95,.14); }
+
+/* ─────────── KPI 卡内的迷你趋势线（sparkline） ─────────── */
+/*
+ * 照参考项目：KPI 卡底部一条细折线，让「数字」带上「走向」。
+ * ⚠️ `preserveAspectRatio: none`（在 JS 里设）+ `height` 固定、
+ * `width: 100%` ⇒ 折线自适应卡片宽度而不留边距。
+ * ⚠️ `vector-effect: non-scaling-stroke`（在 JS 里设）保证横向拉伸时
+ * **描边粗细不变**，否则宽卡上的线会被拉成一片色块。
+ */
+.spark {
+  display: block; width: 100%; height: 28px;
+  margin-top: 8px; overflow: visible;
+}
+.spark path { stroke: var(--kpi, var(--accent-text)); }
+/* 每张卡用自己色系的线（与图标章同色） */
+.spark-blue path   { stroke: #4f8cff; }
+.spark-purple path { stroke: #a855f7; }
+.spark-green path  { stroke: #22c55e; }
+.spark-orange path { stroke: #f59e0b; }
+.spark-cyan path   { stroke: #06b6d4; }
+.spark-pink path   { stroke: #ec4899; }
+.spark-red path    { stroke: var(--err); }
+
+/* ─────────── 用量页：排名列表（照参考项目的 Top Models） ─────────── */
+.rank-row {
+  display: flex; align-items: center; gap: 12px;
+  padding: 9px 2px; border-bottom: 1px solid var(--line);
+}
+.rank-row:last-child { border-bottom: 0; }
+/* 序号徽章：前三名给一个强调色，其余保持中性（不喧哗） */
+.rank-idx {
+  flex: none; width: 20px; height: 20px; border-radius: 6px;
+  display: inline-flex; align-items: center; justify-content: center;
+  font-size: 11px; font-weight: 600; color: var(--dim);
+  background: var(--panel2);
+}
+.rank-idx.top1 { background: rgba(79,140,255,.16); color: #4f8cff; }
+.rank-idx.top2 { background: rgba(168,85,247,.16); color: #a855f7; }
+.rank-idx.top3 { background: rgba(34,197,94,.16); color: #22c55e; }
+.rank-main { flex: 1 1 auto; min-width: 0; }
+.rank-head {
+  display: flex; align-items: baseline; justify-content: space-between;
+  gap: 10px; margin-bottom: 5px;
+}
+.rank-name {
+  font-size: 12px; font-weight: 500;
+  /* ⚠️ 长模型名/uid 必须能断行，且用 `overflow-wrap` 而非 `break-all`
+     （后者会截断正常英文单词，项目单测禁止）。 */
+  overflow-wrap: anywhere; min-width: 0;
+}
+.rank-share {
+  flex: none; font-size: 11px; color: var(--dim);
+  font-variant-numeric: tabular-nums;
+}
+.rank-track {
+  height: 6px; border-radius: 3px; background: #10131a; overflow: hidden;
+}
+.rank-fill { height: 100%; background: var(--accent); border-radius: 3px; }
+.rank-fill.bad { background: var(--err); }
+.rank-metrics {
+  flex: none; display: flex; gap: 10px; align-items: baseline;
+  font-size: 11px; color: var(--dim); font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.rank-failed { color: var(--err); }
+/* ⚠️ 浅色主题下轨道底色要换 —— **两套都要覆盖**（见 AGENTS.md §9.1b ②g：
+   显式 light 与「跟随系统」是两套独立规则，漏一处就只在某种模式下出错）。 */
+html[data-theme='light'] .rank-track { background: #e8ebf0; }
+html[data-theme='light'] .rank-idx { background: #eef1f5; }
+
+/* ─────────── 用量页：通用面板容器 ─────────── */
+.panel {
+  border: 1px solid var(--line); border-radius: 16px;
+  /* ⚠️ 不写 `margin-bottom`：面板总是 `section.view`（`gap: 14px`）的子元素，
+     间距由容器统一给。自己再加一份就是双重间距。 */
+  background: var(--panel); padding: 14px 16px;
+  box-shadow: 0 1px 2px rgba(0,0,0,.03);
+}
+.panel-head {
+  display: flex; align-items: baseline; justify-content: space-between;
+  gap: 10px; margin-bottom: 12px; flex-wrap: wrap;
+}
+.panel-head h3 { margin: 0; font-size: 13px; font-weight: 600; }
+
+/* ─────────── 用量页：页头（标题 + 工具行） ─────────── */
+.page-head {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 12px; flex-wrap: wrap;
+  /* ⚠️ `margin-bottom: 0` —— 间距全部交给 `section.view` 的 `gap: 14px`。
+     这里再加一点就会变成「gap + margin」双重间距，标题与内容之间显得空旷。 */
+  margin-bottom: 0;
+}
+.page-head h2 { margin: 0; }
+.page-tools { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+/* 页头里的分段控件不需要下边距（原先 .seg 自带 margin-bottom:12px） */
+.page-tools .seg { margin-bottom: 0; }
+
+/* ─────────── 时间窗分段控件（用量页） ─────────── */
+.seg {
+  display: inline-flex; gap: 2px; padding: 3px; margin-bottom: 12px;
+  background: var(--panel2); border: 1px solid var(--line); border-radius: 8px;
+}
+.seg-item {
+  background: transparent; border: 0; color: var(--dim);
+  font-size: 12px; padding: 5px 12px; border-radius: 6px; cursor: pointer;
+  font-family: inherit; transition: background .12s, color .12s;
+}
+.seg-item:hover { color: var(--text); }
+.seg-item.active { background: var(--accent); color: #fff; }
+html[data-theme='light'] .seg-item.active { color: #fff; }
+/* ⚠️ 用量页 KPI 卡：浅色下阴影要略重一点才有层次（深色下靠亮色卡片本身）。
+   ⚠️ **必须与下方 `prefers-color-scheme` 那一份成对出现** ——
+   两套浅色规则是独立维护的，只写一处就会在「跟随系统」模式下漏掉
+   （本项目已为此踩过一次，见 AGENTS.md §9.1b ②g）。 */
+html[data-theme='light'] .kpi {
+  box-shadow: 0 1px 2px rgba(0,0,0,.04), 0 10px 20px -12px rgba(0,0,0,.18);
+}
+
+/* ─────────── 按天趋势柱 ─────────── */
+/*
+ * ⚠️ 用 flex 横排 + 每列固定最小宽度，而不是等分整行：
+ * 等分会让「30 天窗口」的柱子细到看不见，而「唯一一根柱」被拉成整条白块
+ *（参考实现记录过这个真实缺陷）。
+ */
+.trend {
+  display: flex; align-items: flex-end; gap: 4px;
+  overflow-x: auto; padding: 8px 2px 0;
+  /* ⚠️ **不要再套一层框**（用户报「按天趋势里面不要再套一个框」）。
+     它本身已经在一个 `.panel`（有边框/圆角/底色）里了，
+     再加一层就是「框里套框」—— 视觉上冗余，也让层级变模糊。
+     ⇒ 去掉 `border` / `background` / `margin-bottom`（外层 panel 已有内边距）。 */
+  /* ## 🔴 必须限宽（用户报「太宽不好看」）
+   *
+   * `.trend-col` 的 `flex-basis` 是 26px（为了让窄窗口的柱子不至于细到看不见），
+   * 而列**只多不少**：30 天窗口 ⇒ 30 列 ⇒ 光柱子就要 780px+，
+   * 在 1180px 的主容器里被 `flex-grow` 拉得更宽，整条图横铺满屏、很难看。
+   *
+   * ⇒ 给整块一个**上限**，超过就横向滚动（`overflow-x: auto` 已有）。
+   * 只加 `max-width` 而不动 `flex-basis`：前者限制**整块**的观感，
+   * 后者保证**单根柱**在窄屏仍可见 —— 两件事互不冲突。
+   *
+   * ⚠️ 用 `max-width: 100%` 兜底窄屏：不能让它溢出容器。
+   */
+  max-width: 760px;
+  width: 100%;
+}
+.trend-col {
+  /* ⚠️ **每列必须有宽度上限**（原先是 `flex: 1 0 26px`，grow=1 会撑满剩余空间）：
+   * 30 列时每列被拉宽、柱子跟着变胖；单列时更糟 —— 一根柱被拉成整条白块
+   *（这正是参考实现记录过的那个观感缺陷）。
+   *
+   * ⇒ `1 1 26px` 允许长高但**封顶 56px**：单列时是一根正常的柱（不是白块），
+   * 30 列时每列被压到 21px 左右仍可见（且不会被拉胖）。
+   */
+  flex: 1 1 26px;
+  max-width: 56px;
+  display: flex; flex-direction: column; align-items: center; gap: 4px;
+}
+.trend-val {
+  font-size: 10px; color: var(--dim); font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.trend-track {
+  width: 100%; height: 64px; display: flex; align-items: flex-end;
+  background: #10131a; border-radius: 4px; overflow: hidden;
+}
+.trend-fill {
+  width: 100%; background: var(--accent); border-radius: 3px 3px 0 0;
+  min-height: 2px; transition: height .15s;
+}
+.trend-fill.bad { background: var(--err); }
+/* 无数据的那天：一条极矮的底衬，表示「这天存在但没请求」 */
+.trend-fill.empty { background: var(--line); }
+.trend-label {
+  font-size: 10px; color: var(--dim); font-family: ui-monospace, monospace;
+  white-space: nowrap;
+}
+.trend-label.today { color: var(--accent-text); font-weight: 600; }
+html[data-theme='light'] .trend-track { background: #e8ebf0; }
 
 /* ─────────── 供应商网格 ─────────── */
 .prov-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 10px; }
 .prov-card {
-  border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px;
-  cursor: pointer; background: var(--panel2); transition: border-color .12s;
+  border: 1px solid var(--line); border-radius: 14px; padding: 12px 14px;
+  cursor: pointer; background: var(--panel); transition: border-color .12s, box-shadow .12s;
+  box-shadow: 0 1px 2px rgba(0,0,0,.03);
 }
-.prov-card:hover { border-color: var(--accent); }
-.prov-card .prov-name { font-weight: 600; font-size: 13px; }
-.prov-card .prov-id { font-family: ui-monospace, monospace; font-size: 11px; color: var(--dim); margin-bottom: 6px; }
+.prov-card:hover { border-color: var(--accent-text); }
+.prov-card .prov-name {
+  font-weight: 600; font-size: 13px;
+  min-width: 0; overflow-wrap: anywhere;
+}
+/*
+ * ⚠️ 右侧要**预留**积分药丸的位置，否则长名称会钻到它下面
+ *（药丸是绝对定位、不参与布局，只能靠内边距让位）。
+ *
+ * ⚠️ 但**不能无条件预留** —— 没有积分的卡片（未登录 / 不支持查积分的家）
+ * 会白空出右侧一大块。故用 `:has()` 只在**药丸真的显示时**才让位。
+ * 现代浏览器（Chrome 105+ / Safari 15.4+）均支持；不支持时只是可能重叠，
+ * 不影响功能。
+ */
+.prov-card:has(.prov-credits:not([hidden])) .prov-name { padding-right: 96px; }
+/* ⚠️ 同上（provider id 也是长串）；顺带补断行 */
+.prov-card .prov-id {
+  font-family: ui-monospace, monospace; font-size: 11px; color: var(--dim);
+  margin-bottom: 6px; overflow-wrap: anywhere;
+}
 .prov-card .caps { display: flex; flex-wrap: wrap; gap: 4px; }
 .cap { font-size: 10px; padding: 1px 6px; border-radius: 999px; border: 1px solid var(--line); color: var(--dim); }
 .cap.on { color: var(--ok); border-color: #1e5b3a; }
 .cap.off { color: #6b7280; text-decoration: line-through; }
+
+/* ─────────── 动效降级（`prefers-reduced-motion`） ─────────── */
+/*
+ * ⚠️ 面板只有 4 处 transition（按钮/卡片 hover、主题切换），量很小；
+ * 但对**前庭功能敏感**的用户，任何非必要动效都可能引起不适 ——
+ * 系统里既然开了这个开关，就该尊重它。
+ *
+ * ⚠️ 这里**不是**把 `transition` 全删掉，而是压到 `0.01ms`：
+ * 保留「状态变化会立即生效」的语义（有些代码依赖 `transitionend`），
+ * 同时让肉眼看不到动画。
+ */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+  }
+}
 
 /* ─────────── 弹窗 ─────────── */
 .modal {
@@ -183,9 +610,17 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
   display: flex; align-items: center; justify-content: center; padding: 20px; z-index: 50;
 }
 .modal[hidden] { display: none !important; }
+/*
+ * 弹窗（主弹窗与二级弹窗共用）。
+ *
+ * ⚠️ 圆角与阴影**与 `.panel` / `.kpi` 同一套**（16px + 柔和阴影）——
+ * 用户要求「把二级弹窗的 UI 也统一一下」。旧值 12px 无阴影，
+ * 与新版卡片并排明显不是一套。
+ */
 .modal-box {
-  background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 16px;
   width: min(760px, 100%); max-height: 86vh; display: flex; flex-direction: column;
+  box-shadow: 0 18px 48px rgba(0,0,0,.28);
 }
 .modal-head {
   display: flex; align-items: center; justify-content: space-between;
@@ -196,14 +631,33 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 .mtab {
   background: transparent; border: 1px solid transparent; border-bottom: none;
   color: var(--dim); padding: 6px 12px; border-radius: 6px 6px 0 0; cursor: pointer; font: inherit;
+  /* ⚠️ 同一排的标签**字号必须一致**：状态切换时字号差 1px 会肉眼可见地抖。 */
 }
 .mtab.active { color: var(--text); background: var(--panel2); border-color: var(--line); }
 .modal-body { padding: 14px 16px; overflow: auto; }
 .mtab-panel[hidden] { display: none !important; }
+/*
+ * ⚠️ 弹窗里的卡片**必须用 `--panel2`**（比弹窗底亮/暗一档）。
+ *
+ * ⚠️ 我一度把它改成 `--panel`「统一底色」，那是**错的**：
+ * `.modal-box` 本身就是 `--panel` ⇒ 卡片与弹窗底**完全相同**
+ *（实测对比度 **1.00:1**）⇒ 卡片**看不见**，只剩一圈边框。
+ *
+ * ⚠️ 这正是「相邻嵌套面必须有视觉差异」那条纪律：
+ * 弹窗（`--panel`）与其中的卡片（`--panel2`）必须差一档。
+ */
 .modal .card { background: var(--panel2); }
+/*
+ * ⚠️ 二级弹窗（`openInfo`）的内容是**表格 + 说明**，
+ * 与主弹窗的卡片列表形态不同 ⇒ 统一给它一点内部节奏：
+ * 说明文字与表格之间留白，表格自身可横向滚动（`.table-wrap` 已有）。
+ */
+.modal-body .hint + .table-wrap { margin-top: 10px; }
+.modal-body .table-wrap + .hint { margin-top: 10px; }
 
 /* ─────────── 任务卡片 ─────────── */
-.task-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 12px; margin-bottom: 8px; }
+/* ⚠️ 不写下边距（容器有 gap） */
+.task-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 12px; }
 .task-card {
   border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px;
   background: var(--panel2); display: flex; flex-direction: column; gap: 8px;
@@ -242,7 +696,7 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
  */
 html[data-theme='light'] {
   --bg: #f6f7f9; --panel: #ffffff; --panel2: #f1f3f6; --line: #d8dde5;
-  --text: #1a1d23; --dim: #5c6675; --accent: #2563eb;
+  --text: #1a1d23; --dim: #5c6675; --accent: #2563eb; --accent-text: #2563eb;
   --ok: #15803d; --warn: #b45309; --err: #dc2626;
 }
 html[data-theme='light'] input,
@@ -286,6 +740,11 @@ header .icon-btn { min-width: 40px; min-height: 40px; }
   font-size: 11px; font-weight: 600; color: var(--ok);
   background: #14301f; border: 1px solid #1e5b3a; border-radius: 999px;
   padding: 1px 8px;
+  /* ⚠️ 药丸补了「积分」二字后变宽（约 85px），而它是**绝对定位、不占位** ——
+     名称一长就会钻到它下面。两个约束一起给：
+       1. 名称预留出药丸的位置（`padding-right`）；
+       2. 药丸自身**不换行**，避免「积分」两字被折到第二行。 */
+  white-space: nowrap;
 }
 html[data-theme='light'] .prov-card .prov-credits { background: #e7f5ec; border-color: #86c79a; }
 
@@ -300,7 +759,7 @@ html[data-theme='light'] .prov-card .prov-credits { background: #e7f5ec; border-
 @media (prefers-color-scheme: light) {
   html:not([data-theme]) {
     --bg: #f6f7f9; --panel: #ffffff; --panel2: #f1f3f6; --line: #d8dde5;
-    --text: #1a1d23; --dim: #5c6675; --accent: #2563eb;
+    --text: #1a1d23; --dim: #5c6675; --accent: #2563eb; --accent-text: #2563eb;
     --ok: #15803d; --warn: #b45309; --err: #dc2626;
   }
   html:not([data-theme]) input,
@@ -308,13 +767,27 @@ html[data-theme='light'] .prov-card .prov-credits { background: #e7f5ec; border-
   html:not([data-theme]) textarea,
   html:not([data-theme]) button.ghost { background: #ffffff; }
   html:not([data-theme]) .out { background: #f8f9fb; }
+  /* ⚠️ `.bar-track` 与 `.trend-track` 是**两个**元素，都要覆盖。
+     实测缺陷（用户报「浅色主题下柱形图背景还是深色的」）：
+     我只把 `.trend-track` 加进了 `[data-theme='light']` 那一套，
+     而**跟随系统（auto）**模式走的是这段 `prefers-color-scheme` ——
+     两套规则是**独立维护**的，漏一处就只在某一种模式下出错，极难发现。
+     ⇒ 凡是在浅色下需要改底色的元素，**两处都要加**。 */
   html:not([data-theme]) .bar-track,
+  html:not([data-theme]) .trend-track,
   html:not([data-theme]) .switch { background: #e8ebf0; }
   html:not([data-theme]) .credits-pill,
   html:not([data-theme]) .prov-credits { background: #e7f5ec; border-color: #86c79a; }
   html:not([data-theme]) .banner { background: #fdecec; border-color: #f0a0a0; color: #7f1d1d; }
   html:not([data-theme]) .notice { background: #eef4ff; border-color: #b9d0f5; }
   html:not([data-theme]) .cap.off { color: #8a93a3; }
+  /* ⚠️ 与上面 `html[data-theme='light'] .rank-track` 成对 —— 漏一个就是「某种模式下出错」 */
+  html:not([data-theme]) .rank-track { background: #e8ebf0; }
+  html:not([data-theme]) .rank-idx { background: #eef1f5; }
+  /* ⚠️ 与上面 `html[data-theme='light'] .kpi` 成对 —— 漏一个就是「只有某种模式出错」 */
+  html:not([data-theme]) .kpi {
+    box-shadow: 0 1px 2px rgba(0,0,0,.04), 0 10px 20px -12px rgba(0,0,0,.18);
+  }
   html:not([data-theme]) .model-row.off .mid,
   html:not([data-theme]) .model-row.off .mname { color: #9aa3b2; }
 }
@@ -436,13 +909,20 @@ main > * { min-width: 0; }
   header { flex-wrap: wrap; gap: 8px; padding: 8px 12px; }
 
   /* ── 计数卡片：手机上 2 列，比「一列太长、三列太窄」都好读 ── */
-  .counts { gap: 8px; }
+  /*
+   * 计数卡：手机上**两列**。
+   *
+   * ⚠️ 这里曾经写 `flex: 0 1 calc(50% - 4px)` —— 那是 `.counts` 还是
+   * `flex` 容器时代的写法。现已改成 `grid`，**flex 属性在网格项上完全不生效**
+   *（会成为需要一并清理的死代码）。改用 `grid-template-columns` 显式两列。
+   *
+   * ⚠️ 「两列」不是拍脑袋：项目此前**实测**过一列时 5 张卡纵排要占 344px，
+   * 把首个供应商卡片推到 578px（在 667 高的机型上直接落到首屏之外），
+   * 而卡片才是本页主要内容。两列能把这段压回约一半。
+   */
+  .counts { gap: 8px; grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .count {
-    /* ⚠️ `flex-grow: 0`（不是 1）：计数块个数是奇数时（供应商页 5 个），
-     * grow 会让最后一块**被拉伸成整行宽**，看起来像被选中的高亮项。
-     * 固定成半宽后每块尺寸一致，奇数个只是末尾留一个空位。 */
-    flex: 0 1 calc(50% - 4px);
-    min-width: 0;          /* ⚠️ 关键：不清掉 min-width 时 flex 项不会收缩 */
+    min-width: 0;          /* ⚠️ 网格项默认不收缩，不清掉会被长内容撑破 */
     padding: 7px 10px;
   }
   .count b { font-size: 16px; }
@@ -473,9 +953,49 @@ main > * { min-width: 0; }
   .nav-item { white-space: nowrap; flex: 0 0 auto; }
 }
 
+/* ─────────── 手机端（≤720px）：用量页新组件的适配 ─────────── */
+/*
+ * ⚠️ 这些是**本轮新增**的组件（KPI 卡 / 排名行 / sparkline / 页头），
+ * 它们此前没有任何窄屏规则 —— 而宽屏下的尺寸直接缩到 375px 会挤成一团。
+ *
+ * 原则（与既有移动端规则一致）：
+ *   1. **能在容器内滚动的就滚动**，不要撑破页面（横向溢出最难用）；
+ *   2. **不靠缩小字号硬塞** —— 字号低于 11px 在手机上已经不好读；
+ *   3. 实在放不下的**次要信息**宁可省略（鼠标悬停仍可看 title），
+ *      也不要把主信息挤没。
+ */
+@media (max-width: 720px) {
+  /* KPI 卡：单列铺满，数字略收（25px → 22px）以免长数字折行 */
+  .kpi-grid { grid-template-columns: 1fr; gap: 10px; }
+  .kpi { padding: 12px 14px; }
+  .kpi-value { font-size: 22px; }
+  .spark { height: 24px; }
+
+  /* 排名行：手机上把「指标」换到第二行 ——
+     ⚠️ 不换行的话，`metrics` 是 flex:none + nowrap，
+     会把名称栏挤到只剩 100px 左右，长模型名直接变成一列碎字。 */
+  .rank-row { flex-wrap: wrap; row-gap: 6px; }
+  .rank-main { flex: 1 1 100%; order: 1; }
+  .rank-idx { order: 0; }
+  .rank-metrics { order: 2; flex: 1 1 100%; padding-left: 32px; gap: 12px; }
+
+  /* 页头：标题与工具行各占一行（工具行可横向滚动，避免按钮换行凌乱） */
+  .page-head { align-items: flex-start; }
+  .page-tools { width: 100%; overflow-x: auto; flex-wrap: nowrap; }
+  .page-tools .seg { flex: 0 0 auto; }
+
+  /* 面板内边距收紧，把宽度让给内容 */
+  .panel { padding: 12px 13px; border-radius: 14px; }
+  .panel-head { margin-bottom: 10px; }
+}
+
 /* ── 二维码：小屏上略缩，避免把弹窗撑到需要滚动 ── */
 @media (max-width: 420px) {
   .qr-box svg { width: 148px; height: 148px; }
+  /* 更窄的屏：KPI 数字再收一档；排名指标的字号保持 11px（不硬缩） */
+  .kpi-value { font-size: 20px; }
+  .kpi { padding: 11px 12px; }
+  .rank-metrics { padding-left: 0; }
 }
 
 /*
@@ -489,7 +1009,10 @@ main > * { min-width: 0; }
  * 故把单列规则降到 360 —— 常见手机走 720 断点的两列布局。
  */
 @media (max-width: 360px) {
-  .count { flex: 1 1 100%; }   /* 一列，避免数字被压到换行 */
+  /* 一列，避免数字被压到换行。
+     ⚠️ 用 `grid-template-columns`（容器属性），不是 `flex` ——
+     `.counts` 已是 grid，flex 属性在网格项上无效。 */
+  .counts { grid-template-columns: 1fr; }
   .bar-label { width: 52px; }  /* 此时折成两行可以接受 */
 }
 
@@ -501,15 +1024,38 @@ main > * { min-width: 0; }
  * 按下即开始拖动，click 事件不会触发。
  * `cursor: grab` 明示可拖；手机上由浏览器映射成长按拖动。
  */
+/*
+ * 拖动手柄。
+ *
+ * ## 🔴 `touch-action: none` 是 **iOS 能拖起来的关键**
+ *
+ * 用户报「拖动排序在 iOS 上只会选择文字」。原因是 iOS Safari 对普通元素
+ * **根本不支持 HTML5 拖放**（`draggable` 只对链接/图片等原生可拖元素有效），
+ * 故已改用 Pointer Events（见 app.js 的说明）。
+ *
+ * 但换事件还不够：**必须显式关掉浏览器的手势接管**，否则 iOS 会把长按
+ * 解释成文字选择 / 滚动，`pointermove` 根本不会持续派发。
+ * `touch-action: none` 就是那个开关。
+ *
+ * ⚠️ 只加在**手柄**上（不是整行）—— 加在整行会让列表无法滚动。
+ * ⚠️ `user-select: none` 是第二道防线（桌面端长按拖时也会选中文字）。
+ */
 .drag-handle {
   cursor: grab;
   color: var(--dim);
   font-size: 18px;
   line-height: 1;
-  padding: 0 4px;
+  /* 加大触摸目标：移动端 4px 内边距太窄，手指按不准 */
+  padding: 6px 10px;
+  margin: -6px -6px -6px -2px;
   user-select: none;
+  -webkit-user-select: none;
+  touch-action: none;
 }
 .drag-handle:active { cursor: grabbing; }
+
+/* 拖动进行中：禁止整页选中文字（iOS 上尤其明显） */
+.dragging-active { user-select: none; -webkit-user-select: none; }
 
 /* 拖动中的行：降透明度，让「正在拖谁」一目了然 */
 .card.dragging { opacity: 0.45; }
@@ -527,4 +1073,14 @@ main > * { min-width: 0; }
    让积分单独占一行，否则会把 uid/昵称挤成一条竖线。 */
 @media (max-width: 720px) {
   .card .acct-credits { flex-basis: 100%; }
+  /* ⚠️ 用量「按小时」在窄屏要收窄：三列（78+132+78=288px）+ 轨道
+     会让轨道被挤到几乎没有宽度。
+     ⇒ 隐藏 token 列（它在 title 提示里仍有），请求数列收窄。 */
+  .bar-tokens { display: none; }
+  .bar-head span:nth-child(4) { display: none; }
+  .bar-val { width: 84px; }
+  .bar-head span:nth-child(3) { width: 84px; }
+  .bar-label { width: 54px; }
+  /* KPI 卡片在窄屏单列铺满，数字略小一点以免折行 */
+  .kpi-value { font-size: 22px; }
 }

@@ -105,6 +105,11 @@ export function planGrowth(options?: { includeRealChat?: boolean }): TaskStep[] 
   const steps: TaskStep[] = [
     // 先拉一次列表，确认账号可用并拿到当前进度
     { code: '_probe', action: 'listTasks', delayMs: GAP.report },
+    // ⚠️ **必须先「接受」任务再上报行为**：上游 accept 不产生进度，
+    // 但只有已接受的任务才会计分（见 `actions.ts` 的 `acceptPending`）。
+    // 本引擎此前从不接受任务 ⇒ 未接受的任务上报了也不点亮。
+    // 幂等，重复运行无副作用。
+    { code: '_probe', action: 'acceptPending', delayMs: GAP.report },
     // ⚠️ **签到必须在本计划里**。面板与文档都承诺「签到 → 成长任务 → 领奖」
     //（`src/panel/assets/index.html:50-53`、`src/index.ts:447`），
     // 但早期 `planGrowth` **没有这一步** —— 用户点「执行每日任务」时只跑了成长任务，

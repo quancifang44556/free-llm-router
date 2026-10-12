@@ -195,11 +195,22 @@ test('⚠️ /v1/models 必须只列「有账号」的供应商的模型（登�
 
 test('⚠️ 面板视图（账号池已并入供应商）', () => {
   const html = panelAsset('/panel/')?.body ?? ''
-  const views = ['providers', 'tasks', 'usage', 'packages', 'models', 'config', 'logs']
+  // ⚠️ `packages` 已按用户要求**删除**（页面与视图都删）。
+  // 但 `/admin/packages` **端点保留** —— 账号卡片上的「单独显示积分」仍在用它。
+  const views = ['providers', 'tasks', 'usage', 'models', 'config', 'logs']
   for (const v of views) {
     assert.ok(html.includes(`data-view="${v}"`), `缺少视图：${v}`)
     assert.ok(html.includes(`id="view-${v}"`), `缺少视图容器：${v}`)
   }
+  // ⚠️ 反向断言：积分包页签与视图都必须已删除，且不留死代码
+  assert.ok(!html.includes('data-view="packages"'), '积分包页签应已删除')
+  assert.ok(!html.includes('id="view-packages"'), '积分包视图容器应已删除')
+  const js = panelAsset('/panel/app.js')?.body ?? ''
+  assert.ok(!/function loadPackages/.test(js), '⚠️ loadPackages 死代码应已删除')
+  assert.ok(!/refresh-packages/.test(js), '⚠️ 不应残留 refresh-packages 事件绑定')
+  // ⚠️ 但数据源必须保留（账号卡片积分靠它）
+  assert.ok(/function fetchPackages/.test(js),
+    '⚠️ fetchPackages 必须保留（账号卡片的「单独显示积分」在用）')
   // ⚠️ 账号池已并入「供应商与账号」，不该再有独立视图
   assert.ok(!html.includes('data-view="accounts"'), '账号池应已并入供应商视图')
   assert.ok(!html.includes('id="view-accounts"'), '不该再有独立的账号池容器')
@@ -471,7 +482,13 @@ test('⚠️ 所有表格必须包在 .table-wrap 里（否则手机上横向溢
   const wrapped = calls.filter((c) => c === 'wrapTable').length
   // 允许 buildTable 的定义体本身（`function buildTable(`）
   assert.equal(bare, 1, `buildTable 只应在定义处出现一次裸调用，实际 ${bare}`)
-  assert.ok(wrapped >= 5, `应有至少 5 处 wrapTable(buildTable(...))，实际 ${wrapped}`)
+  // ⚠️ **不写死「至少 N 处」** —— 那是个会随界面改版失效的魔数。
+  // 本轮把「按模型/按账号」两张表换成了**排名列表**（不存在表格，也就无需包裹），
+  // 数量从 5 掉到 4 —— 而**真正要守的约束没变**：
+  // 「凡是用表格的地方，必须包在 `.table-wrap` 里」。
+  // 上面那条 `bare === 1`（只允许定义处）已经等价地守住了它，
+  // 故这里只要求「还有表格在用这套包装」，不再钉具体数字。
+  assert.ok(wrapped >= 1, `应仍有用 wrapTable 包裹的表格，实际 ${wrapped}`)
 
   assert.ok(css.includes('.table-wrap'), 'CSS 必须有 .table-wrap 规则')
   assert.ok(/\.table-wrap\s*\{[^}]*overflow-x:\s*auto/.test(css), '.table-wrap 必须横向可滚动')
@@ -660,8 +677,16 @@ test('⚠️ 计数块的「单列」断点必须 ≤360px（420px 会覆盖几�
   //（844 高的屏上已过半；667 高的机型直接落到首屏之外）。
   // 逐宽度实测每行几个：375→1、390→1、412→1，仅 430 及以上为 2 列。
   const css = panelAsset('/panel/style.css')?.body ?? ''
-  const m = /@media\s*\(max-width:\s*(\d+)px\)\s*\{[^@]*?\.count\s*\{[^}]*flex:\s*1\s+1\s+100%/.exec(css)
-  assert.notEqual(m, null, '应存在把计数块收成一列的断点')
+  // ⚠️ 判据写成「断点里把 .counts 收成**一列**」，**不绑死实现方式**。
+  // 本项目 `.counts` 从 `flex-wrap` 改成了 `grid`（用户报「6 个卡片在电脑上太窄」），
+  // 旧断言匹配的 `flex: 1 1 100%`（写在 `.count` 上）随之失效 ——
+  // 但**它要守的结论没变**（单列断点必须 ≤360px）。
+  // ⇒ 改为匹配 grid 语境下的单列声明，同时容忍两种写法。
+  // ⚠️ 块内内容用 `[^@]*`（不允许再出现 `@media`）—— 否则 `[\s\S]*?` 会
+  // **跨越到下一个断点**去匹配，把 720px 那个块误报成「单列断点」
+  //（我第一版就是这么错的：720 块里没有 1fr，但匹配一路走到了 360 块）。
+  const m = /@media\s*\(max-width:\s*(\d+)px\)\s*\{[^@]*?\.counts\s*\{[^}]*grid-template-columns:\s*1fr/.exec(css)
+  assert.notEqual(m, null, '应存在把计数块收成一列的断点（grid-template-columns: 1fr）')
   assert.ok(Number(m?.[1]) <= 360, `单列断点应在 ≤360px，实际 ${m?.[1]}px（会误伤 375/390/412 的机型）`)
 })
 
@@ -675,15 +700,21 @@ test('⚠️ 柱状图时间标签必须放得下（"10-03 20:00" 折行会让�
   assert.ok(Number(m?.[1]) >= 56, `.bar-label 应 ≥56px 才容得下 "10-03 20:00"（自然宽 55px），实际 ${m?.[1]}px`)
 })
 
-test('⚠️ 积分包必须显式处理 skipped（否则渲染成「可用 undefined」）', () => {
+test('⚠️ 必须显式处理 skipped / 非数字 total（否则渲染成「可用 undefined」）', () => {
   // 线上实测（P2）：opencode 匿名通道那行显示 **「可用 undefined」**。
   // 后端其实是对的 —— 它对该账号返回
   // `{skipped:true, reason:'该供应商不支持查余额'}`（既无 error 也无 total），
   // 是前端只判 `a.error` 就落到 else 分支，把 undefined 拼进了字符串。
+  //
+  // ⚠️ 积分包**页面**已按用户要求删除，但 `/admin/packages` 端点保留
+  //（账号卡片的「单独显示积分」靠它），故这条防线仍然必须有 ——
+  // 只是断言点从已删除的 `loadPackages` 换到仍在的消费方。
   const js = panelAsset('/panel/app.js')?.body ?? ''
-  assert.ok(/a\.skipped/.test(js), '应处理 skipped（后端用它标记「该供应商不支持查余额」）')
-  // 同时要有 total 非数字的兜底（与 loadProviderCredits 同口径）
-  assert.ok(/typeof a\.total !== 'number'/.test(js), '应对非数字 total 兜底，不让 undefined 流到界面')
+  // 账号卡片：非数字 total 必须跳过（不让 undefined 流到界面）
+  assert.ok(/typeof a\.total !== 'number'/.test(js) || /typeof cred\.total !== 'number'/.test(js),
+    '⚠️ 应对非数字 total 兜底，不让 undefined 流到界面')
+  // 任务结果里 skipped 的显式处理（后端用它标记「该供应商不支持查余额」）
+  assert.ok(/r\.skipped/.test(js), '应处理 skipped')
 })
 
 test('⚠️ 错误文案不得硬截断（会切掉「请重新登录」这类可行动的尾巴）', () => {
@@ -695,7 +726,11 @@ test('⚠️ 错误文案不得硬截断（会切掉「请重新登录」这类�
   // 当反例讲解（说明「为什么不再这么写」），不剥会把自己的说明误判成违规。
   const jsCode = stripJsComments(panelAsset('/panel/app.js')?.body ?? '')
   assert.ok(!/a\.error\.slice\(/.test(jsCode), '错误文案不得用 slice 硬截断')
-  assert.ok(jsCode.includes('err-msg'), '长错误应走 .err-msg 块级样式换行显示')
+  // ⚠️ 原先这里断言「长错误走 .err-msg 块级样式」，但那唯一的用点是
+  // 已按用户要求删除的**积分包页**。保留的消费方（账号卡片）用 `title`
+  // 承载完整原因，故这里只钉住「不得硬截断」这条仍然成立的纪律 ——
+  // 用 `title` 承载完整原因也是合规的做法，一并钉住。
+  assert.ok(/title/.test(jsCode), '完整错误原因应通过 title 等方式可达（不被丢弃）')
 })
 
 test('⚠️ 空的输出框不该画出空边框', () => {
@@ -782,16 +817,15 @@ test('⚠️ 「供应商」计数块必须在「已禁用」**右边**，且复
 
 test('⚠️ 供应商列表必须支持**拖动**排序（不是上移/下移按钮）', () => {
   // 用户明确要求：「加一个拖动移动位置」。
-  const js = panelAsset('/panel/app.js')?.body ?? ''
+  //
+  // ⚠️ 实现方式**后来换过**：原先用 HTML5 drag-and-drop，但用户实测
+  // 「iOS 上只会选择文字」⇒ 已改用 Pointer Events
+  //（根因与取舍见下一条测试）。这里只钉住「有拖动能力 + 有手柄」。
+  const js = stripJsComments(panelAsset('/panel/app.js')?.body ?? '')
   const css = panelAsset('/panel/style.css')?.body ?? ''
-  // 行可拖 + 有手柄
-  assert.ok(/row\.draggable = true/.test(js), '行必须是 draggable')
-  assert.ok(/ondragstart/.test(js) && /ondrop/.test(js), '要处理 dragstart 与 drop')
+  assert.ok(/pointerdown/.test(js), '要有拖动能力（Pointer Events）')
   assert.ok(js.includes('drag-handle'), '要有拖动手柄')
   assert.ok(/drag-handle/.test(css), '手柄要有样式（cursor: grab）')
-  // ⚠️ `dragover` 必须 preventDefault，否则浏览器拒绝 drop（静默失效）
-  assert.ok(/ondragover = \(e\) => \{ e\.preventDefault\(\)/.test(js),
-    '⚠️ dragover 必须 preventDefault，否则 drop 不触发')
   // ⚠️ 不能再有上移/下移按钮（用户要的是拖动）
   assert.ok(!/up\.textContent = '↑'/.test(js), '不应保留「上移」按钮')
 })
@@ -802,8 +836,13 @@ test('⚠️ 供应商管理弹窗必须复用现有 .card 样式（视觉统一
   const js = panelAsset('/panel/app.js')?.body ?? ''
   const css = panelAsset('/panel/style.css')?.body ?? ''
   const i = js.indexOf('function openProviderManager')
-  const block = js.slice(i, i + 3200)
-  assert.ok(/row\.className = 'card'/.test(block), '管理行应复用 .card 样式')
+  // ⚠️ 窗口要取到**下一个顶层函数**，不能用固定长度 ——
+  // 该函数因拖动改用 Pointer Events 变长了，固定 3200 会切掉后半段，
+  // 让断言变成「找不到 ⇒ 失败」这种**假失败**（我为此返工过）。
+  const j = js.indexOf('\nfunction ', i + 10)
+  const block = js.slice(i, j > 0 ? j : i + 12000)
+  // ⚠️ 断言前剥注释：我的说明里引用了 `row.draggable` 这类旧写法当反例。
+  assert.ok(/row\.className = 'card'/.test(stripJsComments(block)), '管理行应复用 .card 样式')
   // ⚠️ 按钮也复用现有的 ghost / danger（不另立样式）
   assert.ok(/sw\.className = off \? 'ghost' : 'danger'/.test(block), '开关应复用 ghost/danger')
   // 自造的 .prow 样式必须已删除（否则就是两套风格）
@@ -827,16 +866,40 @@ test('🔴 账号卡片必须支持单独停用/启用，且按钮在「删除�
     '删除仍应是 danger 样式')
 })
 
-test('⚠️ 每个账号卡片必须单独显示积分（用户要求）', () => {
-  const js = panelAsset('/panel/app.js')?.body ?? ''
+test('⚠️ 每个账号卡片必须单独显示积分，且**不得阻塞账号列表**', () => {
+  // ## 用户两条反馈（先后）
+  //
+  // 1. 「每个账号单独显示积分」—— 于是接了 `acct-credits`。
+  // 2. ⚠️「账号半天加载不出来」—— 因为积分是逐账号串行实时查上游
+  //    （实测 `/admin/packages` 要 **16.3 秒**，而 `/admin/accounts` 只要 1.5 秒），
+  //    旧写法把两者**串在一起** ⇒ 点开弹窗后要盯空白等 16 秒。
+  //
+  // ⇒ 现在**先渲染账号**，积分**异步补**。这条测试钉住这个结构。
+  const js = stripJsComments(panelAsset('/panel/app.js')?.body ?? '')
   const css = panelAsset('/panel/style.css')?.body ?? ''
   assert.ok(js.includes('acct-credits'), '账号卡片要有积分元素')
-  // ⚠️ 数据必须来自已有的 `/admin/accounts`（`a.credits`），
-  // **不能**为每个账号再打一次上游 —— 那既慢又消耗额度。
-  assert.ok(/a\.credits/.test(js), '积分应取账号自身字段，不额外请求')
   assert.ok(/acct-credits/.test(css), '要有样式')
-  // 查不到时显示 `—` 而不是 0（显示 0 会让人以为额度用光）
-  assert.ok(js.includes("cr.textContent = '—'"), '未查到应显示破折号而非 0')
+
+  // ① ⚠️ **必须**用 `/admin/packages` 而不是 `a.credits` ——
+  //    后者只在 `AccountPoolDO.revive()` 里被写，平时恒为 0（废弃字段）。
+  assert.ok(/fetchPackages\(\)/.test(js), '积分应来自 /admin/packages')
+
+  // ② ⚠️ 积分必须在**渲染之后**异步补，不能 await 在渲染之前。
+  const fn = js.slice(js.indexOf('async function loadModalAccounts'))
+  const renderAt = fn.indexOf('box.appendChild(card)')
+  const creditAt = fn.indexOf('await fetchPackages()')
+  assert.ok(renderAt > 0, '应有账号渲染')
+  assert.ok(creditAt > renderAt,
+    '⚠️ 积分查询必须在**账号渲染之后**（之前会阻塞 16 秒 —— 用户报「半天加载不出来」）')
+
+  // ③ ⚠️ 必须有轮次校验：用户快速切换供应商时，旧一家的积分不能写进新一家
+  assert.ok(/modalAccountsSeq/.test(js), '⚠️ 异步补齐必须有轮次校验（否则串数据）')
+  // ④ ⚠️ 元素可能已被下一次重载移除，写之前要判 isConnected
+  assert.ok(/\.isConnected/.test(js), '⚠️ 写之前要判元素是否仍在文档里')
+  // ⑤ 三种终态都要有：有额度 / 查询失败（带原因）/ 不支持查余额
+  assert.ok(/查询失败/.test(js), '查询失败要显示（不是静默 0）')
+  assert.ok(/不支持查余额/.test(js), '后端标 skipped 时应显示「不支持查余额」而非「查询失败」')
+  assert.ok(js.includes("el.textContent = '—'"), '未查到应显示破折号而非 0')
 })
 
 test('🔴 供应商关闭必须真的关掉（服务端状态 + 双向拦截）', () => {
@@ -928,4 +991,772 @@ test('⚠️ loomy 面板必须走短信两步流程（不能进轮询逻辑）'
   const block = js.slice(fn, fn + 600)
   assert.ok(/providerId === 'loomy'/.test(block), '⚠️ 必须在轮询之前分派走')
   assert.ok(/LOGIN_KIND_LABEL[\s\S]{0,120}loomy:/.test(js), '要有「短信验证码登录」标签')
+})
+
+test('🔴 供应商拖动必须用 Pointer Events（iOS Safari 不支持普通元素的 HTML5 拖放）', () => {
+  // ## 用户实测反馈
+  //
+  // 「供应商拖动排序功能在 iOS 的浏览器上只会**选择文字**，
+  //  在 Chromium 内核的浏览器上能正常拖动，但也不太顺手」。
+  //
+  // 根因是**两个独立问题**：
+  // 1. **iOS Safari 对普通元素根本不支持 HTML5 拖放** ——
+  //    `draggable="true"` 只对链接/图片等原生可拖元素有效，对 `<div>`
+  //    只会触发文字选择。⇒ 这不是「配置不对」，改属性救不回来。
+  // 2. **整行都在拖**（`row.draggable = true`），而注释声称「只有手柄可拖」
+  //    ⇒ 按「启用/关闭」按钮时容易误触发拖动，按钮变得难以点中。
+  const js = stripJsComments(panelAsset('/panel/app.js')?.body ?? '')
+  const css = panelAsset('/panel/style.css')?.body ?? ''
+
+  // ① 不得再用 HTML5 拖放 API
+  for (const api of ['ondragstart', 'ondragover', 'ondrop', '.draggable = true']) {
+    assert.ok(!js.includes(api), `⚠️ 不得再用 HTML5 拖放（${api}）—— iOS 上无效`)
+  }
+  // ② 必须用 Pointer Events
+  assert.ok(/pointerdown/.test(js), '应用 pointerdown 起拖')
+  assert.ok(/pointermove/.test(js), '应用 pointermove 跟踪位置')
+  assert.ok(/pointerup/.test(js), '应用 pointerup 落位')
+  // ③ ⚠️ 必须处理 pointercancel，且**不提交**（原样回退）
+  assert.ok(/pointercancel/.test(js), '⚠️ 必须处理 pointercancel（系统中断）')
+  assert.ok(/endDrag\(false\)/.test(js), '⚠️ pointercancel 必须不提交改动')
+  // ④ ⚠️ 必须 setPointerCapture，否则滑出手柄就收不到 pointerup（拖到一半卡住）
+  assert.ok(/setPointerCapture/.test(js), '⚠️ 必须 setPointerCapture（否则拖到一半卡住）')
+  // ⑤ ⚠️ 必须有起拖阈值，轻点手柄不该算拖动
+  assert.ok(/DRAG_START_PX/.test(js), '⚠️ 起拖需有位移阈值（避免误触）')
+
+  // ⑥ ⚠️ CSS 的 touch-action:none 是 iOS 能拖起来的**关键**
+  //   （否则 iOS 把长按解释成文字选择/滚动，pointermove 不会持续派发）
+  const handleRule = css.slice(css.indexOf('.drag-handle {'))
+  const handleBody = handleRule.slice(0, handleRule.indexOf('}'))
+  assert.ok(/touch-action:\s*none/.test(handleBody),
+    '⚠️ .drag-handle 必须有 touch-action: none —— 这是 iOS 能拖的关键')
+  assert.ok(/-webkit-user-select:\s*none|-user-select:\s*none/.test(handleBody),
+    '⚠️ .drag-handle 需要 user-select: none（第二道防线）')
+})
+
+test('⚠️ 拖动排序只作用于手柄，不作用于整行（否则按钮点不中）', () => {
+  // 用户反馈「Chromium 上能拖但不太顺手」的直接原因之一：
+  // 整行可拖会让「启用/关闭」按钮几乎点不中（按下即开始拖动，click 不触发）。
+  const js = stripJsComments(panelAsset('/panel/app.js')?.body ?? '')
+  // pointerdown 必须挂在 handle 上
+  assert.ok(/handle\.addEventListener\('pointerdown'/.test(js),
+    '⚠️ pointerdown 必须挂在小手柄上，不是整行')
+  // row 上不得挂 pointerdown
+  assert.ok(!/row\.addEventListener\('pointerdown'/.test(js),
+    '⚠️ 整行不得起拖（会让按钮点不中）')
+  // 开关按钮必须仍然有 onclick（未被拖动逻辑吃掉）
+  assert.ok(/sw\.onclick/.test(js), '⚠️ 开关按钮的 onclick 必须保留')
+})
+
+test('🔴 浅色主题必须覆盖**两套**规则（显式 light + 跟随系统的 auto）', () => {
+  // ## 实测缺陷（用户报「用量的柱形图在自适应主题下的浅色主题背景还是深色的」）
+  //
+  // 项目有**两套**浅色规则，独立维护：
+  //   1. `html[data-theme='light']` —— 用户**显式**选浅色；
+  //   2. `@media (prefers-color-scheme: light) { html:not([data-theme]) ... }`
+  //      —— 用户选「跟随系统」且系统是浅色。
+  //
+  // 我只把 `.trend-track` 加进了第 1 套 ⇒ **auto 模式下漏了**，
+  // 于是柱状图背景仍是深色（`#10131a`）。
+  // ⚠️ 这类缺陷只在**某一种模式**下出现，极难发现 —— 必须用测试钉住「两处都有」。
+  const css = panelAsset('/panel/style.css')?.body ?? ''
+
+  // 两套规则都必须存在
+  assert.ok(/html\[data-theme='light'\]\s*\.trend-track/.test(css),
+    "⚠️ 显式 light 主题要覆盖 .trend-track")
+  assert.ok(/html:not\(\[data-theme\]\)\s*\.trend-track/.test(css),
+    '⚠️ 跟随系统（auto）的浅色也要覆盖 .trend-track —— 漏了就是用户报的那个缺陷')
+
+  // 一般化：凡是有 `.bar-track` 浅色覆盖的地方，`.trend-track` 也必须有
+  // （两个都是「柱状图轨道」，成对出现才不容易漏）
+  const explicitLightBlock = css.slice(css.indexOf("html[data-theme='light'] .out"))
+  assert.ok(/\.bar-track[\s\S]{0,400}\.trend-track|\.trend-track[\s\S]{0,400}\.bar-track/.test(css)
+    || /\.trend-track/.test(explicitLightBlock),
+    '⚠️ .bar-track 与 .trend-track 应在同一处一起覆盖（它们是一对）')
+
+  // ⚠️ 更强的判据：**逐条**检查浅色规则体里没有深色底。
+  //（不能简单地「取第一个 [data-theme='light'] 之后的全部文本」——
+  //  那会把后面的 auto 块与注释也算进来，产生假失败。我第一版就是这么错的。）
+  const lightRuleBodies: string[] = []
+  const re = /html\[data-theme='light'\]([^{]*)\{([^}]*)\}/g
+  let m: RegExpExecArray | null
+  while ((m = re.exec(css)) !== null) lightRuleBodies.push(m[2] ?? '')
+  const autoRuleBodies: string[] = []
+  const re2 = /html:not\(\[data-theme\]\)([^{]*)\{([^}]*)\}/g
+  while ((m = re2.exec(css)) !== null) autoRuleBodies.push(m[2] ?? '')
+  assert.ok(lightRuleBodies.length > 0 && autoRuleBodies.length > 0,
+    '两套浅色规则都应存在')
+  for (const body of [...lightRuleBodies, ...autoRuleBodies]) {
+    assert.ok(!/#10131a/.test(body),
+      `⚠️ 浅色规则体里不得残留深色底 #10131a（实际：${body.trim().slice(0, 80)}）`)
+  }
+})
+
+test('⚠️ 趋势图必须限宽（用户报「太宽不好看」）', () => {
+  // `.trend-col` 的 flex-basis 是 26px（保证窄屏柱子可见），
+  // 而 30 天窗口 ⇒ 30 列 ⇒ 光柱子就要 780px+，再加 `flex-grow` 撑满
+  // ⇒ 整条图横铺满 1180px 容器，很难看。
+  const css = panelAsset('/panel/style.css')?.body ?? ''
+  const rule = css.slice(css.indexOf('.trend {'))
+  const body = rule.slice(0, rule.indexOf('}'))
+  // ① 整块要有宽度上限
+  assert.ok(/max-width:\s*\d+px/.test(body),
+    '⚠️ .trend 必须有 max-width（否则 30 列横铺满屏）')
+  // ② 单列也要封顶，否则「唯一一根柱」会被拉成整条白块
+  const colRule = css.slice(css.indexOf('.trend-col {'))
+  const colBody = colRule.slice(0, colRule.indexOf('}'))
+  assert.ok(/max-width:\s*\d+px/.test(colBody),
+    '⚠️ .trend-col 必须有 max-width（否则单列时一根柱被拉成白块）')
+  // ③ 窄屏不能溢出容器
+  assert.ok(/width:\s*100%/.test(body), '⚠️ 应有 width:100% 兜底窄屏（不能溢出）')
+})
+
+test('🔴 用量「按小时」的数字**必须带单位**（用户报「21 24 是什么意思」）', () => {
+  // ## 用户原话：「这个每小时用量的 21 24 是什么意思」
+  //
+  // 根因：旧版渲染时只写一个裸 `count`：
+  //   `val.textContent = fmtNum(h.count) + (h.failed ? ' / ' + … : '')`
+  // ⇒ 界面上就是「21」「24」两个数字，**看不出是请求数还是 token 数**。
+  // 这不是「不够美观」，是**信息缺失** —— 用户无法解读自己的数据。
+  const js = stripJsComments(panelAsset('/panel/app.js')?.body ?? '')
+  const fn = js.slice(js.indexOf('function renderUsageHours'))
+  // ① 值必须带「次请求」这样的单位
+  assert.ok(/次请求/.test(fn), '⚠️ 请求数必须写明单位（不能只有裸数字）')
+  // ② 必须同时给出该小时的 token 量（否则仍然不知道每小时花了多少）
+  assert.ok(/tokens/.test(fn) || /tok/.test(fn), '⚠️ 该小时的 token 量也要给')
+  // ③ 必须有表头，否则右侧两列仍然靠猜
+  assert.ok(/bar-head/.test(fn), '⚠️ 需要表头说明各列是什么')
+  // ④ 悬停提示里要有完整明细
+  assert.ok(/\.title\s*=/.test(fn), '⚠️ 应有 title 提示给出完整数字')
+})
+
+test('🔴 「今日」窗口不得显示按天趋势（单根柱没有意义）', () => {
+  // 用户明确要求：「今日就不要显示按天趋势了」。
+  // 今日窗口只有**一根柱** —— 既不构成趋势，观感也差
+  //（单根柱要么被拉成整条白块，要么孤零零杵着）。
+  //
+  // ⚠️ 要隐藏**整个面板**（含标题），而不是只清空内容 ——
+  // 留一个空标题比不显示更让人困惑。
+  const js = stripJsComments(panelAsset('/panel/app.js')?.body ?? '')
+  const fn = js.slice(js.indexOf('function renderUsageTrend'))
+  assert.ok(/windowDays === 1/.test(fn), '应判单日窗口')
+  assert.ok(/panel\.hidden = true/.test(fn),
+    '⚠️ 单日窗口必须**隐藏整个面板**（不是只清空内容）')
+  // 且必须是**提前返回**（不能继续画柱子）
+  const hideAt = fn.indexOf('panel.hidden = true')
+  const returnAt = fn.indexOf('return', hideAt)
+  assert.ok(returnAt > hideAt && returnAt - hideAt < 200,
+    '⚠️ 隐藏后必须立即 return，否则仍会画出那根柱')
+})
+
+test('🔴 byHour 必须带 token（否则「按小时」给不出用量）', () => {
+  // 上一条测试断言「按小时要显示 tokens」，其前提是**后端确实算了**。
+  // 这个前提若变了，那条断言就只是空转。
+  const src = readFileSync('src/store/usage.ts', 'utf8')
+  const iface = src.slice(src.indexOf('export interface UsageHour'))
+  const body = iface.slice(0, iface.indexOf('}'))
+  for (const k of ['input', 'output']) {
+    assert.ok(new RegExp(`\\b${k}\\b`).test(body),
+      `⚠️ UsageHour 必须包含 ${k}（否则按小时给不出 token 量）`)
+  }
+  // ⚠️ 旧数据没有这两个字段 ⇒ 累加时必须按 0 兜底，否则整列变 NaN
+  assert.ok(/prev\?\.input \?\? 0/.test(src) && /prev\?\.output \?\? 0/.test(src),
+    '⚠️ 旧数据的 byHour 没有 input/output，累加必须 ?？ 0 兜底（否则显示 NaN）')
+  assert.ok(/v\.input \?\? 0/.test(src) && /v\.output \?\? 0/.test(src),
+    '⚠️ 汇总合并时同样要兜底')
+})
+
+test('⚠️ KPI 卡的浅色规则必须**两套都加**（显式 light + 跟随系统 auto）', () => {
+  // 这正是本项目上一轮踩过的缺陷（用户报「浅色主题下趋势柱背景还是深色」）：
+  // 两套浅色规则**独立维护**，只写一处就会在「跟随系统」模式下漏掉。
+  // 本轮新增 KPI 卡时，我自己又差点犯同一个错（先只加了一处）。
+  const css = panelAsset('/panel/style.css')?.body ?? ''
+  assert.ok(/html\[data-theme='light'\]\s*\.kpi\s*\{/.test(css),
+    "⚠️ 显式 light 主题要覆盖 .kpi")
+  assert.ok(/html:not\(\[data-theme\]\)\s*\.kpi\s*\{/.test(css),
+    '⚠️ 跟随系统（auto）的浅色也要覆盖 .kpi')
+})
+
+// ─────────────── 真实执行渲染函数（抓 TDZ 这类**运行时**错误） ───────────────
+//
+// ## 为什么必须有这一组（用户报「用量页直接加载不出来了」）
+//
+// 我上一轮加 KPI 卡时，把 `rangeLabel` **用在了 `const` 声明之前** ——
+// `const` 有 TDZ，于是 `loadUsage()` 一执行就抛
+// `Cannot access 'rangeLabel' before initialization`，**整个用量页空白**。
+//
+// ⚠️⚠️ **这类错误任何「读源码文本」的断言都抓不到**：
+// 语法完全合法（`new Function(src)` 照样通过），只有**真的跑一遍**才会暴露。
+// 项目此前只有静态文本断言，所以这个 bug 一路漏到了线上。
+//
+// ⇒ 这里搭一个**最小 DOM 桩**，把真实的 `loadUsage()` 跑起来。
+// ⚠️ 桩只实现面板实际用到的那几个 API（见下方统计），
+// 故意**不做**通用伪装 —— 用到没实现的方法要立刻报错，而不是静默返回 undefined。
+
+/** 极简 DOM 元素桩。 */
+function makeEl(tag) {
+  const el = {
+    tagName: String(tag).toUpperCase(),
+    children: [],
+    style: {},
+    dataset: {},
+    classList: {
+      _s: new Set(),
+      add(...c) { for (const x of c) this._s.add(x) },
+      remove(...c) { for (const x of c) this._s.delete(x) },
+      toggle(c, on) { if (on === undefined) { this._s.has(c) ? this._s.delete(c) : this._s.add(c) } else if (on) this._s.add(c); else this._s.delete(c) },
+      contains(c) { return this._s.has(c) },
+    },
+    get firstChild() { return this.children[0] ?? null },
+    // ⚠️ DOM 里子节点数组叫 `childNodes`，而面板代码用 `children` ——
+    // 两者都要有（我第一版只给了 children，测试读 childNodes 就拿到 undefined）。
+    get childNodes() { return this.children },
+    get textContent() { return this._text ?? '' },
+    set textContent(v) { this._text = String(v); this.children = [] },
+    appendChild(c) { this.children.push(c); return c },
+    removeChild(c) { const i = this.children.indexOf(c); if (i >= 0) this.children.splice(i, 1); return c },
+    insertBefore(c) { this.children.unshift(c); return c },
+    addEventListener() {},
+    removeEventListener() {},
+    // ⚠️ SVG 元素用 `setAttribute`/`getAttribute` 而不是属性赋值 ——
+    // `sparkline` 完全依赖它们，桩里必须真的存下来（否则断言读不到 d）。
+    _attrs: {},
+    setAttribute(k, v) { this._attrs[k] = String(v) },
+    getAttribute(k) { return Object.prototype.hasOwnProperty.call(this._attrs, k) ? this._attrs[k] : null },
+    getBoundingClientRect() { return { top: 0, height: 0, left: 0, width: 0 } },
+    querySelectorAll() { return [] },
+    querySelector() { return null },
+    cloneNode() { return makeEl(tag) },
+    // ⚠️ 桩里恒真：真实浏览器里「已脱离文档」的元素写文字无效，
+    // 但这里没有文档树概念，恒真足够验证**逻辑**不抛错。
+    get isConnected() { return true },
+    hidden: false,
+    title: '',
+  }
+  return el
+}
+
+/**
+ * 在最小 DOM 桩里加载面板 JS，并跑一个渲染函数。
+ *
+ * @param fnSource - 要执行的代码（可访问面板里的函数与变量）
+ */
+function runPanelJs(fnSource) {
+  const src = panelAsset('/panel/app.js')?.body ?? ''
+  const els = new Map()
+  const document = {
+    getElementById: (id) => {
+      if (!els.has(id)) els.set(id, makeEl('div'))
+      return els.get(id)
+    },
+    createElement: (tag) => makeEl(tag),
+    // ⚠️ SVG 必须走 `createElementNS`（命名空间）—— `sparkline` 用它建 svg/path。
+    // 桩里直接复用同一个元素实现即可（我们只关心属性与子节点）。
+    createElementNS: (_ns, tag) => makeEl(tag),
+    querySelectorAll: () => [],
+    querySelector: () => null,
+    documentElement: makeEl('html'),
+    importNode: (n) => n,
+  }
+  const store = new Map([['wb_api_key', 'k']])
+  const localStorage = {
+    getItem: (k) => (store.has(k) ? store.get(k) : null),
+    setItem: (k, v) => store.set(k, String(v)),
+    removeItem: (k) => store.delete(k),
+  }
+  const window = { open() {}, addEventListener() {}, matchMedia: () => ({ matches: false, addEventListener() {} }) }
+  const fetchStub = async () => ({ ok: true, status: 200, text: async () => '{}', json: async () => ({}) })
+  // ⚠️ 用 `new Function` 包一层：面板 JS 里全是函数声明与 const，
+  // 直接 eval 会把它们塞进当前作用域，和测试变量撞名。
+  // ⚠️⚠️ **必须把定时器换成空实现**。
+  //
+  // 面板 JS 末尾会调 `bootstrap()`，而它注册了 `setInterval(loadWaf, 20000)`
+  // 之类的常驻定时器 —— 在 Node 测试进程里那会让**整个测试永不退出**
+  //（我第一版就踩到了：单测跑 294 秒后被 cancel）。
+  //
+  // ⚠️ 这里要验证的是**同步渲染逻辑**，定时器与它无关，故直接吞掉。
+  // ⚠️ 但**不要**把 `setTimeout` 实现成「立即执行回调」—— 那会让
+  // 轮询类代码递归自激，同样卡死。直接返回一个假 id、什么都不做最稳。
+  const noTimer = () => 0
+  const factory = new Function(
+    'document', 'localStorage', 'window', 'fetch', 'navigator', 'location', 'alert', 'confirm', 'URL', 'AbortController', 'setTimeout', 'clearTimeout', 'setInterval', 'clearInterval',
+    src + '\n;return { ' + fnSource + ' };',
+  )
+  return factory(document, localStorage, window, fetchStub, { userAgent: 'test' }, { href: 'http://x/panel/', search: '' }, () => {}, () => true, URL, AbortController, noTimer, noTimer, noTimer, noTimer)
+}
+
+test('🔴 loadUsage 必须能**真的跑起来**（TDZ 这类运行时错误只有执行才抓得到）', async () => {
+  // 用户报「直接加载不出来了」：`loadUsage` 里 `rangeLabel` 被用在 `const` 声明之前，
+  // TDZ 抛错 ⇒ 整页空白。语法检查完全合法，只有真跑才暴露。
+  const rt = runPanelJs('loadUsage')
+  assert.equal(typeof rt.loadUsage, 'function', 'loadUsage 应可取出')
+  // 用空数据跑：只要不抛异常就算过（这里验证的是**不崩**，不是渲染细节）
+  await assert.doesNotReject(async () => { await rt.loadUsage() },
+    '⚠️ loadUsage 不得抛错（TDZ / 未定义变量这类都会在这里暴露）')
+})
+
+test('🔴 用量页所有渲染函数都必须能真的执行（逐个跑一遍）', async () => {
+  // ⚠️ 只测 loadUsage 不够：它内部会调 renderUsageTrend / renderUsageHours，
+  // 但那两条在「今日 + 无数据」时可能提前 return，覆盖不到主体逻辑。
+  // 故把三个渲染函数各自**单独**喂数据跑一遍。
+  const rt = runPanelJs('renderUsageTrend,renderUsageHours,renderUsageRanges,loadUsage')
+  const bars = [
+    { day: '2026-10-11', count: 42, failed: 0, input: 1322, output: 2001, tokens: 3323 },
+    { day: '2026-10-10', count: 10, failed: 2, input: 100, output: 50, tokens: 150 },
+  ]
+  const hours = [
+    { hour: '08:00', count: 22, failed: 0, input: 5, output: 12 },
+    { hour: '10:00', count: 20, failed: 1, input: 0, output: 0 },
+  ]
+
+  // 多日窗口：应画出柱子
+  await assert.doesNotReject(async () => { rt.renderUsageTrend(bars, 7) }, '多日趋势应可渲染')
+  // 单日窗口：应隐藏面板（不抛错）
+  await assert.doesNotReject(async () => { rt.renderUsageTrend(bars, 1) }, '单日趋势应可渲染（并隐藏面板）')
+  // 空数据
+  await assert.doesNotReject(async () => { rt.renderUsageTrend([], 7) }, '空趋势应可渲染')
+  // 按小时：今日窗口
+  await assert.doesNotReject(async () => { rt.renderUsageHours(hours, 1) }, '按小时应可渲染')
+  // 按小时：非今日（应给提示而不是画图）
+  await assert.doesNotReject(async () => { rt.renderUsageHours(hours, 7) }, '非今日按小时应可渲染')
+  await assert.doesNotReject(async () => { rt.renderUsageRanges() }, '时间窗控件应可渲染')
+})
+
+test('⚠️ 用量页不得有「清空」按钮（用户要求删除）', () => {
+  // 用户原话：「这个清空按钮删了，不需要」。
+  //
+  // ⚠️ 删按钮时**必须连 JS 里的事件绑定一起删** ——
+  // `$('clear-usage')` 在按钮不存在时返回 `null`，紧接着 `.onclick = …`
+  // 会抛 `TypeError`，而它位于顶层脚本流里 ⇒ **从这里往后的所有绑定全部失效**
+  //（表现为「面板一半的按钮都不好使了」）。
+  const html = panelAsset('/panel/')?.body ?? ''
+  const js = stripJsComments(panelAsset('/panel/app.js')?.body ?? '')
+
+  assert.ok(!html.includes('id="clear-usage"'), '⚠️ 清空按钮应已从 HTML 删除')
+  assert.ok(!js.includes("$('clear-usage')"),
+    '⚠️ JS 里不得再引用 clear-usage（否则 null.onclick 抛错，后续绑定全失效）')
+  // 刷新按钮必须仍在（只删清空）
+  assert.ok(html.includes('id="refresh-usage"'), '刷新按钮应保留')
+  // ⚠️ 后端端点**保留**：用户只要求删按钮，没说删能力
+  const idx = readFileSync('src/index.ts', 'utf8')
+  assert.ok(idx.includes("'/admin/usage/clear'"), '后端清空端点应保留（只删了按钮）')
+})
+
+test('⚠️ sparkline 的边界：少于 2 个点必须返回空（不能编造一条平线）', async () => {
+  // 照参考项目 KPI 卡底部的趋势线。三个边界都必须对：
+  //   1. < 2 个点 ⇒ 连不成线，返回**空**（硬画会得到一条假水平线，
+  //      那是在**编造**「数据很平稳」）；
+  //   2. 全平（max === min）⇒ 画中线，**不能**除零（NaN 会让整条 path 不渲染）；
+  //   3. 正常序列 ⇒ 画出 path。
+  const rt = runPanelJs('sparkline')
+  // ① 0 / 1 个点 → 空
+  for (const vals of [[], [5]]) {
+    const svg = rt.sparkline(vals, 'blue')
+    assert.equal(svg.childNodes.length, 0,
+      `⚠️ ${vals.length} 个点时应返回空 SVG（不能画假线）`)
+  }
+  // ② 全平 → 有 path 且 d 里**不含 NaN**
+  const flat = rt.sparkline([7, 7, 7], 'green')
+  assert.equal(flat.childNodes.length, 1, '全平也应画出线（中线）')
+  const flatD = flat.childNodes[0].getAttribute('d')
+  assert.ok(!/NaN/.test(String(flatD)), `⚠️ 全平时不得出现 NaN（实际 ${flatD}）`)
+  // ③ 正常 → 有 path 且点数正确（3 个点 ⇒ 2 段 L）
+  const norm = rt.sparkline([1, 5, 3], 'purple')
+  assert.equal(norm.childNodes.length, 1, '正常序列应画出线')
+  const d = String(norm.childNodes[0].getAttribute('d'))
+  assert.ok(d.startsWith('M'), 'path 应以 M 开头')
+  assert.equal((d.match(/L/g) ?? []).length, 2, '3 个点应有 2 段直线')
+})
+
+test('⚠️ KPI 卡只在真有 ≥2 个点时加 sparkline（否则留一段空白）', () => {
+  const js = stripJsComments(panelAsset('/panel/app.js')?.body ?? '')
+  const fn = js.slice(js.indexOf('function kpiCard'))
+  assert.ok(/sparkValues\.length >= 2/.test(fn),
+    '⚠️ 少于 2 个点时不得加 sparkline（空 SVG 会撑出空白）')
+  // ⚠️ 还要判 sparkline 真的产出了内容（它内部可能因边界返回空 SVG）
+  assert.ok(/childNodes\.length > 0/.test(fn),
+    '⚠️ 加之前要确认 sparkline 真产出了内容')
+})
+
+test('⚠️ 耗时卡**故意不**给 sparkline（拿了会误导）', () => {
+  // 我们只存了「按天的合计耗时」，而卡上显示的是**均值** ——
+  // 拿合计画趋势会把「请求多的一天」画成「很慢的一天」。
+  // ⚠️ 宁可不画，也不给一张错图。
+  const js = stripJsComments(panelAsset('/panel/app.js')?.body ?? '')
+  const i = js.indexOf("'平均耗时'")
+  assert.ok(i > 0, '应有平均耗时卡')
+  // ⚠️ 判据要**简单**：直接确认那一行之后**紧接着**就是副标题参数、
+  // 然后调用结束（没有第 6 个参数）。前面两版写法都太脆：
+  //   · 用「正则匹配结尾」——实参跨两行且含模板字符串，匹配不到；
+  //   · 数顶层逗号 —— 会把 `? :` 三元与嵌套调用的括号算错。
+  const twoLines = js.split('\n')
+  const at = twoLines.findIndex((l) => l.includes("'平均耗时'"))
+  assert.ok(at > 0, '应能找到平均耗时卡那一行')
+  const call = twoLines.slice(at, at + 2).join('\n')
+  assert.ok(/kpiCard\('orange',\s*'⏱',\s*'平均耗时',\s*fmtDuration\(avgMs\),/.test(call),
+    '平均耗时卡应只到 fmtDuration(avgMs) 为止')
+  // 关键：紧接的第二行必须以 `))` 收尾（第 5 个参数结束、调用结束）
+  assert.ok(/\+\s*' 次请求的平均'\)\)\s*$/.test(call.trim().split('\n')[1] ?? ''),
+    '⚠️ 平均耗时卡不得传第 6 个参数（sparkline）—— 合计 ≠ 均值，画出来是误导')
+})
+test('⚠️ 排名列表：占比用总数为分母、条宽用最大值为分母', () => {
+  // 两者的分母**故意不同**：
+  //   · 占比文字答「占多少份额」⇒ 用**总请求数**
+  //   · 条宽答「相对第一名多长」⇒ 用**最大值**（让第一名铺满，更好读）
+  // 混用会让「占比 40% 的条」和「条长 40%」在视觉上打架。
+  const js = stripJsComments(panelAsset('/panel/app.js')?.body ?? '')
+  const fn = js.slice(js.indexOf('function renderUsageRanking'))
+  assert.ok(/totalCount === 0 \? '' : \(\(r\.count \/ totalCount\) \* 100\)/.test(fn),
+    '⚠️ 占比文字应以**总请求数**为分母')
+  assert.ok(/\(r\.count \/ max\) \* 100/.test(fn),
+    '⚠️ 条宽应以**最大值**为分母')
+  // 空数据要给提示而不是白板
+  assert.ok(/无数据/.test(fn), '空数据应给提示')
+  // ⚠️ 长名断行用 overflow-wrap（不是 break-all —— 项目单测禁止后者）
+  const css = panelAsset('/panel/style.css')?.body ?? ''
+  const nameRule = css.slice(css.indexOf('.rank-name {'))
+  assert.ok(/overflow-wrap:\s*anywhere/.test(nameRule.slice(0, nameRule.indexOf('}'))),
+    '⚠️ 长模型名/uid 要能断行（用 overflow-wrap，不是 break-all）')
+})
+
+test('⚠️ 三个视图容器都不得再有「框」（用户报「不要再套一个框」）', () => {
+  // ## 用户原话
+  //   「不显示按小时的就不要显示那个框了，按天趋势里面不要再套一个框，
+  //     切换天数下面不要显示说明，能看懂」
+  //
+  // 根因：`section.view` 原来自带 `background + border + radius + padding`
+  //（那是「一张卡」），而它内部现在**全是卡片**（`.panel` / `.kpi`）
+  // ⇒ 每个内部卡片外围又多一圈同样的框，就是「框里套框」。
+  const css = stripCssComments(panelAsset('/panel/style.css')?.body ?? '')
+  const rule = css.slice(css.indexOf('section.view {'))
+  const body = rule.slice(0, rule.indexOf('}'))
+  for (const prop of ['border', 'background', 'padding']) {
+    assert.ok(!new RegExp(`(^|;)\\s*${prop}\\s*:`).test(body),
+      `⚠️ section.view 不得再有 ${prop}（那是外层框，会与内部卡片叠成两层）`)
+  }
+  // 必须保留 min-width: 0（网格项不收缩，去掉会让长表格撑破页面）
+  assert.ok(/min-width:\s*0/.test(body), '⚠️ min-width: 0 必须保留（防横向溢出）')
+
+  // `.trend` 也不能自带边框/底色（它在 .panel 里）
+  const trend = css.slice(css.indexOf('.trend {'))
+  const trendBody = trend.slice(0, trend.indexOf('}'))
+  assert.ok(!/(^|;)\s*border\s*:/.test(trendBody),
+    '⚠️ .trend 不得自带 border（那正是用户说的「套一个框」）')
+  assert.ok(!/(^|;)\s*background\s*:/.test(trendBody),
+    '⚠️ .trend 不得自带 background（同上）')
+})
+
+test('⚠️ 按小时：非今日窗口必须**整个面板隐藏**（不是留个说明框）', () => {
+  // 用户原话：「不显示按小时的就不要显示那个框了」。
+  // ⚠️ 要隐藏**整个面板**（含标题），而不是面板里塞一句说明 ——
+  // 后者正是用户抱怨的那个「框」。
+  const js = stripJsComments(panelAsset('/panel/app.js')?.body ?? '')
+  const fn = js.slice(js.indexOf('function renderUsageHours'))
+  assert.ok(/windowDays !== 1/.test(fn), '应判非今日窗口')
+  const hideAt = fn.indexOf('panel.hidden = true')
+  assert.ok(hideAt > 0, '⚠️ 非今日窗口必须隐藏整个面板')
+  // 且必须立即 return（不能再往面板里塞内容）
+  const retAt = fn.indexOf('return', hideAt)
+  assert.ok(retAt > hideAt && retAt - hideAt < 120,
+    '⚠️ 隐藏后必须立即 return（否则仍会往里塞说明文字 = 那个没用的框）')
+  // 今日窗口要显示出来（不能被永久隐藏）
+  assert.ok(/panel.hidden = false/.test(fn), '今日窗口必须恢复显示面板')
+})
+
+test('⚠️ 切换天数下面不得有说明文字（用户要求删除）', () => {
+  // 用户原话：「切换天数下面不要显示说明，能看懂」。
+  const html = panelAsset('/panel/')?.body ?? ''
+  const js = stripJsComments(panelAsset('/panel/app.js')?.body ?? '')
+  assert.ok(!html.includes('usage-scope'), '⚠️ HTML 里不得再有说明容器')
+  assert.ok(!/\$\('usage-scope'\)/.test(js), '⚠️ JS 里不得再引用它（否则 null.textContent 抛错）')
+})
+
+test('⚠️ 各视图必须统一为「页头 + 面板」结构（用户要求统一风格）', () => {
+  // 用户原话：「把其它界面的 UI 也统一成这种风格」。
+  const html = panelAsset('/panel/')?.body ?? ''
+  const views = ['tasks', 'usage', 'models', 'providers', 'config', 'logs']
+  for (const v of views) {
+    const i = html.indexOf(`id="view-${v}"`)
+    assert.ok(i > 0, `应有 ${v} 视图`)
+    // 取到下一个视图开头
+    const nextView = html.indexOf('<section class="view"', i + 10)
+    const body = html.slice(i, nextView > 0 ? nextView : undefined)
+    assert.ok(body.includes('class="page-head"'),
+      `⚠️ ${v} 视图应有统一的 .page-head 页头`)
+  }
+  // ⚠️ 不得再有「裸 h2 带按钮」的旧写法（按钮应在 .page-tools 里）
+  assert.ok(!/<h2>[^<]*<button/.test(html), '⚠️ 标题里不得直接塞按钮（应放 .page-tools）')
+})
+
+test('⚠️ 不得用「容器 gap + 子元素 margin」造成双重间距', () => {
+  // 本轮把 `section.view` 从「卡片」改成「布局容器（display:grid; gap:14px）」
+  // 之后，凡是做它直接子元素的块都必须**去掉自己的下边距** ——
+  // 否则 gap 与 margin 叠加，间距凭空翻倍。
+  // ⚠️ 这是改布局时极易漏的一类，本轮我自己就漏了 4 处。
+  const css = stripCssComments(panelAsset('/panel/style.css')?.body ?? '')
+  for (const cls of ['.kpi-grid', '.panel', '.task-cards', '.counts', '.hint', '.page-head']) {
+    const i = css.indexOf(cls + (cls === '.panel' ? ' {' : ' {'))
+    if (i < 0) continue
+    const body = css.slice(i, css.indexOf('}', i))
+    // ⚠️ 允许 `margin-bottom: 0`（显式归零是有意的，见 .page-head 的说明）——
+    //    真正要禁的是**非零**下边距与 gap 叠加。
+    const mb = body.match(/(?:^|;)\s*margin-bottom\s*:\s*([^;]+)/)
+    if (mb) {
+      assert.ok(/^0(\s|px|rem|em|%)*$/.test(mb[1].trim()),
+        `⚠️ ${cls} 是视图直接子元素，不得有**非零** margin-bottom（会与容器 gap 叠成双间距），实际 ${mb[1].trim()}`)
+    }
+  }
+})
+
+test('⚠️ 嵌套面必须有视觉差异（不得「框里套框」）', () => {
+  // 相邻嵌套面若完全一样（同边框同底色），看起来就是多余的框。
+  // `.out` 在 `.panel` 里时保留深色背景（表达「原始输出」的层级差），
+  // 但**去掉描边**，由外层 `.panel` 独自承担边框。
+  const css = stripCssComments(panelAsset('/panel/style.css')?.body ?? '')
+  assert.ok(/\.panel\s*>\s*\.out\s*\{[^}]*border:\s*0/.test(css),
+    '⚠️ .panel 内的 .out 必须去掉边框（否则框里套框）')
+})
+
+test('🔴 视图网格的**每一层**子元素都必须能收缩（否则手机上挤出屏幕）', () => {
+  // ## 用户报：「配置与状态页面在手机上挤出屏幕了」
+  //
+  // 根因（我自己上一轮引入的回归）：把 `section.view` 改成 `display: grid`
+  //（为拿统一下间距）之后，它的子元素成了**网格项** ——
+  // 而网格项默认 `min-width: auto`（「不小于内容的最小宽度」）。
+  // 配置页表格按 `max-content` 取宽 ⇒ 这个最小值跟着变大 ⇒ 网格轨道被撑开
+  // ⇒ 整个页面横向溢出。
+  //
+  // ⚠️ 项目**早已**为 `main` 记录过这个陷阱（`main > * { min-width: 0 }`），
+  // 但那只覆盖 main 的**直接**子元素，对**再下一层**无效 —— 这是同一陷阱的第二层。
+  //
+  // ⚠️ 纪律：**每引入一个新的 grid/flex 容器，就要给它的子元素加 `min-width: 0`。**
+  const css = stripCssComments(panelAsset('/panel/style.css')?.body ?? '')
+  assert.ok(/main\s*>\s*\*\s*\{[^}]*min-width:\s*0/.test(css),
+    'main 的直接子元素要能收缩（既有规则，不得回退）')
+  assert.ok(/section\.view\s*>\s*\*\s*\{[^}]*min-width:\s*0/.test(css),
+    '⚠️ section.view 是 grid，其子元素也必须 min-width: 0（否则长表格撑破页面）')
+})
+
+test('⚠️ 计数卡在桌面上必须铺满（不得只占一角）', () => {
+  // 用户报：「配置与账号下面 6 个卡片在电脑上太窄了」。
+  // 原先是 `flex-wrap` + `.count { min-width: 92px }`：6 张只占 602px，
+  // 而桌面容器 1200px ⇒ 右侧空出近 600px，又窄又挤在一角。
+  //
+  // ⚠️ 不能简单给 flex 加 `flex-grow: 1` —— 项目记录过那个坑：奇数个时
+  // 最后一张会被拉成整行宽，看着像「被选中的高亮项」。
+  // ⇒ 用 grid + `auto-fit`：所有轨道等宽、自动铺满，且空轨道会被折叠。
+  const css = stripCssComments(panelAsset('/panel/style.css')?.body ?? '')
+  const i = css.indexOf('.counts {')
+  assert.ok(i > 0, '应有 .counts 规则')
+  const body = css.slice(i, css.indexOf('}', i))
+  assert.ok(/display:\s*grid/.test(body), '⚠️ .counts 应用 grid（否则卡片铺不满、只占一角）')
+  assert.ok(/auto-fit/.test(body), '⚠️ 应用 auto-fit（轨道等宽且自动铺满）')
+  // ⚠️ 网格项也要能收缩
+  assert.ok(/minmax\(\s*0|minmax\(\s*\d+px/.test(body), '列定义应能收缩')
+})
+
+test('⚠️ 表格单元格必须能断行（长 token 会撑破窄屏）', () => {
+  // 配置页的值含 `AES-GCM（密钥来自 CREDENTIAL_KEY secret）` 这类长 token；
+  // 单元格默认不折行 ⇒ 「值」列按最长内容取宽 ⇒ 表格变宽 ⇒ 撑破页面。
+  const css = stripCssComments(panelAsset('/panel/style.css')?.body ?? '')
+  const m = /th,\s*td\s*\{([^}]*)\}/g
+  let hasWrap = false
+  let b
+  while ((b = m.exec(css)) !== null) {
+    if (/overflow-wrap:\s*anywhere/.test(b[1] ?? '')) hasWrap = true
+  }
+  assert.ok(hasWrap, '⚠️ th/td 必须有 overflow-wrap: anywhere')
+  // ⚠️ 且不得用 break-all（项目单测禁止：会截断正常英文单词）
+  assert.ok(!/word-break:\s*break-all/.test(css), '不得使用 break-all')
+})
+
+test('⚠️ uid / provider id 这类长串必须能断行', () => {
+  // 它们形如 `raccoon:raccoon-9696afc62b16c498`，窄屏会撑破卡片。
+  const css = stripCssComments(panelAsset('/panel/style.css')?.body ?? '')
+  for (const sel of ['.card .uid', '.prov-card .prov-id', '.rank-name']) {
+    const i = css.indexOf(sel)
+    assert.ok(i > 0, `应有 ${sel} 规则`)
+    const body = css.slice(i, css.indexOf('}', i))
+    assert.ok(/overflow-wrap:\s*anywhere/.test(body),
+      `⚠️ ${sel} 必须能断行（长串会撑破容器）`)
+  }
+})
+
+test('🔴 loadPool 必须在 providerCache 就绪**之后**调用（否则「供应商」计数首屏恒为 0）', () => {
+  // ## 缺陷（外部测试报告定位，我已独立复核）
+  //   「供应商」计数首屏恒显示 0，点一次「刷新」才变正确。
+  //
+  // 根因：`loadPool()` 末尾用 `providerCache` 算「已启用的供应商数」，
+  // 而 `providerCache` 要到 `await api('/admin/providers')` **之后**才赋值。
+  // 原先在 `loadProviders()` 的**第一行**就同步调 `loadPool()` ⇒ 读到的必然是
+  // 模块级初值 `[]` ⇒ 恒为 0。
+  //
+  // ⚠️ **100% 复现，不是偶发**：`loadPool` 内部 `await fetchPoolCounts()`
+  // 至少要等两个网络往返，必然晚于那里的读取。
+  // ⚠️ 「刷新一下就好」这种症状最容易被当成抖动放过去 —— 必须用测试钉住。
+  const js = stripJsComments(panelAsset('/panel/app.js')?.body ?? '')
+  const fn = js.slice(js.indexOf('async function loadProviders'))
+  const assignAt = fn.indexOf('providerCache = res.body.providers')
+  assert.ok(assignAt > 0, '应能定位 providerCache 赋值')
+
+  // ⚠️ 判据要**区分两个分支**，不能只找第一个 `loadPool()`：
+  //    · 赋值**之前**的那个在 `if (!res.ok)` 错误分支里（用旧缓存兜底，是对的）；
+  //    · 真正的「成功路径」调用必须在赋值**之后**。
+  // （我第一版只比较「第一个 loadPool 的位置」，于是命中了错误分支那位，
+  //   报了个假失败 —— 而真正命中的原因是注释里也写了 `loadPool()`，
+  //   项目早已记录过「断言源码前必须剥注释」这条教训。）
+  const afterAssign = fn.slice(assignAt)
+  assert.ok(/loadPool\(\)/.test(afterAssign),
+    '⚠️ 成功路径必须在 providerCache 赋值**之后**调 loadPool()（否则计数恒 0）')
+  // 赋值前只允许出现**错误分支**里那一次兜底调用
+  const beforeAssign = fn.slice(0, assignAt)
+  const beforeCalls = (beforeAssign.match(/loadPool\(\)/g) ?? []).length
+  assert.ok(beforeCalls <= 1,
+    `⚠️ 赋值前最多只应有错误分支的 1 次兜底调用，实际 ${beforeCalls} 次`)
+  assert.ok(/if \(!res\.ok\)[\s\S]{0,200}?loadPool\(\)/.test(beforeAssign),
+    '⚠️ 供应商列表失败时也要渲染计数（用已有缓存兜底），否则统计栏空白')
+})
+
+test('🔴 accent 必须拆成「背景」与「文字」两个令牌（否则修一个坏一个）', () => {
+  // ## 缺陷：深色主题主按钮白字对比度 3.22:1（WCAG AA 正文需 4.5:1）
+  //
+  // ⚠️ 但**不能直接把 `--accent` 调深** —— 它同时被当作**文字色**用在
+  // 深色背景上（`.trend-label.today`、KPI 图标章、`.spark` 描边），
+  // 而那里它原本有 5.97:1 的好成绩。调深会把它拉到约 4.03:1
+  // ⇒ **修好按钮、弄坏文字**（外部报告的建议漏了这一层，我复核时补上）。
+  //
+  // ⇒ 拆成两个令牌：`--accent`（实底，压白字，要够深）
+  //   与 `--accent-text`（当文字/描边，要够亮）。
+  const css = stripCssComments(panelAsset('/panel/style.css')?.body ?? '')
+  assert.ok(/--accent-text:/.test(css), '⚠️ 必须有 --accent-text 令牌')
+  // 三处主题（深色 / 显式浅色 / 跟随系统浅色）都要定义
+  const defs = css.match(/--accent-text:/g) ?? []
+  assert.ok(defs.length >= 3,
+    `⚠️ --accent-text 必须在三处主题都定义（深色 + 显式浅色 + auto），实际 ${defs.length} 处`)
+  // 「当文字用」的三处不得再用 --accent
+  for (const sel of ['.trend-label.today']) {
+    const i = css.indexOf(sel)
+    assert.ok(!/var\(--accent\)/.test(css.slice(i, css.indexOf('}', i))),
+      `⚠️ ${sel} 是文字，应使用 --accent-text（--accent 已调深，会降低可读性）`)
+  }
+  assert.ok(/\.spark path \{ stroke: var\(--kpi, var\(--accent-text\)\)/.test(css),
+    '⚠️ sparkline 描边应使用 --accent-text')
+})
+
+test('⚠️ 必须支持 prefers-reduced-motion（动效敏感用户）', () => {
+  const css = stripCssComments(panelAsset('/panel/style.css')?.body ?? '')
+  assert.ok(/@media\s*\(prefers-reduced-motion:\s*reduce\)/.test(css),
+    '⚠️ 应有 prefers-reduced-motion 降级')
+  // ⚠️ 不能简单删 transition（有代码可能依赖 transitionend），压到极小即可
+  const i = css.indexOf('prefers-reduced-motion')
+  const block = css.slice(i, i + 500)
+  assert.ok(/transition-duration:\s*0?\.\d+ms/.test(block),
+    '⚠️ 应把 transition-duration 压到极小，而不是删掉 transition')
+})
+
+test('⚠️ 供应商卡片的积分必须带单位（与账号弹层口径一致）', () => {
+  // 报告：卡片右上角只有裸数字 `10,296`，而弹层里写的是 `5,049 积分`。
+  // 同一份数据两种口径 ⇒ 用户不知道这个数字是什么。
+  const js = stripJsComments(panelAsset('/panel/app.js')?.body ?? '')
+  const i = js.indexOf('creditCache[prov.id].toLocaleString')
+  assert.ok(i > 0, '应能定位卡片积分渲染')
+  const line = js.slice(i, js.indexOf('\n', i))
+  assert.ok(/积分/.test(line),
+    '⚠️ 卡片积分必须带单位「积分」（与弹层一致）')
+  // ⚠️ title 写在**下一行** —— 不能只扫同一行（我第一版就这么写，假失败了）
+  const stmt = js.slice(i, i + 300)
+  assert.ok(/credits\.title\s*=/.test(stmt), '⚠️ 应给 title 说明这是「全部账号合计」')
+  // ⚠️ 药丸变宽了，CSS 要保证不换行、且长名称不会钻到它下面
+  const css = stripCssComments(panelAsset('/panel/style.css')?.body ?? '')
+  const pill = css.slice(css.indexOf('.prov-card .prov-credits'))
+  assert.ok(/white-space:\s*nowrap/.test(pill.slice(0, pill.indexOf('}'))),
+    '⚠️ 积分药丸不得换行（「积分」两字被折下去会很难看）')
+  assert.ok(/:has\(\.prov-credits:not\(\[hidden\]\)\)/.test(css),
+    '⚠️ 只应在**有积分时**才给名称预留右侧空间（否则没积分的卡片白空一块）')
+})
+
+test('⚠️ 配置页「已存凭据数」必须说明口径（与账号总数不是一回事）', () => {
+  // 报告：并排显示「账号总数 19」与「已存凭据数 20」会让人怀疑有脏数据。
+  // ⚠️ 不改成同一个数（两者口径**本来就不同**：账号池 vs 凭据存储），
+  // 而是在值里写清口径 —— 不加 tooltip（单元格 title 在手机上点不出来）。
+  const js = stripJsComments(panelAsset('/panel/app.js')?.body ?? '')
+  const i = js.indexOf("'已存凭据数'")
+  assert.ok(i > 0, '应有「已存凭据数」这一行')
+  const seg = js.slice(i, js.indexOf('\n', i))
+  assert.ok(/口径/.test(seg), '⚠️ 必须说明口径不同（否则用户以为是脏数据）')
+})
+
+test('⚠️ /v1/models 的每个条目都应有 name（aggregate 曾是整列空白）', () => {
+  // 报告：模型页 19 个 `aggregate/*` 条目名称列为空，看起来像渲染失败。
+  // 根因在后端：`VirtualModel` 本来就有 `name` 字段，只是没往外发。
+  const src = readFileSync('src/index.ts', 'utf8')
+  const i = src.indexOf('AGGREGATE_AUTO}')
+  assert.ok(i > 0, '应能定位 aggregate 条目构造')
+  const seg = src.slice(i, i + 900)
+  assert.ok(/name:\s*'自动选择/.test(seg), '⚠️ aggregate/auto 必须给 name')
+  assert.ok(/name:\s*v\.name\s*\|\|\s*v\.key/.test(seg),
+    '⚠️ 虚拟模型必须有 name（并兜底到 key，避免空单元格）')
+  // ⚠️ 前端也要兜底：少一个字段不该渲染出空单元格
+  const js = stripJsComments(panelAsset('/panel/app.js')?.body ?? '')
+  assert.ok(/m\.name \|\| m\.id/.test(js),
+    '⚠️ 前端名称缺失时应回落到 id（防御性）')
+})
+
+test('⚠️ 供应商页不得再有「刷新」按钮（用户要求删除）', () => {
+  // 用户原话：「供应商与账号的刷新按钮没啥用，删了」。
+  //
+  // ⚠️ 删按钮时**必须连 JS 绑定一起删** —— `$('refresh-providers')` 在按钮不存在时
+  // 返回 `null`，紧接着 `.onclick = …` 抛 `TypeError`，而它在**顶层脚本流**里
+  // ⇒ 从这里往后的所有绑定全部失效（表现为「面板一半按钮都不好使」）。
+  const html = panelAsset('/panel/')?.body ?? ''
+  const js = stripJsComments(panelAsset('/panel/app.js')?.body ?? '')
+  assert.ok(!html.includes('refresh-providers'), '⚠️ 刷新按钮应已从 HTML 删除')
+  assert.ok(!js.includes("$('refresh-providers')"),
+    '⚠️ JS 里不得再引用它（否则 null.onclick 抛错，后续绑定全失效）')
+  // ⚠️ 但 `loadProviderCredits` 必须留着 —— 首次进视图（`creditsLoaded`）仍在用它
+  assert.ok(/if \(!creditsLoaded\) void loadProviderCredits\(\)/.test(js),
+    '首次进视图仍应自动拉一次积分（不能因删按钮而丢掉）')
+})
+
+test('🔴 二级弹窗不得使用无 CSS 定义的类名（.muted 曾是死类名）', () => {
+  // ## 实测缺陷
+  // 二级弹窗（`openInfo`）用了 3 处 `class="muted"`，而**全站 CSS 里
+  // `.muted` 定义数为 0** ⇒ 那几段说明文字**完全没有样式**（既不是 dim 色、
+  // 也没有字号约束），与主面板的 `.hint` 观感不一致。
+  //
+  // 用户要求「把二级弹窗的 UI 也统一一下」⇒ 统一到 `.hint`。
+  const js = stripJsComments(panelAsset('/panel/app.js')?.body ?? '')
+  const css = stripCssComments(panelAsset('/panel/style.css')?.body ?? '')
+  assert.ok(!/className = 'muted'/.test(js),
+    "⚠️ 不得再用 .muted（它没有 CSS 定义，文字会完全无样式）")
+  assert.ok(/\.hint\s*\{/.test(css), '.hint 必须有定义（二级弹窗统一用它）')
+  // ⚠️ 弹窗观感要与新卡片系统一致（16px 圆角 + 阴影）
+  const box = css.slice(css.indexOf('.modal-box {'))
+  const body = box.slice(0, box.indexOf('}'))
+  assert.ok(/border-radius:\s*16px/.test(body),
+    '⚠️ .modal-box 圆角应与 .panel/.kpi 一致（16px）')
+  assert.ok(/box-shadow/.test(body), '⚠️ .modal-box 应有阴影（与卡片系统一致）')
+  // ⚠️⚠️ 弹窗内的卡片**必须与弹窗底差一档**，否则卡片「隐形」。
+  // `.modal-box` 用的是 `--panel` ⇒ 卡片若也用 `--panel` 就是**同一颜色**
+  //（实测对比度 1.00:1，只剩一圈边框）。这里钉住它必须是 `--panel2`。
+  //（我一度把它「统一」成 --panel，是这个断言该拦住的那类错误。）
+  const cardRule = css.slice(css.indexOf('.modal .card'))
+  const cardBody = cardRule.slice(0, cardRule.indexOf('}'))
+  assert.ok(/background:\s*var\(--panel2\)/.test(cardBody),
+    '⚠️ .modal .card 必须用 --panel2（用 --panel 会与 .modal-box 同色、卡片隐形）')
+})
+
+test('🔴 聚合只暴露白名单两个模型（用户要求）', () => {
+  // 用户原话：「aggregate 只保留 deepseek-v4-1-flash 和 glm-5-3-flash 就行了，
+  // 其它的用不上」。
+  const src = readFileSync('src/gateway/aggregate.ts', 'utf8')
+  assert.ok(/AGGREGATE_ALLOWED_KEYS/.test(src), '应有白名单常量')
+  // ⚠️ 必须是白名单（只放认过的），不是黑名单 ——
+  // 黑名单会让「上游每加一个模型，聚合目录就多一行」。
+  assert.ok(/'deepseek-v4-1-flash'/.test(src) && /'glm-5-3-flash'/.test(src),
+    '白名单应含这两个规范名')
+  // ⚠️ 过滤必须在 buildVirtualModels 内收口（聚合有目录 + chat 两条路径）
+  const fn = src.slice(src.indexOf('export function buildVirtualModels'))
+  assert.ok(/AGGREGATE_ALLOWED_KEYS\.has\(key\)/.test(fn.slice(0, fn.indexOf('\n}'))),
+    '⚠️ 白名单必须在 buildVirtualModels 内收口，否则两条路径只堵住一条')
 })

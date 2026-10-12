@@ -848,12 +848,3 @@ export function anthropicSseToOpenAiSse(
   )
 }
 
-/** 供上层把 `ProviderError` 里的可读原因塞进错误帧（避免把异常吞成空流）。 */
-export function providerErrorToSseFrame(error: unknown, provider: string): string {
-  const message = error instanceof ProviderError
-    ? error.message
-    : error instanceof Error
-      ? error.message
-      : String(error)
-  return openAiErrorFrame(`${provider}: ${message}`)
-}
