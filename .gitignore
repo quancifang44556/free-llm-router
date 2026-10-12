@@ -13,3 +13,7 @@ real_cred*.json
 
 # ZCode 客户端本地生成的文件（不含敏感内容，但属本地状态）
 .zcodeignore
+
+# 私有本地记忆文档（不提交到 GitHub）
+MEMORY.md
+*memory*.md
