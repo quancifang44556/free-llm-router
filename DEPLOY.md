@@ -5,9 +5,32 @@
 | 项 | 值 |
 |---|---|
 | **对外入口** | <https://<你的域名>> |
-| 备用入口 | <https://workbuddy-gateway.<你的子域>.workers.dev> |
+| **绑定方式** | **Worker Route**（`<你的域名>/*` → `free-llm-router`），**不是** Custom Domain |
+| 备用入口 | <https://free-llm-router.<你的子域>.workers.dev> |
 | 管理面板 | <https://<你的域名>/panel/> |
-| 账号 | 2 个（CN 域），已导入 |
+
+> ⚠️ **绑定方式为什么是 Route 而不是 Custom Domain**（2026-10-11 变更）
+>
+> **Custom Domain 会由 Cloudflare 自己托管那条 DNS 记录** —— 你改不了它，
+> 一改绑定就失效。而 **Route 只按 pattern 匹配，DNS 记录完全归你**。
+>
+> ⇒ 若要做**优选 IP / 优选域名**，**必须**用 Route：优选的前提就是你
+> 自己控制那条 DNS 记录（指到自己选的 IP / CNAME）。
+>
+> ⚠️ 迁移步骤（已执行）：
+> 1. 删除 Custom Domain 绑定
+>    （`DELETE /accounts/{id}/workers/domains/{domain_id}`）
+>    —— ⚠️ 它**会连带删掉 CF 自动建的那条 DNS 记录**，故必须先准备好替代记录，
+>    否则域名会立刻解析失败；
+> 2. 自己加一条 DNS 记录指向 Worker；
+> 3. Route 保持不动（本例中它**早已存在**，无需新建）。
+>
+> ⚠️ **Route 通常要求 DNS 记录是「已代理」（橙云）** ——
+> Worker Route 只在**经过 Cloudflare 网络**的流量上触发。
+> 实测：本域名在特定优选配置下（未开橙云）**仍然可用且返回 200**，
+> 但 `cf-ray` / `server: cloudflare` 仍在，说明流量确实经过 CF。
+> 若你的优选方案改成灰云后 Route 不触发（表现为 404 / 连不上），
+> 那就必须开橙云，或改用 Custom Domain 放弃优选。
 
 > `/` 根路径返回 **401**（需密钥）—— 这是刻意的，避免被扫到。
 > 面板在 `/panel/`，它本身不含敏感数据，但所有数据接口都要 `Authorization`。

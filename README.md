@@ -105,7 +105,8 @@ npm run deploy
 
 ### 完整细节
 
-自定义域绑定、`workers.dev` 兜底、GitHub 自动部署、自检命令、移除服务等，
+**域名绑定方式（Route vs Custom Domain，及优选 IP 的前提）**、`workers.dev` 兜底、
+GitHub 自动部署、自检命令、移除服务等，
 见 [DEPLOY.md](DEPLOY.md)。
 
 ---
@@ -245,7 +246,7 @@ curl -N https://<你的域名>/v1/responses \
 | 文件 | 内容 |
 |---|---|
 | [AGENTS.md](AGENTS.md) | **唯一权威设计文档**：项目目标、可行性、架构、协议事实、实施记录与踩坑。§9 是完整的实施进度与实测发现 |
-| [DEPLOY.md](DEPLOY.md) | 部署细节：自定义域、GitHub 自动部署、自检、移除 |
+| [DEPLOY.md](DEPLOY.md) | 部署细节：域名绑定（Route / Custom Domain / 优选）、GitHub 自动部署、自检、移除 |
 | [probe/](probe/) | 独立的出口 IP / WAF 验证探针（可单独部署复用） |
 
 ## License
