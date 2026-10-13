@@ -192,7 +192,13 @@
   分开的原因：供应商弹窗的标签页与数据都是按 provider 组织的，
   而池计数是**跨供应商**的，硬塞进去会污染那套结构。
 -->
-<div id="info-modal" class="modal" hidden>
+<!--
+  ⚠️ `role="dialog"` + `aria-modal="true"` + `aria-labelledby`：
+  这两个弹窗此前只有**视觉**上的弹窗形态，对辅助技术而言只是普通 `div` ——
+  屏幕阅读器不会宣告「对话框已打开」，也不会报出标题。
+  `aria-labelledby` 指向已有的 `<h3>`（两者都在页面上，无需重复文字）。
+-->
+<div id="info-modal" class="modal" role="dialog" aria-modal="true" aria-labelledby="info-title" hidden>
   <div class="modal-box">
     <div class="modal-head">
       <h3 id="info-title"></h3>
@@ -207,7 +213,7 @@
   </div>
 </div>
 
-<div id="modal" class="modal" hidden>
+<div id="modal" class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title" hidden>
   <div class="modal-box">
     <div class="modal-head">
       <h3 id="modal-title"></h3>

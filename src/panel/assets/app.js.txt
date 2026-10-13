@@ -1826,10 +1826,23 @@ function openProviderManager() {
       row.appendChild(nm)
 
       // 开关：复用现有的 ghost / danger 按钮样式
+      //
+      // ⚠️ 这里**不能**只靠背景色区分「开/关」：两种状态都显示按钮的
+      // **动作名**（「关闭」/「启用」），于是 12 家全启用时就是**排一整列红色
+      // 「关闭」按钮** —— 远看像一整列错误。用户要的是「一眼看出哪家关了」。
+      //
+      // 故补上 `.prov-sw` 的**动作型**视觉：
+      //   · 要关闭（当前启用）→ 中性底色 + 红字，**红色只在文字上**，不成片；
+      //   · 已关闭        → 强调色实心（「启用」是可恢复的推荐动作，不是危险操作）。
+      // ⚠️ 仍然保留 `ghost`/`danger` 基类（项目既有约定是复用它们），
+      // 由 `.prov-sw` 在其上做覆盖 —— 不另造一套按钮体系。
       const off = providerDisabled.has(prov.id)
       const sw = document.createElement('button')
-      sw.className = off ? 'ghost' : 'danger'
+      sw.className = (off ? 'ghost' : 'danger') + ' prov-sw' + (off ? ' is-off' : '')
       sw.textContent = off ? '启用' : '关闭'
+      // ⚠️ 纯图标/单选类控件要暴露状态；这个按钮是「操作型」
+      // （文案已说明会做什么），故用 `title` 补充**当前状态**供悬停查看。
+      sw.title = off ? '该家已关闭（不参与 API），点击重新启用' : '该家已启用，点击关闭'
       sw.onclick = async () => {
         if (!off && !confirm('关闭「' + prov.name + '」？\n\n它的模型会从 /v1/models 消失，'
           + '并且调用它会返回 403。账号与凭据都保留，随时可以重新启用。')) return
@@ -2131,6 +2144,12 @@ function renderModalAdd() {
   const ta = document.createElement('textarea')
   ta.id = 'modal-import-body'; ta.rows = 6
   ta.placeholder = '{"accessToken":"...","uid":"..."}'
+  // ⚠️ 必须给可访问名：这个 textarea **没有 `<label>`**（它由 JS 动态插进弹窗，
+  // 没有稳定的 HTML 位置可挂 label）。没有 `aria-label` 时屏幕阅读器
+  // 只会念「编辑框」，用户不知道要粘什么进去（实测可访问性扫描报出此项）。
+  // `placeholder` **不能**代替可访问名：它一输入内容就消失，且不是所有
+  // 辅助技术都读它。
+  ta.setAttribute('aria-label', '粘贴凭据 JSON')
   box.appendChild(ta)
 
   const imp = document.createElement('button'); imp.textContent = '导入'
@@ -2407,6 +2426,30 @@ $('info-close').onclick = () => { $('info-modal').hidden = true }
 $('info-modal').onclick = (e) => { if (e.target === $('info-modal')) $('info-modal').hidden = true }
 $('modal').onclick = (e) => { if (e.target === $('modal')) $('modal').hidden = true }
 for (const b of document.querySelectorAll('.mtab')) b.onclick = () => switchModalTab(b.dataset.mtab)
+
+/**
+ * Escape 关闭弹窗。
+ *
+ * ## 为什么必须有（实测缺陷）
+ *
+ * 两个弹窗都只支持「点关闭按钮」与「点遮罩」，**不支持 Esc** ——
+ * 而 Esc 是弹窗的**通用约定**（Windows 对话框、macOS、以及所有主流 UI 库
+ * 都支持），键盘使用者会习惯性地按它，然后发现「没反应」，
+ * 只能费力去寻那个小叉。实测确认：按 Esc 后弹窗**仍然打开**。
+ *
+ * ## 实现要点
+ * - 监听 `document`（不是某个弹窗）—— 焦点在弹窗内的任何元素上都要生效；
+ * - 只处理真正可见的弹窗，并把**最上层**的那个关掉（info 弹窗可能叠在
+ *   供应商弹窗之上，先关上面那个才符合直觉）；
+ * - 无弹窗时**不拦截**，不干扰页面其余键盘行为。
+ */
+document.addEventListener('keydown', (e) => {
+  if (e.key !== 'Escape') return
+  const info = $('info-modal')
+  const main = $('modal')
+  if (info && !info.hidden) { info.hidden = true; return }
+  if (main && !main.hidden) { main.hidden = true; return }
+})
 
 // ─────────────────────────── 配置 ───────────────────────────
 

@@ -167,7 +167,7 @@ import {
   TRAE_LOGIN_CALLBACK_PATH,
   TRAE_LOGIN_STATE_TTL_MS,
 } from './providers/trae.js'
-import { panelAsset, securityHeaders } from './panel/index.js'
+import { panelAsset, securityHeaders, loginSecurityHeaders } from './panel/index.js'
 
 // DO 类必须从入口导出，否则 wrangler 找不到绑定目标。
 export { AccountPoolDO, TaskRunnerDO }
@@ -1071,10 +1071,24 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
   // 刻意不用 cookie（cookie 会自动附带，需要额外 CSRF 防护；Authorization 头不会）。
   const asset = panelAsset(path)
   if (asset !== undefined) {
+    // ⚠️ 登录页有自己的 CSP：它含一个真实 `<form>`，而 `form-action 'none'`
+    // 会把提交拦下并在控制台报错（见 `CSP_LOGIN` 的说明）。
+    const isLoginPage = path === '/login' || path === '/login/'
+    const headers = isLoginPage ? loginSecurityHeaders() : securityHeaders()
     return new Response(asset.body, {
       status: 200,
-      headers: { ...securityHeaders(), 'content-type': asset.contentType },
+      headers: { ...headers, 'content-type': asset.contentType },
     })
+  }
+
+  // ── /favicon.ico：显式返回 204 ──
+  //
+  // ⚠️ 浏览器对**每个**页面都会自动请求 `/favicon.ico`（无需 `<link>`）。
+  // 此前这个路径落进了下面的鉴权分支：未登录时返回 **401 JSON** ——
+  // 浏览器控制台凭空多一条错误，而这里本来就没有图标可给。
+  // 返回 204 No Content：合法、无内容、无副作用（不暴露任何信息）。
+  if (path === '/favicon.ico') {
+    return new Response(null, { status: 204, headers: securityHeaders() })
   }
 
   // 老的 /panel 前缀（无尾斜杠）重定向到带斜杠，避免相对路径解析错误

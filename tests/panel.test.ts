@@ -844,7 +844,9 @@ test('⚠️ 供应商管理弹窗必须复用现有 .card 样式（视觉统一
   // ⚠️ 断言前剥注释：我的说明里引用了 `row.draggable` 这类旧写法当反例。
   assert.ok(/row\.className = 'card'/.test(stripJsComments(block)), '管理行应复用 .card 样式')
   // ⚠️ 按钮也复用现有的 ghost / danger（不另立样式）
-  assert.ok(/sw\.className = off \? 'ghost' : 'danger'/.test(block), '开关应复用 ghost/danger')
+  // ⚠️ 断言用「两者都出现」而不是写死整行：2026-10-13 的 UI 审计给它附加了
+  // `prov-sw` 状态类（修「一整列红色关闭按钮」的观感缺陷），整行匹配会**假失败**。
+  assert.ok(/off \? 'ghost' : 'danger'/.test(block), '开关应复用 ghost/danger')
   // 自造的 .prow 样式必须已删除（否则就是两套风格）
   assert.ok(!/\.prow\b/.test(css), '⚠️ 不得残留自造的 .prow 样式')
 })
@@ -1255,6 +1257,10 @@ function runPanelJs(fnSource) {
     createElementNS: (_ns, tag) => makeEl(tag),
     querySelectorAll: () => [],
     querySelector: () => null,
+    // ⚠️ 面板用 `document.addEventListener` 注册全局 Escape 关闭弹窗 ——
+    // 桩必须实现它，否则 `runPanelJs` 一加载就抛错（实测踩到）。
+    addEventListener() {},
+    removeEventListener() {},
     documentElement: makeEl('html'),
     importNode: (n) => n,
   }
@@ -1759,4 +1765,128 @@ test('🔴 聚合只暴露白名单两个模型（用户要求）', () => {
   const fn = src.slice(src.indexOf('export function buildVirtualModels'))
   assert.ok(/AGGREGATE_ALLOWED_KEYS\.has\(key\)/.test(fn.slice(0, fn.indexOf('\n}'))),
     '⚠️ 白名单必须在 buildVirtualModels 内收口，否则两条路径只堵住一条')
+})
+
+// ─────────────── 2026-10-13 面板 UI 审计修复 ───────────────
+//
+// 下面 5 条对应一次「用真实浏览器（Firefox + WebDriver BiDi）全面测试面板」
+// 后发现的缺陷。每条都先复现、后修复，断言用于防回归。
+
+test('🔴 .cap.off（不支持的能力标签）必须达 WCAG AA 对比度', () => {
+  // 实测（沿祖先链合成真实背景后计算）：
+  //   深色 #6b7280 → 3.6:1、浅色 #8a93a3 → 3.1:1，**都不达正文 4.5:1**。
+  // 这两个值看着「低调」，实则把「这家不支持签到」这条**有用信息**
+  // 变得难以辨认 —— 而它正是用户判断能力差异的唯一依据。
+  const css = panelAsset('/panel/style.css')?.body ?? ''
+  // 基础规则必须走 --dim（两套主题下都满足对比度，且天然弱于 .cap.on）
+  const i = css.indexOf('.cap.off')
+  const rule = css.slice(i, css.indexOf('}', i))
+  assert.ok(/color:\s*var\(--dim\)/.test(rule),
+    '⚠️ .cap.off 必须用 var(--dim)；硬编码灰值实测不达标')
+  // ⚠️ 不得再有硬编码的浅色覆盖（那正是原先 3.1:1 的来源）
+  assert.ok(!/\.cap\.off\s*\{\s*color:\s*#8a93a3/.test(css),
+    '⚠️ 应已删除浅色下不达标的 #8a93a3 覆盖')
+  assert.ok(!/\.cap\.off\s*\{\s*color:\s*#6b7280/.test(css),
+    '⚠️ 应已删除深色下不达标的 #6b7280')
+  // 仍需保留删除线作为第二重「不支持」信号
+  assert.ok(/line-through/.test(rule), '应保留删除线')
+})
+
+test('🔴 两个弹窗必须具备 role="dialog" + aria-modal（否则读屏不宣告）', () => {
+  // 实测：弹窗此前在无障碍树里只是普通 div，屏幕阅读器不会宣告对话框打开。
+  const html = panelAsset('/panel/')?.body ?? ''
+  for (const [id, titleId] of [['modal', 'modal-title'], ['info-modal', 'info-title']]) {
+    const tag = html.slice(html.indexOf(`id="${id}"`))
+    const el = tag.slice(0, tag.indexOf('>'))
+    assert.ok(/role="dialog"/.test(el), `#${id} 应有 role="dialog"`)
+    assert.ok(/aria-modal="true"/.test(el), `#${id} 应有 aria-modal="true"`)
+    assert.ok(new RegExp(`aria-labelledby="${titleId}"`).test(el),
+      `#${id} 应用已有标题元素作可访问名`)
+  }
+})
+
+test('🔴 弹窗必须支持 Escape 关闭（实测此前不支持）', () => {
+  const js = stripJsComments(panelAsset('/panel/app.js')?.body ?? '')
+  assert.ok(/addEventListener\('keydown'/.test(js), '应监听 keydown')
+  assert.ok(/e\.key\s*!==\s*'Escape'/.test(js) || /'Escape'/.test(js), '应处理 Escape')
+  // ⚠️ 必须两个弹窗都能关：先关最上层的 info，再关主弹窗。
+  const i = js.indexOf("addEventListener('keydown'")
+  const block = js.slice(i, i + 600)
+  assert.ok(/info[\s\S]*hidden\s*=\s*true/.test(block), 'Escape 应能关信息弹窗')
+  assert.ok(/main[\s\S]*hidden\s*=\s*true/.test(block), 'Escape 应能关供应商弹窗')
+})
+
+test('🔴 动态创建的 textarea 必须有 aria-label（无 label 时读屏只念「编辑框」）', () => {
+  const js = stripJsComments(panelAsset('/panel/app.js')?.body ?? '')
+  assert.ok(/ta\.setAttribute\('aria-label'/.test(js),
+    '⚠️ #modal-import-body 是 JS 动态插入的，没有 <label>，必须给 aria-label')
+})
+
+test('⚠️ 供应商开关不得做成「一整列红色关闭按钮」（观感像全是错误）', () => {
+  // 实测截图：12 家全启用时，弹窗里是一整列红色实心「关闭」，
+  // 远看像整屏错误告警；而真正需要一眼看出的「哪家关了」反被淹没。
+  const js = panelAsset('/panel/app.js')?.body ?? ''
+  const css = panelAsset('/panel/style.css')?.body ?? ''
+  // ① 仍复用既有按钮体系（项目约定），并额外挂状态类
+  assert.ok(/sw\.className = \(off \? 'ghost' : 'danger'\) \+ ' prov-sw'/.test(js),
+    '开关应复用 ghost/danger 并附加 prov-sw')
+  assert.ok(/is-off/.test(js), '应区分已关闭状态')
+  // ② 关闭是「可逆」的恢复动作，不该用危险色铺满
+  const i = css.indexOf('button.prov-sw')
+  assert.ok(i > 0, '应有 button.prov-sw 规则')
+  const rule = css.slice(i, css.indexOf('\n}', i))
+  assert.ok(/background:\s*transparent/.test(rule),
+    '⚠️ 已启用态的「关闭」按钮不得用实心危险色')
+  assert.ok(/color:\s*var\(--err\)/.test(rule), '红色应只落在文字上')
+  assert.ok(/\.prov-sw\.is-off[\s\S]{0,200}background:\s*var\(--accent\)/.test(css),
+    '⚠️ 已关闭态应高对比（强调色实心），让「这家没在跑」一眼可见')
+})
+
+test('⚠️ /favicon.ico 必须显式处理（否则每次访问多一条 401）', () => {
+  // 浏览器对每个页面都会自动请求 /favicon.ico（无需 <link>）。
+  // 此前它落进鉴权分支：未登录时返回 401 JSON ⇒ 控制台凭空多一条错误。
+  const src = readFileSync('src/index.ts', 'utf8')
+  assert.ok(/path === '\/favicon\.ico'/.test(src), '应显式处理 /favicon.ico')
+  const i = src.indexOf("path === '/favicon.ico'")
+  const block = src.slice(i, i + 200)
+  assert.ok(/204/.test(block), '应返回 204 No Content')
+  // ⚠️ 必须在**鉴权之前**：否则又变回 401（这正是要修的东西）
+  const authIdx = src.indexOf('if (!(await authorized(request, env)))')
+  assert.ok(authIdx > 0 && i < authIdx, '⚠️ favicon 处理必须在鉴权之前')
+})
+
+test('🔴 登录页必须允许 form-action self（form-action none 会拦掉登录表单）', () => {
+  // 实测（Firefox + WebDriver BiDi 审计）：点「登录」后固定报一条
+  // `blocked ... (form-action) at /login because it violates "form-action 'none'"`。
+  // 功能上「碰巧能用」（login.js 在 onsubmit 里 preventDefault 后走 fetch），
+  // 但这是**真实上报的错误**，且把全站 form-action 防线退化成噪音。
+  const src = readFileSync('src/panel/index.ts', 'utf8')
+  assert.ok(/export const CSP_LOGIN/.test(src), '应有登录页专用 CSP')
+  // ⚠️ 必须是 'self'（不是 *、不是 none）：仍要阻止**提交到外部域名**
+  const i = src.indexOf('export const CSP_LOGIN')
+  const block = src.slice(i, i + 400)
+  assert.ok(/form-action 'self'/.test(block), "⚠️ 登录页应 form-action 'self'（保留「禁外部提交」）")
+  // 面板页（无表单）仍须保持 'none' —— 不能为了修登录页把面板也放宽
+  const mainCsp = src.slice(src.indexOf('export const CSP ='), src.indexOf('export const CSP_LOGIN'))
+  assert.ok(/form-action 'none'/.test(mainCsp), '⚠️ 面板页仍是 form-action none')
+})
+
+test('🔴 登录页必须被路由到 CSP_LOGIN（否则改了 CSP 也不生效）', () => {
+  // ⚠️ 光定义 `CSP_LOGIN` 不够：`/login` 与 `/panel` 走的是同一条静态资源分支，
+  // 忘了分流就等于没修（这类「定义了但没接线」在本项目出现过多次）。
+  const src = readFileSync('src/index.ts', 'utf8')
+  const i = src.indexOf('const asset = panelAsset(path)')
+  const block = src.slice(i, i + 700)
+  assert.ok(/isLoginPage/.test(block), '⚠️ 资源分支必须区分登录页')
+  assert.ok(/loginSecurityHeaders\(\)/.test(block), '⚠️ 登录页应使用 loginSecurityHeaders()')
+  assert.ok(/path === '\/login'/.test(block), '登录页判定应含 /login')
+})
+
+test('🔴 所有安全头必须齐全（登录页也不例外）', () => {
+  // 登录页同样不能被 iframe 嵌套、不能泄露 Referer。
+  const src = readFileSync('src/panel/index.ts', 'utf8')
+  const i = src.indexOf('export function loginSecurityHeaders')
+  const block = src.slice(i, i + 300)
+  assert.ok(/\.\.\.securityHeaders\(\)/.test(block),
+    '⚠️ 登录页头应基于 securityHeaders() 展开（只覆盖 CSP），否则容易漏头')
 })

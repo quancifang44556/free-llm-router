@@ -583,7 +583,19 @@ html[data-theme='light'] .trend-track { background: #e8ebf0; }
 .prov-card .caps { display: flex; flex-wrap: wrap; gap: 4px; }
 .cap { font-size: 10px; padding: 1px 6px; border-radius: 999px; border: 1px solid var(--line); color: var(--dim); }
 .cap.on { color: var(--ok); border-color: #1e5b3a; }
-.cap.off { color: #6b7280; text-decoration: line-through; }
+/*
+ * ⚠️ 未具备的能力标签的颜色**必须能在两种主题下都读清**。
+ *
+ * 实测（axe 式对比度扫描，沿祖先链合成真实背景）：
+ * 原先深色 `#6b7280`（3.6:1）、浅色 `#8a93a3`（3.1:1）**都不达 WCAG AA 正文 4.5:1**。
+ * 这两个值看着「低调」，实则是把「这家不支持签到」这条**有用信息**
+ * 变得难以辨认 —— 而 `.cap.off` 恰恰是用户判断能力差异的唯一依据。
+ *
+ * ⚠️ 仍要**明显弱于** `.cap.on`（视觉层级不能丢）：故用 `var(--dim)`，
+ * 它在两套主题里都是「次要文字」令牌，天然满足对比度且天然比强调色弱。
+ * 保留 `line-through` 作为第二重「不支持」的视觉信号。
+ */
+.cap.off { color: var(--dim); text-decoration: line-through; }
 
 /* ─────────── 动效降级（`prefers-reduced-motion`） ─────────── */
 /*
@@ -713,7 +725,9 @@ html[data-theme='light'] .credits-pill { background: #e7f5ec; border-color: #86c
 html[data-theme='light'] .banner { background: #fdecec; border-color: #f0a0a0; color: #7f1d1d; }
 html[data-theme='light'] .banner button { border-color: #d99; color: #7f1d1d; }
 html[data-theme='light'] .notice { background: #eef4ff; border-color: #b9d0f5; }
-html[data-theme='light'] .cap.off { color: #8a93a3; }
+/* ⚠️ 与上方 `.cap.off` 的浅色覆盖**成对**（见该规则说明）。
+ * 浅色下 `--dim` 已是 #5c6675（5.4:1），无需再单独指定颜色；
+ * 这里只删掉原先不达标的硬编码覆盖。 */
 html[data-theme='light'] .model-row.off .mid,
 html[data-theme='light'] .model-row.off .mname { color: #9aa3b2; }
 
@@ -780,7 +794,9 @@ html[data-theme='light'] .prov-card .prov-credits { background: #e7f5ec; border-
   html:not([data-theme]) .prov-credits { background: #e7f5ec; border-color: #86c79a; }
   html:not([data-theme]) .banner { background: #fdecec; border-color: #f0a0a0; color: #7f1d1d; }
   html:not([data-theme]) .notice { background: #eef4ff; border-color: #b9d0f5; }
-  html:not([data-theme]) .cap.off { color: #8a93a3; }
+  /* ⚠️ 与 `html[data-theme='light'] .cap.off` 成对：跟随系统（auto）模式
+   * 走的是这段 `prefers-color-scheme`，是**独立维护的一套**。
+   * 浅色下 `--dim` 已是 #5c6675，无需硬编码。 */
   /* ⚠️ 与上面 `html[data-theme='light'] .rank-track` 成对 —— 漏一个就是「某种模式下出错」 */
   html:not([data-theme]) .rank-track { background: #e8ebf0; }
   html:not([data-theme]) .rank-idx { background: #eef1f5; }
@@ -1017,6 +1033,37 @@ main > * { min-width: 0; }
 }
 
 /* ── 供应商管理（计数块样式复用 .count，这里只加拖动手柄与已关闭标记）── */
+
+/*
+ * 「启用 / 关闭」开关按钮。
+ *
+ * ## 为什么需要它（实测的观感缺陷）
+ *
+ * 按钮文案是**动作名**（当前启用 → 显示「关闭」），于是 12 家全部启用时，
+ * 弹窗里就是一整列**红色实心「关闭」** —— 远看像一整屏错误告警，
+ * 而实际上一切正常。真正需要被一眼看出的「哪家被关了」反而被淹没。
+ *
+ * 故把颜色语义反过来用在**状态**上：
+ *   · 已启用（动作=关闭，可逆）→ 中性底色 + 红字，红色只落在文字上，不成片；
+ *   · 已关闭（动作=启用）→ **强调色实心**，因为「这家现在没在跑」才是异常态，
+ *     它需要最高对比度来被发现（同时「启用」本身是安全的恢复动作）。
+ *
+ * ⚠️ 仍然是 `ghost`/`danger` 按钮（沿用项目既有体系），这里只做覆盖。
+ */
+button.prov-sw {
+  flex: none;
+  background: transparent; border: 1px solid var(--line); color: var(--err);
+  padding: 4px 12px; font-size: 12px;
+}
+button.prov-sw.is-off {
+  background: var(--accent); border-color: var(--accent); color: #fff;
+  font-weight: 600;
+}
+/* ⚠️ hover 的 `filter: brightness(1.12)` 对**透明底**的按钮几乎无效
+ * （没有底色可提亮），故给已启用态一个明确的悬停回馈。 */
+button.prov-sw:hover { background: var(--panel2); }
+button.prov-sw.is-off:hover { background: var(--accent); filter: brightness(1.12); }
+html[data-theme='light'] button.prov-sw { background: #ffffff; }
 
 /*
  * 拖动排序手柄。

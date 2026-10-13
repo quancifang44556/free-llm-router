@@ -48,7 +48,19 @@ import loginJs from './assets/login.js.txt'
  * - `style-src 'self' 'unsafe-inline'`：允许内联样式属性（**不会导致脚本执行**）；
  * - `connect-src 'self'`：前端 fetch 只能打本服务（防把密钥发去外部域）；
  * - `frame-ancestors 'none'`：禁止被 iframe 嵌套（防点击劫持）；
- * - `base-uri 'none'`：禁止注入 `<base>` 改写相对路径。
+ * - `base-uri 'none'`：禁止注入 `<base>` 改写相对路径；
+ * - `form-action 'none'`：**仅用于不含表单的页面**（面板 app.js 全用 fetch，没有 `<form>`）。
+ *
+ * ⚠️⚠️ **登录页必须用另一套 CSP**（见 `CSP_LOGIN`）——
+ * `/login` 有一个真实的 `<form>`，而 `form-action 'none'` 会把它**拦掉**：
+ * 浏览器每提交一次都在控制台报一条 CSP 违规。实测（Firefox + BiDi 审计）：
+ * 点「登录」后固定出现
+ * `blocked ... (form-action) at /login because it violates "form-action 'none'"`。
+ *
+ * 功能上它「碰巧能用」——因为 `login.js` 在 `onsubmit` 里
+ * `e.preventDefault()` 后用 fetch 自己发请求，表单从未真的导航。
+ * 但这是一条**真实上报的错误**，且把「全站 form-action:none」
+ * 这个真实防线退化成了噪音：真正的表单劫持会被淹没。
  */
 export const CSP =
   "default-src 'none'; " +
@@ -57,6 +69,28 @@ export const CSP =
   "connect-src 'self'; " +
   "img-src 'self' data:; " +
   "form-action 'none'; " +
+  "frame-ancestors 'none'; " +
+  "base-uri 'none'"
+
+/**
+ * 登录页专用的 CSP：与 `CSP` 只差 `form-action`。
+ *
+ * ## 为什么不能简单地去掉 `form-action`（而要让登录页显式允许）
+ *
+ * 登录页确实会把表单提交到**自己的源** —— 即使 JS 已 `preventDefault()`，
+ * 声明 `form-action 'self'` 也能保证「即便 JS 挂了/被阻止，表单也不可能
+ * 提交到外部域名」（那等于把密钥送到别人服务器）。
+ *
+ * ⚠️ 用 `'self'` 而**不是**放开成 `*`：前者保留了「禁外部提交」这个
+ * 真正要防的东西，只是把边界从「完全不能提交」放宽到「只能提交给自己」。
+ */
+export const CSP_LOGIN =
+  "default-src 'none'; " +
+  "script-src 'self'; " +
+  "style-src 'self' 'unsafe-inline'; " +
+  "connect-src 'self'; " +
+  "img-src 'self' data:; " +
+  "form-action 'self'; " +
   "frame-ancestors 'none'; " +
   "base-uri 'none'"
 
@@ -69,6 +103,16 @@ export function securityHeaders(): Record<string, string> {
     'referrer-policy': 'no-referrer',
     'cache-control': 'no-store',
   }
+}
+
+/**
+ * 登录页的安全头（与 `securityHeaders()` 只差 CSP）。
+ *
+ * ⚠️ 其余头（nosniff / frame-ancestors / referrer-policy / no-store）
+ * 必须完全一致 —— 登录页同样不能被嵌套、不能泄露 Referer。
+ */
+export function loginSecurityHeaders(): Record<string, string> {
+  return { ...securityHeaders(), 'content-security-policy': CSP_LOGIN }
 }
 
 /** 面板静态资源路由表（路径 → 内容与类型）。 */
