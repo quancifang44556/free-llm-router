@@ -172,6 +172,14 @@ export interface PickResult {
 }
 
 /** 账号池的对外 RPC 面（Worker 通过 stub 调用）。 */
+export interface RoutingConfig {
+  strategy: 'expiry' | 'roundrobin' | 'random'
+  maxRetries: number
+  softCooldownSeconds: number
+  autoTaskCron: boolean
+  autoRefreshCredential: boolean
+}
+
 export class AccountPoolDO extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env)
@@ -421,6 +429,32 @@ export class AccountPoolDO extends DurableObject<Env> {
     })
   }
 
+  /** 获取系统调度与路由配置。 */
+  async getRoutingConfig(): Promise<RoutingConfig> {
+    const raw = await this.ctx.storage.get<Partial<RoutingConfig>>('systemRoutingConfig')
+    return {
+      strategy: raw?.strategy === 'roundrobin' || raw?.strategy === 'random' ? raw.strategy : 'expiry',
+      maxRetries: typeof raw?.maxRetries === 'number' && raw.maxRetries >= 0 && raw.maxRetries <= 10 ? raw.maxRetries : 3,
+      softCooldownSeconds: typeof raw?.softCooldownSeconds === 'number' && raw.softCooldownSeconds >= 10 && raw.softCooldownSeconds <= 3600 ? raw.softCooldownSeconds : 60,
+      autoTaskCron: raw?.autoTaskCron !== false,
+      autoRefreshCredential: raw?.autoRefreshCredential !== false,
+    }
+  }
+
+  /** 更新系统调度与路由配置。 */
+  async setRoutingConfig(input: Partial<RoutingConfig>): Promise<RoutingConfig> {
+    const cur = await this.getRoutingConfig()
+    const next: RoutingConfig = {
+      strategy: input.strategy === 'roundrobin' || input.strategy === 'random' || input.strategy === 'expiry' ? input.strategy : cur.strategy,
+      maxRetries: typeof input.maxRetries === 'number' && input.maxRetries >= 0 && input.maxRetries <= 10 ? input.maxRetries : cur.maxRetries,
+      softCooldownSeconds: typeof input.softCooldownSeconds === 'number' && input.softCooldownSeconds >= 10 && input.softCooldownSeconds <= 3600 ? input.softCooldownSeconds : cur.softCooldownSeconds,
+      autoTaskCron: typeof input.autoTaskCron === 'boolean' ? input.autoTaskCron : cur.autoTaskCron,
+      autoRefreshCredential: typeof input.autoRefreshCredential === 'boolean' ? input.autoRefreshCredential : cur.autoRefreshCredential,
+    }
+    await this.ctx.storage.put('systemRoutingConfig', next)
+    return next
+  }
+
   /** 账号池计数摘要（供 `/healthz` 与面板）。 */
   async counts(realm: string, now: number): Promise<{
     total: number
@@ -524,7 +558,8 @@ export class AccountPoolDO extends DurableObject<Env> {
           state.until = input.resetAt
         } else if (!isActive(state.until, now)) {
           state.softStreak += 1
-          const backoff = Math.min(600_000 * 2 ** (state.softStreak - 1), 2 * 60 * 60 * 1000)
+          // 起步冷却从 10 分钟缩短至 60 秒（1 分钟），对齐上游「Wait about a minute」真实提示，避免单次超频连坐 10 分钟
+          const backoff = Math.min(60_000 * 2 ** (state.softStreak - 1), 30 * 60 * 1000)
           state.until = now + backoff
         }
         // ⚠️ 「已在冷却中」时**不推进不延长**（Go 侧 `cooldown.go:321`）——

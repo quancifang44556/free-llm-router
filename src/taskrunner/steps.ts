@@ -31,6 +31,8 @@ export interface TaskStep {
 /** 一次任务运行的持久化状态。 */
 export interface RunState {
   uid: string
+  /** 任务计划名称（如 daily, growth, checkin）。 */
+  plan?: string
   /** 待执行的步骤队列（先进先出）。 */
   queue: TaskStep[]
   /** 已完成步骤的摘要（用于回报与去重）。 */

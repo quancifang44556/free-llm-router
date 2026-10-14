@@ -45,6 +45,44 @@ import { splitModelName, type ProviderCredential } from '../providers/types.js'
 import type { LoginCredential } from '../upstream/auth.js'
 import type { AccountPoolDO } from '../pool/AccountPoolDO.js'
 
+/**
+ * 将 API 请求摘要记录到日志环形缓冲（供管理面板「日志」Tab 实时展示）。
+ */
+export function recordLog(
+  pool: DurableObjectStub<AccountPoolDO>,
+  entry: {
+    type?: 'api' | 'task' | 'auth' | 'error'
+    model: string
+    provider: string
+    uid: string
+    status: number
+    durationMs: number
+    tokens?: { input: number; output: number; total: number }
+    stream?: boolean
+    error?: string
+  },
+  ctx?: ExecutionContext,
+): void {
+  const logItem = {
+    id: Math.random().toString(36).slice(2, 10),
+    time: Date.now(),
+    type: entry.type ?? (entry.status >= 400 ? 'error' : 'api'),
+    model: entry.model,
+    provider: entry.provider,
+    uid: entry.uid,
+    status: entry.status,
+    durationMs: entry.durationMs,
+    tokens: entry.tokens ?? { input: 0, output: 0, total: 0 },
+    stream: entry.stream ?? false,
+    ...(entry.error ? { error: entry.error } : {}),
+  }
+  const task = pool.appendLog(logItem).catch((err: unknown) => {
+    console.error('[log] 记录请求日志失败：', err instanceof Error ? err.message : String(err))
+  })
+  if (ctx !== undefined) ctx.waitUntil(task)
+  else void task
+}
+
 /** 单次请求最多换号次数（Go 侧 `MaxRotate` 默认 3）。 */
 export const MAX_ROTATE = 3
 
@@ -657,6 +695,21 @@ export async function handleChatCompletions(
           // ⚠️ 必须 waitUntil：否则响应流结束的瞬间这个 promise 会被取消
           if (ctx !== undefined) ctx.waitUntil(task)
           else void task
+
+          recordLog(
+            pool,
+            {
+              type: 'api',
+              model: `buddy/${model}`,
+              provider: 'buddy',
+              uid: candidate.uid,
+              status: 200,
+              durationMs: Date.now() - startedAt,
+              tokens: { input: usage?.input ?? 0, output: usage?.output ?? 0, total: (usage?.input ?? 0) + (usage?.output ?? 0) },
+              stream: wantsStream,
+            },
+            ctx,
+          )
         },
         onError: (message) => {
           // 流**内**错误：无法改 HTTP 状态码了，但要记账
@@ -674,6 +727,21 @@ export async function handleChatCompletions(
               reason: message.slice(0, 200),
             })
             .catch(() => {})
+
+          recordLog(
+            pool,
+            {
+              type: 'error',
+              model: `buddy/${model}`,
+              provider: 'buddy',
+              uid: candidate.uid,
+              status: 502,
+              durationMs: Date.now() - startedAt,
+              error: message.slice(0, 200),
+              stream: wantsStream,
+            },
+            ctx,
+          )
         },
       }, wantsStream ? undefined : { model }),
     }
@@ -1026,6 +1094,20 @@ async function handleProviderChat(input: {
                     .applyFailure({ uid: picked.uid, kind: 'breaker', now: Date.now(), reason: m.slice(0, 200) })
                     .catch(() => {})
                   if (ctx !== undefined) ctx.waitUntil(t)
+                  recordLog(
+                    pool,
+                    {
+                      type: 'error',
+                      model: `${providerId}/${model}`,
+                      provider: providerId,
+                      uid: picked.uid,
+                      status: 502,
+                      durationMs: Date.now() - startedAt2,
+                      error: m.slice(0, 200),
+                      stream: wantsStream,
+                    },
+                    ctx,
+                  )
                 },
                 onFinish: (usage) => {
                   const t = pool
@@ -1036,6 +1118,20 @@ async function handleProviderChat(input: {
                     })
                     .catch(() => {})
                   if (ctx !== undefined) ctx.waitUntil(t)
+                  recordLog(
+                    pool,
+                    {
+                      type: 'api',
+                      model: `${providerId}/${model}`,
+                      provider: providerId,
+                      uid: picked.uid,
+                      status: 200,
+                      durationMs: Date.now() - startedAt2,
+                      tokens: { input: usage?.input ?? 0, output: usage?.output ?? 0, total: (usage?.input ?? 0) + (usage?.output ?? 0) },
+                      stream: wantsStream,
+                    },
+                    ctx,
+                  )
                 },
               }, wantsStream ? undefined : { model }),
             }
@@ -1102,6 +1198,20 @@ async function handleProviderChat(input: {
                     })
                     .catch(() => {})
                   if (ctx !== undefined) ctx.waitUntil(t)
+                  recordLog(
+                    pool,
+                    {
+                      type: 'error',
+                      model: `${providerId}/${model}`,
+                      provider: providerId,
+                      uid: picked.uid,
+                      status: 502,
+                      durationMs: Date.now() - startedAt2,
+                      error: message.slice(0, 200),
+                      stream: wantsStream,
+                    },
+                    ctx,
+                  )
                 },
                 onFinish: (usage) => {
                   const t = pool
@@ -1112,6 +1222,20 @@ async function handleProviderChat(input: {
                     })
                     .catch(() => {})
                   if (ctx !== undefined) ctx.waitUntil(t)
+                  recordLog(
+                    pool,
+                    {
+                      type: 'api',
+                      model: `${providerId}/${model}`,
+                      provider: providerId,
+                      uid: picked.uid,
+                      status: 200,
+                      durationMs: Date.now() - startedAt2,
+                      tokens: { input: usage?.input ?? 0, output: usage?.output ?? 0, total: (usage?.input ?? 0) + (usage?.output ?? 0) },
+                      stream: wantsStream,
+                    },
+                    ctx,
+                  )
                 },
               }, wantsStream ? undefined : { model }),
             }
@@ -1219,6 +1343,20 @@ async function handleProviderChat(input: {
             })
             .catch(() => {})
           if (ctx !== undefined) ctx.waitUntil(t)
+          recordLog(
+            pool,
+            {
+              type: 'error',
+              model: `${providerId}/${model}`,
+              provider: providerId,
+              uid: picked.uid,
+              status: 502,
+              durationMs: Date.now() - startedAt,
+              error: message.slice(0, 200),
+              stream: wantsStream,
+            },
+            ctx,
+          )
         },
         onFinish: (usage) => {
           const record = {
@@ -1236,6 +1374,21 @@ async function handleProviderChat(input: {
           })
           if (ctx !== undefined) ctx.waitUntil(t)
           else void t
+
+          recordLog(
+            pool,
+            {
+              type: 'api',
+              model: `${providerId}/${model}`,
+              provider: providerId,
+              uid: picked.uid,
+              status: 200,
+              durationMs: Date.now() - startedAt,
+              tokens: { input: usage?.input ?? 0, output: usage?.output ?? 0, total: (usage?.input ?? 0) + (usage?.output ?? 0) },
+              stream: wantsStream,
+            },
+            ctx,
+          )
         },
       }, wantsStream ? undefined : { model }),
     }

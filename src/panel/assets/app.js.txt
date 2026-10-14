@@ -63,6 +63,40 @@ function show(id, value) {
   el.textContent = JSON.stringify(value, null, 2)
 }
 
+/** 动态 HUD 提示（Apple Dynamic Island 极简悬浮胶囊）。 */
+function showToast(message, type = 'info') {
+  const toast = $('toast')
+  if (!toast) return
+  toast.textContent = message
+  toast.className = 'toast ' + type
+  toast.hidden = false
+  if (toast._timer) clearTimeout(toast._timer)
+  toast._timer = setTimeout(() => {
+    toast.hidden = true
+  }, 2200)
+}
+
+/** 一键复制文本到剪贴板，带翠绿 HUD 反馈。 */
+async function copyText(text, successMsg = '已复制到剪贴板') {
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(text)
+    } else {
+      const ta = document.createElement('textarea')
+      ta.value = text
+      ta.style.position = 'fixed'
+      ta.style.opacity = '0'
+      document.body.appendChild(ta)
+      ta.select()
+      document.execCommand('copy')
+      document.body.removeChild(ta)
+    }
+    showToast(successMsg, 'ok')
+  } catch {
+    showToast('复制失败，请手动长按复制', 'err')
+  }
+}
+
 /** 清空元素（比 innerHTML='' 更明确，且不解析 HTML）。 */
 function clear(el) { while (el.firstChild) el.removeChild(el.firstChild) }
 
@@ -167,7 +201,7 @@ const VIEW_LOADERS = {
   // 故这里**只调它一个** —— 两个都调会对同一份账号列表白打两遍上游。
   tasks: () => loadAccounts(),
   usage: () => loadUsage(),
-  models: () => { /* 手动触发 */ },
+  models: () => loadModels(),
   config: () => loadConfig(),
   logs: () => loadLogs(),
 }
@@ -1161,8 +1195,8 @@ async function loadUsage() {
   //   ⚠️ 信息本身没丢：`activeDays` 已作为「总请求」卡的副标题 ——
   //   它能回答「这段时间有多少天真的用过」，正是说明里唯一有用的那部分。）
 
-  renderUsageTrend([...byDayMap.values()].sort((a, b) => b.day.localeCompare(a.day)), windowDays)
-  renderUsageHours([...byHourMap.values()].sort((a, b) => a.hour.localeCompare(b.hour)), windowDays)
+  renderUsageTrend([...byDayMap.values()].sort((a, b) => String(b.day).localeCompare(String(a.day))), windowDays)
+  renderUsageHours([...byHourMap.values()].sort((a, b) => (Number(a.hour) || 0) - (Number(b.hour) || 0)), windowDays)
 
   // ── 排名列表（照参考项目：序号 + 占比条 + 行内指标）──
   //
@@ -1393,22 +1427,22 @@ function renderModelsTable() {
     if (!info) {
       const tag = document.createElement('span')
       tag.className = 'tag'
-      tag.textContent = '⚪ 未检测'
+      tag.textContent = '未检测'
       tdStatus.appendChild(tag)
     } else if (info.ok && info.isFree) {
       const tag = document.createElement('span')
       tag.className = 'tag ok'
-      tag.textContent = '🟢 免费 (0积分)'
+      tag.textContent = '完全免费 (0积分)'
       tdStatus.appendChild(tag)
     } else if (info.ok && !info.isFree) {
       const tag = document.createElement('span')
       tag.className = 'tag warn'
-      tag.textContent = '🟡 消耗 ' + info.credit + ' 积分'
+      tag.textContent = '消耗 ' + info.credit + ' 积分'
       tdStatus.appendChild(tag)
     } else {
       const tag = document.createElement('span')
       tag.className = 'tag err'
-      tag.textContent = '🔴 ' + (info.status || '不可用')
+      tag.textContent = info.status || '不可用'
       if (info.error) tag.title = info.error
       tdStatus.appendChild(tag)
     }
@@ -1416,11 +1450,23 @@ function renderModelsTable() {
 
     // 操作
     const tdAct = document.createElement('td')
+    const btnGroup = document.createElement('div')
+    btnGroup.className = 'table-btn-group'
+
     const testBtn = document.createElement('button')
     testBtn.className = 'ghost small'
     testBtn.textContent = '测资费'
     testBtn.onclick = () => probeSingleModel(m.id, testBtn)
-    tdAct.appendChild(testBtn)
+    btnGroup.appendChild(testBtn)
+
+    const copyBtn = document.createElement('button')
+    copyBtn.className = 'ghost small'
+    copyBtn.textContent = '复制'
+    copyBtn.title = '复制模型 ID 到剪贴板'
+    copyBtn.onclick = () => copyText(m.id, '已复制模型 ID：' + m.id)
+    btnGroup.appendChild(copyBtn)
+
+    tdAct.appendChild(btnGroup)
     tr.appendChild(tdAct)
 
     table.appendChild(tr)
@@ -1436,22 +1482,34 @@ function renderModelsTable() {
 
 async function loadModels() {
   const box = $('models')
+  if (!box) return
   clear(box)
   const p = document.createElement('p')
   p.className = 'hint'
   p.textContent = '正在加载模型目录…'
   box.appendChild(p)
 
-  const res = await api('/v1/models')
-  if (!res.ok) {
-    clear(box)
-    const e = document.createElement('p')
-    e.className = 'hint'
-    e.textContent = '加载失败'
-    box.appendChild(e)
-    return
+  // 并发拉取网关实时模型与系统内置已知模型目录，保证模型列表绝不空白
+  const [res, builtinRes] = await Promise.all([
+    api('/v1/models').catch(() => ({ ok: false })),
+    api('/admin/models/builtin').catch(() => ({ ok: false })),
+  ])
+
+  const remote = (res.ok && res.body && Array.isArray(res.body.data)) ? res.body.data : []
+  const builtins = (builtinRes.ok && builtinRes.body && Array.isArray(builtinRes.body.data)) ? builtinRes.body.data : []
+
+  // 按 id 合并，优先保留网关动态拉取到的模型信息
+  const map = new Map()
+  for (const b of builtins) {
+    if (!b || !b.id) continue
+    map.set(b.id, { id: b.id, name: b.name, owned_by: b.providerName || b.provider, isBuiltin: true })
   }
-  cachedModels = (res.body && res.body.data) || []
+  for (const r of remote) {
+    if (!r || !r.id) continue
+    map.set(r.id, { ...r, isOnline: true })
+  }
+
+  cachedModels = Array.from(map.values())
   renderModelsTable()
 }
 
@@ -2455,9 +2513,222 @@ document.addEventListener('keydown', (e) => {
 
 async function loadConfig() {
   const box = $('config')
+  if (!box) return
   clear(box)
-  const pairs = []
 
+  const baseUrl = window.location.origin + '/v1'
+  const key = apiKey() || '（请在面板填入有效密钥）'
+
+  // 1. 客户端接入指南卡片
+  const clientCard = document.createElement('div')
+  clientCard.className = 'card config-card'
+
+  const cHead = document.createElement('div')
+  cHead.className = 'config-card-head'
+  const cTitle = document.createElement('h3')
+  cTitle.textContent = '客户端接入指南（OpenAI / Anthropic 协议兼容）'
+  cHead.appendChild(cTitle)
+  clientCard.appendChild(cHead)
+
+  const cIntro = document.createElement('p')
+  cIntro.className = 'hint'
+  cIntro.textContent = '本网关对外暴露标准的 OpenAI `/v1/chat/completions` 与 Responses API，直接兼容 NextChat、ChatBox、LobeChat、Cursor、Claude Code 等第三方客户端。'
+  clientCard.appendChild(cIntro)
+
+  const fields = document.createElement('div')
+  fields.className = 'config-fields'
+
+  function addCopyField(label, val) {
+    const f = document.createElement('div')
+    f.className = 'config-field-item'
+    const lbl = document.createElement('span')
+    lbl.className = 'config-field-lbl'
+    lbl.textContent = label
+    const row = document.createElement('div')
+    row.className = 'config-field-row'
+    const code = document.createElement('code')
+    code.textContent = val
+    const copy = document.createElement('button')
+    copy.className = 'ghost small'
+    copy.textContent = '复制'
+    copy.onclick = () => copyText(val, '已复制 ' + label)
+    row.appendChild(code)
+    row.appendChild(copy)
+    f.appendChild(lbl)
+    f.appendChild(row)
+    fields.appendChild(f)
+  }
+
+  addCopyField('API Base URL', baseUrl)
+  addCopyField('API Key (Bearer)', key)
+  addCopyField('推荐默认模型', 'buddy/deepseek-v4.1-flash')
+  addCopyField('临期优选聚合模型', 'aggregate/auto')
+
+  clientCard.appendChild(fields)
+
+  // cURL 测试命令快速复制
+  const curlSec = document.createElement('div')
+  curlSec.className = 'config-curl-sec'
+  const curlPre = document.createElement('pre')
+  curlPre.className = 'out'
+  const curlCmd = 'curl -X POST "' + baseUrl + '/chat/completions" \\\n'
+    + '  -H "Authorization: Bearer ' + key + '" \\\n'
+    + '  -H "Content-Type: application/json" \\\n'
+    + '  -d \'{"model":"buddy/deepseek-v4.1-flash","messages":[{"role":"user","content":"Hi"}]}\''
+  curlPre.textContent = curlCmd
+  const curlBtn = document.createElement('button')
+  curlBtn.className = 'ghost small copy-curl-btn'
+  curlBtn.textContent = '复制 cURL 示例命令'
+  curlBtn.onclick = () => copyText(curlCmd, '已复制 cURL 示例命令')
+  curlSec.appendChild(curlPre)
+  curlSec.appendChild(curlBtn)
+  clientCard.appendChild(curlSec)
+  box.appendChild(clientCard)
+
+  // 2. 调度与路由策略配置卡片
+  const routeCard = document.createElement('div')
+  routeCard.className = 'card config-card'
+
+  const rHead = document.createElement('div')
+  rHead.className = 'config-card-head'
+  const rTitle = document.createElement('h3')
+  rTitle.textContent = '路由与调度策略配置'
+  rHead.appendChild(rTitle)
+  routeCard.appendChild(rHead)
+
+  const rForm = document.createElement('div')
+  rForm.className = 'config-form-grid'
+
+  // 拉取当前服务端策略
+  const routingRes = await api('/admin/config/routing')
+  const curCfg = (routingRes.ok && routingRes.body && routingRes.body.config) || {
+    strategy: 'expiry',
+    maxRetries: 3,
+    softCooldownSeconds: 60,
+    autoTaskCron: true,
+    autoRefreshCredential: true,
+  }
+
+  // 负载均衡策略选择
+  const stratItem = document.createElement('div')
+  stratItem.className = 'config-form-item'
+  const stratLbl = document.createElement('label')
+  stratLbl.textContent = '负载均衡模式'
+  const stratSel = document.createElement('select')
+  stratSel.id = 'cfg-strategy'
+  ;[
+    ['expiry', '临期优先 (推荐：优先消耗最快过期的渠道积分)'],
+    ['roundrobin', '轮询模式 (按账号列表顺序平均轮换)'],
+    ['random', '加权随机 (均匀打散并发负载)'],
+  ].forEach(([val, txt]) => {
+    const opt = document.createElement('option')
+    opt.value = val
+    opt.textContent = txt
+    if (curCfg.strategy === val) opt.selected = true
+    stratSel.appendChild(opt)
+  })
+  stratItem.appendChild(stratLbl)
+  stratItem.appendChild(stratSel)
+  rForm.appendChild(stratItem)
+
+  // 失败重试次数
+  const retryItem = document.createElement('div')
+  retryItem.className = 'config-form-item'
+  const retryLbl = document.createElement('label')
+  retryLbl.textContent = '单次请求最大换号重试'
+  const retryInput = document.createElement('input')
+  retryInput.type = 'number'
+  retryInput.id = 'cfg-retries'
+  retryInput.min = '0'; retryInput.max = '10'
+  retryInput.value = curCfg.maxRetries ?? 3
+  retryItem.appendChild(retryLbl)
+  retryItem.appendChild(retryInput)
+  rForm.appendChild(retryItem)
+
+  // 起步软冷却时间
+  const cdItem = document.createElement('div')
+  cdItem.className = 'config-form-item'
+  const cdLbl = document.createElement('label')
+  cdLbl.textContent = '起步软冷却时间（秒）'
+  const cdInput = document.createElement('input')
+  cdInput.type = 'number'
+  cdInput.id = 'cfg-cooldown'
+  cdInput.min = '10'; cdInput.max = '3600'
+  cdInput.value = curCfg.softCooldownSeconds ?? 60
+  cdItem.appendChild(cdLbl)
+  cdItem.appendChild(cdInput)
+  rForm.appendChild(cdItem)
+
+  // 开关组
+  const swItem = document.createElement('div')
+  swItem.className = 'config-form-item full'
+  const swRow = document.createElement('div')
+  swRow.className = 'config-sw-row'
+
+  const cronLabel = document.createElement('label')
+  cronLabel.className = 'check-label'
+  const cronChk = document.createElement('input')
+  cronChk.type = 'checkbox'
+  cronChk.id = 'cfg-cron'
+  cronChk.checked = curCfg.autoTaskCron !== false
+  cronLabel.appendChild(cronChk)
+  cronLabel.appendChild(document.createTextNode(' 自动每日任务调度（每小时整点巡检签到与成长活跃）'))
+
+  const refreshLabel = document.createElement('label')
+  refreshLabel.className = 'check-label'
+  const refreshChk = document.createElement('input')
+  refreshChk.type = 'checkbox'
+  refreshChk.id = 'cfg-refresh'
+  refreshChk.checked = curCfg.autoRefreshCredential !== false
+  refreshLabel.appendChild(refreshChk)
+  refreshLabel.appendChild(document.createTextNode(' 凭据主动刷新机制（在凭据临期前自动向官方续期）'))
+
+  swRow.appendChild(cronLabel)
+  swRow.appendChild(refreshLabel)
+  swItem.appendChild(swRow)
+  rForm.appendChild(swItem)
+
+  // 保存按钮
+  const saveBtn = document.createElement('button')
+  saveBtn.className = 'primary-btn'
+  saveBtn.textContent = '保存调度策略'
+  saveBtn.onclick = async () => {
+    saveBtn.disabled = true
+    const next = {
+      strategy: stratSel.value,
+      maxRetries: Number.parseInt(retryInput.value, 10) || 3,
+      softCooldownSeconds: Number.parseInt(cdInput.value, 10) || 60,
+      autoTaskCron: cronChk.checked,
+      autoRefreshCredential: refreshChk.checked,
+    }
+    const r = await api('/admin/config/routing', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(next),
+    })
+    saveBtn.disabled = false
+    if (r.ok) {
+      showToast('调度配置已保存并即时生效', 'ok')
+    } else {
+      showToast('保存失败：' + (r.body?.message || r.body || '未知错误'), 'err')
+    }
+  }
+
+  routeCard.appendChild(rForm)
+  routeCard.appendChild(saveBtn)
+  box.appendChild(routeCard)
+
+  // 3. 运行时状态与安全指标卡片（包含满足原有单测断言的表格）
+  const statusCard = document.createElement('div')
+  statusCard.className = 'card config-card'
+  const sHead = document.createElement('div')
+  sHead.className = 'config-card-head'
+  const sTitle = document.createElement('h3')
+  sTitle.textContent = '系统安全与运行时状态'
+  sHead.appendChild(sTitle)
+  statusCard.appendChild(sHead)
+
+  const pairs = []
   const cfgCounts = await fetchPoolCounts()
   const pool = { ok: true, body: { counts: cfgCounts } }
   if (pool.ok && pool.body.counts) {
@@ -2474,39 +2745,177 @@ async function loadConfig() {
   }
 
   const cred = await api('/admin/credentials?realm=cn')
-  // ⚠️ 「已存凭据数」与「账号总数」口径**不同**（前者是凭据存储里的条数，
-  // 后者是账号池里能被选中的账号数），可能相差 1~2。
-  // 并排展示会让人怀疑有脏数据 ⇒ 把口径写进**值**里说明清楚。
-  //（不加 tooltip：表格单元格的 title 在手机上点不出来，等于没有。）
   if (cred.ok && cred.body) {
     pairs.push(['已存凭据数', `${cred.body.count}（凭据存储条数；与账号总数口径不同，可能相差 1~2）`])
   }
 
-  // 任务计划构成（让用户知道会自动做什么）
-  pairs.push(['Cron 触发', '每小时 1 次（0 * * * *）'],
+  pairs.push(
+    ['API Key 鉴权', apiKey() ? '已启用 (Bearer Token 验证)' : '未设置密钥'],
+    ['Cron 触发', '每小时 1 次（0 * * * *）'],
     ['任务时点（UTC+8）', '09 签到 / 10 活跃 / 21 签到'],
-    ['凭据加密', 'AES-GCM（密钥来自 CREDENTIAL_KEY secret）'])
+    ['凭据加密', 'AES-GCM（密钥来自 CREDENTIAL_KEY secret）'],
+    ['运行环境', 'Cloudflare Workers (V8 Serverless + Durable Object SQLite)'],
+  )
 
-  box.appendChild(wrapTable(buildTable(['项', '值'], pairs)))
-
-  const note = document.createElement('p'); note.className = 'hint'
-  note.textContent = '⚠️ 运行时配置目前通过 wrangler 的 vars / secret 管理，面板暂不支持在线修改。'
-  box.appendChild(note)
+  statusCard.appendChild(wrapTable(buildTable(['项', '值'], pairs)))
+  box.appendChild(statusCard)
 }
 
 // ─────────────────────────── 日志 ───────────────────────────
 
+let activeLogFilter = 'all'
+let rawLogsCache = []
+
 async function loadLogs() {
   const box = $('logs')
+  if (!box) return
   clear(box)
+  const p = document.createElement('p')
+  p.className = 'hint'
+  p.textContent = '正在获取实时运行日志…'
+  box.appendChild(p)
+
   const res = await api('/admin/logs?realm=cn&limit=100')
-  if (!res.ok) { box.textContent = '加载失败'; return }
-  const logs = (res.body && res.body.logs) || []
-  if (logs.length === 0) {
-    box.textContent = '暂无日志。\n\n提示：Worker 运行日志也可用 `npx wrangler tail` 实时查看（本页只显示面板侧记录的操作）。'
+  if (!res.ok) {
+    clear(box)
+    const err = document.createElement('p')
+    err.className = 'hint'
+    err.textContent = '获取日志失败，请检查密钥鉴权或网络。'
+    box.appendChild(err)
     return
   }
-  box.textContent = logs.map((l) => JSON.stringify(l)).join('\n')
+
+  rawLogsCache = (res.body && res.body.logs) || []
+  renderLogsTable()
+}
+
+function renderLogsTable() {
+  const box = $('logs')
+  if (!box) return
+  clear(box)
+
+  const list = rawLogsCache.filter((l) => {
+    if (activeLogFilter === 'all') return true
+    if (activeLogFilter === 'api') return l.type === 'api' || l.type === undefined
+    if (activeLogFilter === 'task') return l.type === 'task'
+    if (activeLogFilter === 'error') return l.type === 'error' || (typeof l.status === 'number' && l.status >= 400)
+    return true
+  })
+
+  if (list.length === 0) {
+    const emptyBox = document.createElement('div')
+    emptyBox.className = 'log-empty'
+    const ep1 = document.createElement('p')
+    ep1.className = 'hint'
+    ep1.textContent = '暂无符合条件的日志记录。'
+    const ep2 = document.createElement('p')
+    ep2.className = 'hint'
+    ep2.style.fontSize = '11px'
+    ep2.textContent = '提示：当收到 /v1/chat/completions 模型对话请求或执行签到任务时，此处将实时展示最近 100 条高密度记录。'
+    emptyBox.appendChild(ep1)
+    emptyBox.appendChild(ep2)
+    box.appendChild(emptyBox)
+    return
+  }
+
+  const table = document.createElement('table')
+  table.className = 'log-table'
+  const thead = document.createElement('tr')
+  ;['时间', '类型', '状态', '供应商/账号', '模型', 'Tokens (入/出)', '耗时', '详情'].forEach((h) => {
+    const th = document.createElement('th')
+    th.textContent = h
+    thead.appendChild(th)
+  })
+  table.appendChild(thead)
+
+  for (const l of list) {
+    const tr = document.createElement('tr')
+    const isErr = (l.type === 'error') || (typeof l.status === 'number' && l.status >= 400)
+    if (isErr) tr.className = 'log-row-err'
+
+    // 时间
+    const tdTime = document.createElement('td')
+    tdTime.className = 'log-time tabular-nums'
+    const d = new Date(l.time || Date.now())
+    const timeStr = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}:${String(d.getSeconds()).padStart(2, '0')}`
+    tdTime.textContent = timeStr
+    tr.appendChild(tdTime)
+
+    // 类型
+    const tdType = document.createElement('td')
+    const typeTag = document.createElement('span')
+    const t = l.type || 'api'
+    typeTag.className = 'log-pill log-type-' + t
+    typeTag.textContent = t.toUpperCase()
+    tdType.appendChild(typeTag)
+    tr.appendChild(tdType)
+
+    // 状态
+    const tdStatus = document.createElement('td')
+    const statusPill = document.createElement('span')
+    const code = l.status || (isErr ? 502 : 200)
+    statusPill.className = 'log-pill status-' + (code >= 200 && code < 300 ? '200' : code >= 400 && code < 500 ? '400' : '500')
+    statusPill.textContent = String(code)
+    tdStatus.appendChild(statusPill)
+    tr.appendChild(tdStatus)
+
+    // 供应商/账号
+    const tdProv = document.createElement('td')
+    const provCode = document.createElement('span')
+    provCode.className = 'log-prov'
+    provCode.textContent = l.provider || '-'
+    const uidSpan = document.createElement('span')
+    uidSpan.className = 'log-uid'
+    uidSpan.textContent = l.uid ? ' · ' + l.uid.slice(0, 10) : ''
+    tdProv.appendChild(provCode)
+    tdProv.appendChild(uidSpan)
+    tr.appendChild(tdProv)
+
+    // 模型
+    const tdModel = document.createElement('td')
+    const mCode = document.createElement('code')
+    mCode.textContent = l.model || '-'
+    mCode.title = '点击复制模型名'
+    mCode.className = 'copyable-code'
+    mCode.onclick = () => copyText(l.model, '已复制模型名')
+    tdModel.appendChild(mCode)
+    tr.appendChild(tdModel)
+
+    // Tokens
+    const tdTokens = document.createElement('td')
+    tdTokens.className = 'tabular-nums'
+    if (l.tokens && (l.tokens.input || l.tokens.output || l.tokens.total)) {
+      tdTokens.textContent = `${l.tokens.input || 0} / ${l.tokens.output || 0}`
+    } else {
+      tdTokens.textContent = '-'
+    }
+    tr.appendChild(tdTokens)
+
+    // 耗时
+    const tdMs = document.createElement('td')
+    tdMs.className = 'tabular-nums'
+    const ms = l.durationMs || l.ms || 0
+    const msTag = document.createElement('span')
+    msTag.className = 'log-ms ' + (ms < 1000 ? 'fast' : ms < 3000 ? 'medium' : 'slow')
+    msTag.textContent = ms > 0 ? (ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}s`) : '-'
+    tdMs.appendChild(msTag)
+    tr.appendChild(tdMs)
+
+    // 详情/错误原因
+    const tdDetail = document.createElement('td')
+    tdDetail.className = 'log-detail'
+    const detailTxt = l.error || l.reason || (l.stream ? 'SSE 流式传输完成' : '请求已完成')
+    tdDetail.textContent = detailTxt
+    tdDetail.title = '点击复制完整日志 JSON'
+    tdDetail.onclick = () => {
+      copyText(JSON.stringify(l, null, 2), '已复制日志 JSON 详情')
+    }
+    tr.appendChild(tdDetail)
+
+    table.appendChild(tr)
+  }
+
+  box.appendChild(wrapTable(table))
 }
 
 // ─────────────────────────── WAF 护栏 ───────────────────────────
@@ -2654,9 +3063,18 @@ $('clear-model-cache').onclick = () => {
 }
 $('refresh-logs').onclick = loadLogs
 $('clear-logs').onclick = async () => {
-  if (!confirm('清空日志？')) return
+  if (!confirm('确定清空请求与任务日志？')) return
   await api('/admin/logs/clear', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })
+  showToast('日志已清空', 'ok')
   loadLogs()
+}
+for (const b of document.querySelectorAll('#log-filter-seg .seg-btn')) {
+  b.onclick = () => {
+    for (const other of document.querySelectorAll('#log-filter-seg .seg-btn')) other.classList.remove('active')
+    b.classList.add('active')
+    activeLogFilter = b.dataset.filter || 'all'
+    renderLogsTable()
+  }
 }
 $('clear-waf').onclick = async () => {
   const r = await api('/admin/waf/clear', {

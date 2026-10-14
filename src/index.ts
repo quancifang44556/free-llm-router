@@ -134,6 +134,7 @@ import { bindBuddy, WORKBUDDY_INTL } from './providers/buddy.js'
 import {
   DEFAULT_PROVIDER,
   findProvider,
+  getBuiltinModels,
   parseCredentialAnywhere,
   providerCatalog,
   providerIds,
@@ -2484,6 +2485,25 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
     const cnPool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn'))
     await cnPool.setProviderSettings({ order, disabled })
     return json({ ok: true, order, disabled })
+  }
+
+  // ── 路由与调度策略配置 ──
+  if (path === '/admin/config/routing' && request.method === 'GET') {
+    const cnPool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn'))
+    const config = await cnPool.getRoutingConfig()
+    return json({ ok: true, config })
+  }
+  if (path === '/admin/config/routing' && request.method === 'POST') {
+    const body = (await request.json().catch(() => ({}))) as Record<string, unknown>
+    const cnPool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn'))
+    const config = await cnPool.setRoutingConfig(body)
+    return json({ ok: true, config })
+  }
+
+  // ── 系统内置已知模型目录 ──
+  if (path === '/admin/models/builtin' && request.method === 'GET') {
+    const models = getBuiltinModels()
+    return json({ ok: true, data: models, total: models.length })
   }
 
   // ── 按供应商列模特（面板用） ──

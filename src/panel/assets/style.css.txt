@@ -1,7 +1,7 @@
-/* free-llm-router 管理面板样式 */
+/* free-llm-router 管理面板样式 (Apple HIG & Linear 工业级规范) */
 :root {
-  --bg: #0f1115; --panel: #171a21; --panel2: #1d2129; --line: #262b36;
-  --text: #e6e9ef; --dim: #9aa4b2;
+  --bg: #09090b; --panel: #121215; --panel2: #18181b; --line: rgba(255, 255, 255, 0.08);
+  --text: #ededef; --dim: #a1a1aa;
   /*
    * ⚠️ accent **拆成两个令牌** —— 它们对底色的要求相反。
    *
@@ -9,61 +9,70 @@
    *   否则白字对比度不足（WCAG AA 正文需 4.5:1）。
    * 文字（当强调色文字、描边）：压在**深色背景**上 ⇒ 要够**亮**。
    *
-   * 原先共用一个 `#4f8cff`：当按钮底时白字只有 **3.22:1（不达标）**，
-   * 但当文字时是 **5.97:1（很好）**。⇒ 无论往哪边调都会修一个、坏另一个。
-   * 拆开后各取所需（实测：白字 on #3b6fd4 = 4.76:1；#4f8cff 当文字 = 5.97:1）。
+   * 拆开后各取所需（实测：白字 on #0071e3 / #3b6fd4 >= 4.5:1；#4f8cff 当文字 = 5.97:1）。
    */
-  --accent: #3b6fd4; --accent-text: #4f8cff;
-  --ok: #34c77b; --warn: #e0a33e; --err: #ef5f5f;
+  --accent: #0071e3; --accent-text: #4f8cff;
+  --ok: #30d158; --warn: #ff9f0a; --err: #ff453a;
 }
 * { box-sizing: border-box; }
+
 /*
  * ⚠️ 全局防御：`[hidden]` 必须压过任何作者样式的 `display`。
- *
- * 根因（线上实测）：`.banner { display: flex }` 的优先级**高于**浏览器默认的
- * `[hidden] { display: none }`（作者样式 > UA 样式），于是 `hidden` 属性
- * **静默失效** —— 横幅永远显示，即使服务端说 `active: false`、
- * 点「立即解除」也没用（不报错，只是不生效）。
- *
- * 这里用 `!important` 一劳永逸：**任何**元素只要带 `hidden` 就一定不显示，
- * 不必记得给每个设了 `display` 的类补一条 `[hidden]` 规则。
+ * 这里用 `!important` 一劳永逸：**任何**元素只要带 `hidden` 就一定不显示。
  */
 [hidden] { display: none !important; }
+
 body {
   margin: 0; background: var(--bg); color: var(--text);
-  font: 14px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", "Noto Sans SC", sans-serif;
+  font: 14px/1.55 -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", system-ui, "Segoe UI", "Noto Sans SC", sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
-header {
-  display: flex; flex-wrap: wrap; gap: 12px; align-items: center; justify-content: space-between;
-  padding: 12px 20px; border-bottom: 1px solid var(--line); background: var(--panel);
-}
-.brand { display: flex; gap: 12px; align-items: center; }
-h1 { font-size: 15px; margin: 0; letter-spacing: .3px; }
-/*
- * 标题
- *
- * ⚠️ `h2` 的**下边距归零** —— 它现在总是放在 `.page-head` 里，
- * 而那个容器自己管间距（`margin-bottom: 10px`）。
- * 两处都加会让标题下方多出一段空白，越看越松。
- * ⚠️ `h3` 同理：它现在总在 `.panel-head` 里，下边距由容器给。
- * ⚠️ 但 `h3` **保留非布局场景的下边距**（少数地方 h3 是直接子元素，
- * 如任务页的「执行结果」），故用 `:only-child` 之外的场景保留。
- */
-h2 { font-size: 14px; margin: 0; display: flex; gap: 10px; align-items: center; }
-h3 { font-size: 13px; margin: 0; color: var(--dim); font-weight: 500; }
-/* 直接坐在视图里的 h3（不在 .panel-head 内）仍需要上下间距 */
-section.view > h3 { margin: 16px 0 8px; }
 
-nav {
-  display: flex; flex-wrap: wrap; gap: 4px; padding: 8px 16px;
-  border-bottom: 1px solid var(--line); background: var(--panel);
+/* ─────────── 一体化 Sticky 毛玻璃顶栏 ─────────── */
+header.app-header, header {
+  position: sticky; top: 0; z-index: 50;
+  height: 56px; padding: 0 20px;
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  background: rgba(9, 9, 11, 0.82);
+  backdrop-filter: blur(20px) saturate(180%);
+  -webkit-backdrop-filter: blur(20px) saturate(180%);
+  border-bottom: 1px solid var(--line);
+}
+.header-left { display: flex; align-items: center; gap: 12px; }
+.header-center { display: flex; align-items: center; justify-content: center; flex: 1; min-width: 0; }
+.header-right { display: flex; align-items: center; gap: 8px; }
+
+.brand { display: flex; gap: 8px; align-items: center; }
+.brand-logo { color: var(--accent-text); flex-shrink: 0; }
+h1 { font-size: 14px; font-weight: 600; margin: 0; letter-spacing: -0.01em; color: var(--text); }
+.version-badge {
+  font-size: 11px; padding: 1px 7px; border-radius: 999px;
+  background: rgba(255, 255, 255, 0.06); color: var(--dim);
+  border: 1px solid var(--line); font-family: ui-monospace, monospace;
+}
+
+/* ─────────── macOS 原生分段控制器 (Segmented Control) ─────────── */
+nav.nav-segmented, nav {
+  display: inline-flex; align-items: center; gap: 2px;
+  padding: 3px; border-radius: 12px;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.05);
 }
 .nav-item {
-  background: transparent; border: 1px solid transparent; color: var(--dim);
-  padding: 6px 12px; border-radius: 6px; cursor: pointer; font: inherit;
+  background: transparent; border: 0; color: var(--dim);
+  padding: 5px 13px; border-radius: 8px; cursor: pointer;
+  font-size: 13px; font-weight: 500; font-family: inherit;
+  transition: all 0.15s cubic-bezier(0.22, 1, 0.36, 1);
+  white-space: nowrap; user-select: none;
 }
-.nav-item:hover { color: var(--text); background: var(--panel2); }
-.nav-item.active { color: #fff; background: var(--accent); border-color: var(--accent); }
+.nav-item:hover { color: var(--text); }
+.nav-item.active {
+  color: #ffffff;
+  background: #27272a;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.25), inset 0 1px 0 0 rgba(255, 255, 255, 0.08);
+}
+.nav-item:active { transform: scale(0.98); }
 
 /*
  * 页面主容器（**纯布局**，视觉边界交给内部的 `.panel` / `.kpi`）。
@@ -217,16 +226,22 @@ button:disabled { opacity: .5; cursor: not-allowed; }
  *   这与 `.kpi-grid` 是同一套做法，观感统一。
  */
 .counts {
-  display: grid; gap: 10px;
-  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  display: grid; gap: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
 }
 .count {
-  background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
-  padding: 9px 13px; min-width: 92px;
-  box-shadow: 0 1px 2px rgba(0,0,0,.03);
+  background: var(--panel); border: 1px solid var(--line); border-radius: 14px;
+  padding: 12px 14px; min-width: 92px;
+  box-shadow: 0 1px 2px rgba(0,0,0,.04), inset 0 1px 0 0 rgba(255,255,255,0.06);
+  transition: transform 0.15s cubic-bezier(0.22, 1, 0.36, 1), box-shadow 0.15s;
 }
 /* ⚠️ 数字用 tabular-nums：计数块并排时数字宽度一致，不会左右跳动 */
-.count b { display: block; font-size: 19px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.count b {
+  display: block; font-size: 24px; font-weight: 600;
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", system-ui, sans-serif;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.02em;
+}
 .count span { font-size: 11px; color: var(--dim); }
 /*
  * 可点击的计数块（冷却中 / 模型限流）。
@@ -332,19 +347,17 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
  */
 .kpi-grid {
   display: grid; gap: 12px;
-  /* ⚠️ 自适应列数由 `minmax` 决定（窄屏 1 列 → 宽屏 4~5 列）。
-     ⚠️ 不写 `margin-bottom`：它总是放在 `section.view`（`gap: 14px`）里，
-     再加下边距就是**双重间距**（本项目改布局时反复踩到这一点）。 */
-  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  grid-template-columns: repeat(6, minmax(0, 1fr));
 }
 .kpi {
   position: relative;
   border: 1px solid var(--line); border-radius: 16px;
   padding: 14px 16px 13px;
   background: var(--panel);
-  /* 柔和阴影（参考项目用 0 10px 18px -3px）——比纯描边更有层次 */
-  box-shadow: 0 1px 2px rgba(0,0,0,.04), 0 8px 18px -8px rgba(0,0,0,.10);
+  /* 柔和阴影，顶部 1px 微光内描边 */
+  box-shadow: 0 1px 2px rgba(0,0,0,.04), 0 8px 18px -8px rgba(0,0,0,.10), inset 0 1px 0 0 rgba(255,255,255,0.06);
   overflow: hidden;
+  transition: transform 0.15s cubic-bezier(0.22, 1, 0.36, 1), box-shadow 0.15s;
 }
 /* 左上角的彩色图标章 */
 .kpi-chip {
@@ -355,8 +368,14 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
   color: var(--kpi, var(--accent-text));
 }
 .kpi-label { font-size: 11px; color: var(--dim); margin-bottom: 3px; }
-/* ⚠️ 数字要大：这是整张卡的主体（参考项目约 28px/900） */
+/* ⚠️ 数字要大：这是整张卡的主体，圆润无衬线无斜杠0 */
 .kpi-value {
+  font-size: 24px; font-weight: 600; line-height: 1.15;
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", system-ui, sans-serif;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.02em;
+  overflow-wrap: anywhere;
+}
   font-size: 25px; font-weight: 700; line-height: 1.15;
   font-variant-numeric: tabular-nums;
   letter-spacing: -0.01em;
@@ -470,19 +489,26 @@ html[data-theme='light'] .rank-idx { background: #eef1f5; }
 /* 页头里的分段控件不需要下边距（原先 .seg 自带 margin-bottom:12px） */
 .page-tools .seg { margin-bottom: 0; }
 
-/* ─────────── 时间窗分段控件（用量页） ─────────── */
+/* ─────────── 时间窗与分类分段控件 ─────────── */
 .seg {
-  display: inline-flex; gap: 2px; padding: 3px; margin-bottom: 12px;
-  background: var(--panel2); border: 1px solid var(--line); border-radius: 8px;
+  display: inline-flex; align-items: center; gap: 2px; padding: 3px;
+  background: var(--panel2); border: 1px solid var(--line); border-radius: 9px;
 }
-.seg-item {
+.seg-item, .seg-btn {
   background: transparent; border: 0; color: var(--dim);
-  font-size: 12px; padding: 5px 12px; border-radius: 6px; cursor: pointer;
-  font-family: inherit; transition: background .12s, color .12s;
+  font-size: 12px; font-weight: 500; padding: 4px 11px; border-radius: 6px; cursor: pointer;
+  font-family: inherit; transition: background .12s, color .12s; white-space: nowrap;
 }
-.seg-item:hover { color: var(--text); }
-.seg-item.active { background: var(--accent); color: #fff; }
-html[data-theme='light'] .seg-item.active { color: #fff; }
+.seg-item:hover, .seg-btn:hover { color: var(--text); }
+.seg-item.active, .seg-btn.active {
+  background: #27272a; color: #fff;
+  box-shadow: 0 1px 2px rgba(0,0,0,0.18), inset 0 1px 0 0 rgba(255,255,255,0.06);
+}
+html[data-theme='light'] .seg-item.active,
+html[data-theme='light'] .seg-btn.active {
+  background: #ffffff; color: #18181b;
+  box-shadow: 0 1px 2px rgba(0,0,0,0.08);
+}
 /* ⚠️ 用量页 KPI 卡：浅色下阴影要略重一点才有层次（深色下靠亮色卡片本身）。
    ⚠️ **必须与下方 `prefers-color-scheme` 那一份成对出现** ——
    两套浅色规则是独立维护的，只写一处就会在「跟随系统」模式下漏掉
@@ -701,15 +727,149 @@ html[data-theme='light'] .trend-track { background: #e8ebf0; }
   padding: 2px 10px; margin-left: 4px;
 }
 
+/* ─────────── Bento 双列栅格 ─────────── */
+.bento-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
+/* ─────────── 核心操作按钮与微交互 ─────────── */
+.primary-btn {
+  background: var(--accent); border: 1px solid var(--accent); color: #fff;
+  padding: 6px 14px; border-radius: 8px; font-size: 13px; font-weight: 500;
+  display: inline-flex; align-items: center; gap: 6px; cursor: pointer;
+  box-shadow: 0 1px 2px rgba(0, 113, 227, 0.25), inset 0 1px 0 0 rgba(255, 255, 255, 0.15);
+  transition: all 0.15s cubic-bezier(0.22, 1, 0.36, 1);
+}
+.primary-btn:hover { filter: brightness(1.08); box-shadow: 0 2px 6px rgba(0, 113, 227, 0.35); }
+.primary-btn:active { transform: scale(0.98); }
+.table-btn-group { display: inline-flex; align-items: center; gap: 6px; }
+
+/* ─────────── 配置页与接入指南卡片 ─────────── */
+.config-card {
+  display: flex; flex-direction: column; gap: 14px;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 16px;
+  padding: 16px 20px; box-shadow: 0 1px 2px rgba(0,0,0,.04), inset 0 1px 0 0 rgba(255,255,255,0.06);
+}
+.config-card-head { display: flex; align-items: center; justify-content: space-between; }
+.config-card-head h3 { font-size: 14px; font-weight: 600; color: var(--text); margin: 0; }
+.config-fields { display: flex; flex-direction: column; gap: 10px; }
+.config-field-item { display: flex; flex-direction: column; gap: 4px; }
+.config-field-lbl { font-size: 12px; font-weight: 500; color: var(--dim); }
+.config-field-row { display: flex; align-items: center; gap: 8px; }
+.config-field-row code {
+  flex: 1; padding: 7px 11px; background: var(--panel2); border-radius: 8px;
+  border: 1px solid var(--line); font-family: ui-monospace, monospace; font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.copyable-code {
+  cursor: pointer; transition: all 0.15s cubic-bezier(0.22, 1, 0.36, 1);
+}
+.copyable-code:hover {
+  border-color: var(--accent-text); color: var(--text); background: var(--panel2);
+}
+.config-curl-sec {
+  display: flex; flex-direction: column; gap: 8px; margin-top: 6px;
+}
+.copy-curl-btn { align-self: flex-start; }
+
+.config-form-grid {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 14px; margin-bottom: 6px;
+}
+.config-form-item { display: flex; flex-direction: column; gap: 6px; }
+.config-form-item label { font-size: 12px; font-weight: 500; color: var(--dim); }
+.config-form-item.full { grid-column: 1 / -1; }
+.config-sw-row { display: flex; flex-direction: column; gap: 8px; margin-top: 2px; }
+.check-label {
+  display: inline-flex; align-items: center; gap: 8px; font-size: 13px;
+  cursor: pointer; color: var(--text); user-select: none;
+}
+.check-label input[type='checkbox'] {
+  width: 16px; height: 16px; accent-color: var(--accent); cursor: pointer;
+}
+
+/* ─────────── 请求与任务日志高密度终端表格 ─────────── */
+.log-table {
+  width: 100%; border-collapse: collapse; font-size: 12px;
+}
+.log-table th {
+  padding: 8px 10px; font-weight: 500; color: var(--dim);
+  border-bottom: 1px solid var(--line); white-space: nowrap; text-align: left;
+}
+.log-table td {
+  padding: 6px 10px; border-bottom: 1px solid var(--line);
+  vertical-align: middle; white-space: nowrap;
+}
+.log-row-err { background: rgba(255, 69, 58, 0.06); }
+.log-time { color: var(--dim); font-size: 11px; font-family: ui-monospace, monospace; }
+.log-pill {
+  display: inline-flex; align-items: center; font-size: 10px; font-weight: 600;
+  padding: 1px 7px; border-radius: 999px; line-height: 1.3;
+  text-transform: uppercase; font-family: ui-monospace, monospace;
+}
+.log-type-api { background: rgba(0, 113, 227, 0.12); color: #4f8cff; border: 1px solid rgba(0, 113, 227, 0.25); }
+.log-type-task { background: rgba(48, 209, 88, 0.12); color: #30d158; border: 1px solid rgba(48, 209, 88, 0.25); }
+.log-type-error { background: rgba(255, 69, 58, 0.12); color: #ff453a; border: 1px solid rgba(255, 69, 58, 0.25); }
+.status-200 { background: rgba(48, 209, 88, 0.12); color: #30d158; border: 1px solid rgba(48, 209, 88, 0.2); }
+.status-400 { background: rgba(255, 159, 10, 0.12); color: #ff9f0a; border: 1px solid rgba(255, 159, 10, 0.2); }
+.status-500 { background: rgba(255, 69, 58, 0.12); color: #ff453a; border: 1px solid rgba(255, 69, 58, 0.2); }
+.log-prov { font-weight: 600; color: var(--text); }
+.log-uid { color: var(--dim); font-size: 11px; font-family: ui-monospace, monospace; }
+.log-ms.fast { color: #30d158; }
+.log-ms.medium { color: #ff9f0a; }
+.log-ms.slow { color: #8e8e93; }
+.log-detail {
+  max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  color: var(--dim); cursor: pointer;
+}
+.log-detail:hover { color: var(--text); text-decoration: underline; }
+.log-empty { text-align: center; padding: 36px 16px; }
+
+/* ─────────── Apple Dynamic Island 风格 Toast HUD ─────────── */
+.toast {
+  position: fixed; top: 16px; left: 50%; transform: translateX(-50%);
+  z-index: 1000; padding: 7px 18px; border-radius: 9999px;
+  font-size: 13px; font-weight: 500; line-height: 1.3;
+  backdrop-filter: blur(24px) saturate(180%);
+  -webkit-backdrop-filter: blur(24px) saturate(180%);
+  box-shadow: 0 10px 30px -5px rgba(0, 0, 0, 0.4), inset 0 1px 0 0 rgba(255, 255, 255, 0.1);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  pointer-events: none;
+  animation: toast-in 0.22s cubic-bezier(0.22, 1, 0.36, 1);
+}
+.toast.ok { background: rgba(18, 18, 21, 0.9); color: #30d158; }
+.toast.err { background: rgba(30, 12, 12, 0.92); color: #ff453a; }
+.toast.info { background: rgba(18, 18, 21, 0.9); color: var(--text); }
+@keyframes toast-in {
+  from { opacity: 0; transform: translate(-50%, -8px) scale(0.96); }
+  to { opacity: 1; transform: translate(-50%, 0) scale(1); }
+}
+
 /* ─────────── 浅色模式 ───────────
  * ⚠️ 所有颜色都走 CSS 变量，故浅色模式只需覆盖 `:root` 的变量值 ——
  * 不必给每个组件写一份浅色样式（那会立刻产生两份需要同步维护的规则）。
  * 少数几个硬编码的深色值（如 #10131a 的输入框背景）单独覆盖。
  */
 html[data-theme='light'] {
-  --bg: #f6f7f9; --panel: #ffffff; --panel2: #f1f3f6; --line: #d8dde5;
-  --text: #1a1d23; --dim: #5c6675; --accent: #2563eb; --accent-text: #2563eb;
+  --bg: #f5f5f7; --panel: #ffffff; --panel2: #f0f0f2; --line: rgba(0, 0, 0, 0.08);
+  --text: #1d1d1f; --dim: #5c6675; --accent: #0071e3; --accent-text: #0071e3;
   --ok: #15803d; --warn: #b45309; --err: #dc2626;
+}
+html[data-theme='light'] header.app-header,
+html[data-theme='light'] header {
+  background: rgba(245, 245, 247, 0.82);
+}
+html[data-theme='light'] nav.nav-segmented,
+html[data-theme='light'] nav {
+  background: rgba(0, 0, 0, 0.05);
+  border-color: rgba(0, 0, 0, 0.04);
+}
+html[data-theme='light'] .nav-item.active {
+  color: #18181b;
+  background: #ffffff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08), 0 1px 2px rgba(0, 0, 0, 0.04);
 }
 html[data-theme='light'] input,
 html[data-theme='light'] select,
@@ -772,21 +932,30 @@ html[data-theme='light'] .prov-card .prov-credits { background: #e7f5ec; border-
  */
 @media (prefers-color-scheme: light) {
   html:not([data-theme]) {
-    --bg: #f6f7f9; --panel: #ffffff; --panel2: #f1f3f6; --line: #d8dde5;
-    --text: #1a1d23; --dim: #5c6675; --accent: #2563eb; --accent-text: #2563eb;
+    --bg: #f5f5f7; --panel: #ffffff; --panel2: #f0f0f2; --line: rgba(0, 0, 0, 0.08);
+    --text: #1d1d1f; --dim: #5c6675; --accent: #0071e3; --accent-text: #0071e3;
     --ok: #15803d; --warn: #b45309; --err: #dc2626;
+  }
+  html:not([data-theme]) header.app-header,
+  html:not([data-theme]) header {
+    background: rgba(245, 245, 247, 0.82);
+  }
+  html:not([data-theme]) nav.nav-segmented,
+  html:not([data-theme]) nav {
+    background: rgba(0, 0, 0, 0.05);
+    border-color: rgba(0, 0, 0, 0.04);
+  }
+  html:not([data-theme]) .nav-item.active {
+    color: #18181b;
+    background: #ffffff;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08), 0 1px 2px rgba(0, 0, 0, 0.04);
   }
   html:not([data-theme]) input,
   html:not([data-theme]) select,
   html:not([data-theme]) textarea,
   html:not([data-theme]) button.ghost { background: #ffffff; }
   html:not([data-theme]) .out { background: #f8f9fb; }
-  /* ⚠️ `.bar-track` 与 `.trend-track` 是**两个**元素，都要覆盖。
-     实测缺陷（用户报「浅色主题下柱形图背景还是深色的」）：
-     我只把 `.trend-track` 加进了 `[data-theme='light']` 那一套，
-     而**跟随系统（auto）**模式走的是这段 `prefers-color-scheme` ——
-     两套规则是**独立维护**的，漏一处就只在某一种模式下出错，极难发现。
-     ⇒ 凡是在浅色下需要改底色的元素，**两处都要加**。 */
+  /* ⚠️ `.bar-track` 与 `.trend-track` 是**两个**元素，都要覆盖。 */
   html:not([data-theme]) .bar-track,
   html:not([data-theme]) .trend-track,
   html:not([data-theme]) .switch { background: #e8ebf0; }
@@ -986,6 +1155,7 @@ main > * { min-width: 0; }
   .kpi { padding: 12px 14px; }
   .kpi-value { font-size: 22px; }
   .spark { height: 24px; }
+  .bento-grid { grid-template-columns: 1fr; }
 
   /* 排名行：手机上把「指标」换到第二行 ——
      ⚠️ 不换行的话，`metrics` 是 flex:none + nowrap，

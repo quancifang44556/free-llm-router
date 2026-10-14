@@ -1890,3 +1890,46 @@ test('🔴 所有安全头必须齐全（登录页也不例外）', () => {
   assert.ok(/\.\.\.securityHeaders\(\)/.test(block),
     '⚠️ 登录页头应基于 securityHeaders() 展开（只覆盖 CSP），否则容易漏头')
 })
+
+// ─────────────── 2026-10-14 第一阶段与第二阶段重构验证 ───────────────
+
+test('🔴 配置页 loadConfig 必须包含客户端指南与路由调度策略', () => {
+  const js = panelAsset('/panel/app.js')?.body ?? ''
+  assert.ok(/客户端接入指南/.test(js), '配置页应有客户端接入指南')
+  assert.ok(/路由与调度策略配置/.test(js), '配置页应有路由调度配置')
+  assert.ok(/\/admin\/config\/routing/.test(js), '配置页应调用 /admin/config/routing API')
+  assert.ok(/cfg-strategy/.test(js), '配置页应包含负载均衡模式选择')
+  assert.ok(/cfg-retries/.test(js), '配置页应包含最大重试次数')
+  assert.ok(/cfg-cooldown/.test(js), '配置页应包含起步软冷却时间')
+})
+
+test('🔴 日志页 loadLogs 必须渲染高密度终端表格并支持类型筛选', () => {
+  const js = panelAsset('/panel/app.js')?.body ?? ''
+  const html = panelAsset('/panel/')?.body ?? ''
+  assert.ok(/log-table/.test(js), '日志应渲染为表格形式')
+  assert.ok(/activeLogFilter/.test(js), '应支持 activeLogFilter 分类筛选')
+  assert.ok(/id="log-filter-seg"/.test(html), 'HTML 中应有日志分类筛选分段控制器')
+  assert.ok(/data-filter="api"/.test(html) && /data-filter="task"/.test(html) && /data-filter="error"/.test(html),
+    '筛选分段应包含全部/API/任务/错误四个维度')
+})
+
+test('🔴 模型 Tab 必须自动触发 loadModels 并提供内置已知模型兜底', () => {
+  const js = panelAsset('/panel/app.js')?.body ?? ''
+  // VIEW_LOADERS.models 不得再是空注释，必须直接调用 loadModels
+  assert.ok(/models:\s*\(\)\s*=>\s*loadModels\(\)/.test(js), 'models 视图切换必须自动触发 loadModels')
+  // loadModels 内部应拉取内置模型目录
+  assert.ok(/\/admin\/models\/builtin/.test(js), 'loadModels 应调用 /admin/models/builtin 避免空白')
+  assert.ok(/copyText\(m\.id/.test(js), '模型表格应支持一键复制模型 ID')
+})
+
+test('🔴 一体化顶栏必须合并且采用 macOS 原生分段控制器结构', () => {
+  const html = panelAsset('/panel/')?.body ?? ''
+  const css = panelAsset('/panel/style.css')?.body ?? ''
+  // 顶栏中包裹 brand、nav、auth 三部分
+  assert.ok(/<header[^>]*class="app-header"|<header>/.test(html), '应有统一 header')
+  assert.ok(/class="nav-segmented"/.test(html), 'nav 应具备 nav-segmented 类名')
+  // CSS 中应有 Segmented Control 的样式
+  assert.ok(/\.nav-segmented/.test(css), 'CSS 中应有 .nav-segmented 规则')
+  // 不得画假的 macOS 红黄绿窗口按钮
+  assert.ok(!/traffic-lights|window-controls|macos-dots/.test(html), '严禁在网页内画假的 macOS 窗口圆点')
+})

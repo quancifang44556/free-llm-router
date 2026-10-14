@@ -213,3 +213,92 @@ export function providerCatalog(): Array<{
 }> {
   return PROVIDERS.map((p) => ({ id: p.id, name: p.name, capabilities: p.capabilities }))
 }
+
+export interface BuiltinModelInfo {
+  id: string
+  name: string
+  provider: string
+  providerName: string
+  isFree?: boolean
+  isBuiltin: boolean
+}
+
+/**
+ * 获取系统内置支持的全部已知模型列表。
+ * 当用户账号池尚无在线账号或拉取上游目录失败时，保证面板模型目录绝不空白。
+ */
+export function getBuiltinModels(): BuiltinModelInfo[] {
+  return [
+    // 聚合路由
+    { id: 'aggregate/deepseek-v4-1-flash', name: 'DeepSeek V4.1 Flash (临期聚合)', provider: 'aggregate', providerName: '聚合路由', isFree: true, isBuiltin: true },
+    { id: 'aggregate/glm-5-3-flash', name: 'GLM 5.3 Flash (临期聚合)', provider: 'aggregate', providerName: '聚合路由', isFree: true, isBuiltin: true },
+    { id: 'aggregate/auto', name: 'Auto (自动优选临期渠道)', provider: 'aggregate', providerName: '聚合路由', isFree: true, isBuiltin: true },
+
+    // Buddy 国内版
+    { id: 'buddy/deepseek-v4.1-flash', name: 'DeepSeek V4.1 Flash', provider: 'buddy', providerName: 'CodeBuddy(国内版)', isFree: true, isBuiltin: true },
+    { id: 'buddy/glm-5.3-flash', name: 'GLM 5.3 Flash', provider: 'buddy', providerName: 'CodeBuddy(国内版)', isFree: true, isBuiltin: true },
+    { id: 'buddy/fast-model', name: 'Fast Model (快速模型)', provider: 'buddy', providerName: 'CodeBuddy(国内版)', isFree: true, isBuiltin: true },
+    { id: 'buddy/balanced-model', name: 'Balanced Model (均衡模型)', provider: 'buddy', providerName: 'CodeBuddy(国内版)', isFree: true, isBuiltin: true },
+    { id: 'buddy/deep-model', name: 'Deep Model (深度推理)', provider: 'buddy', providerName: 'CodeBuddy(国内版)', isFree: true, isBuiltin: true },
+    { id: 'buddy/hy3', name: 'Hunyuan 3.0 (混元大模型)', provider: 'buddy', providerName: 'CodeBuddy(国内版)', isFree: true, isBuiltin: true },
+
+    // WorkBuddy 国际版
+    { id: 'workbuddy/deepseek-v4.1-flash', name: 'DeepSeek V4.1 Flash', provider: 'workbuddy', providerName: 'WorkBuddy(国际版)', isFree: true, isBuiltin: true },
+    { id: 'workbuddy/glm-5.3-flash', name: 'GLM 5.3 Flash', provider: 'workbuddy', providerName: 'WorkBuddy(国际版)', isFree: true, isBuiltin: true },
+    { id: 'workbuddy/fast-model', name: 'Fast Model', provider: 'workbuddy', providerName: 'WorkBuddy(国际版)', isFree: true, isBuiltin: true },
+    { id: 'workbuddy/deep-model', name: 'Deep Reasoning Model', provider: 'workbuddy', providerName: 'WorkBuddy(国际版)', isFree: true, isBuiltin: true },
+
+    // Qoder
+    { id: 'qoder/claude-3-5-sonnet', name: 'Claude 3.5 Sonnet', provider: 'qoder', providerName: 'Qoder (通义灵码)', isFree: true, isBuiltin: true },
+    { id: 'qoder/gpt-4o', name: 'GPT-4o', provider: 'qoder', providerName: 'Qoder (通义灵码)', isFree: true, isBuiltin: true },
+    { id: 'qoder/deepseek-v3', name: 'DeepSeek V3', provider: 'qoder', providerName: 'Qoder (通义灵码)', isFree: true, isBuiltin: true },
+    { id: 'qoder/deepseek-coder', name: 'DeepSeek Coder', provider: 'qoder', providerName: 'Qoder (通义灵码)', isFree: true, isBuiltin: true },
+    { id: 'qoder/qwen-2.5-coder-32b', name: 'Qwen 2.5 Coder 32B', provider: 'qoder', providerName: 'Qoder (通义灵码)', isFree: true, isBuiltin: true },
+
+    // MiniMax
+    { id: 'minimax/MiniMax-Text-01', name: 'MiniMax-Text-01 (大模型推理)', provider: 'minimax', providerName: 'MiniMax', isFree: true, isBuiltin: true },
+    { id: 'minimax/abab6.5s-chat', name: 'abab6.5s Chat', provider: 'minimax', providerName: 'MiniMax', isFree: true, isBuiltin: true },
+    { id: 'minimax/M3', name: 'MiniMax M3', provider: 'minimax', providerName: 'MiniMax', isFree: true, isBuiltin: true },
+
+    // CodeArts
+    { id: 'codearts/deepseek-v4.1-flash', name: 'DeepSeek V4.1 Flash', provider: 'codearts', providerName: '华为云 CodeArts', isFree: true, isBuiltin: true },
+    { id: 'codearts/glm-5.3-flash', name: 'GLM 5.3 Flash', provider: 'codearts', providerName: '华为云 CodeArts', isFree: true, isBuiltin: true },
+    { id: 'codearts/codearts-snap-model', name: 'CodeArts Snap 专属模型', provider: 'codearts', providerName: '华为云 CodeArts', isFree: true, isBuiltin: true },
+
+    // LobsterAI
+    { id: 'lobsterai/deepseek-flash', name: 'DeepSeek Flash', provider: 'lobsterai', providerName: 'LobsterAI', isFree: true, isBuiltin: true },
+    { id: 'lobsterai/glm-5.3-flash', name: 'GLM 5.3 Flash', provider: 'lobsterai', providerName: 'LobsterAI', isFree: true, isBuiltin: true },
+    { id: 'lobsterai/claude-3-5-sonnet', name: 'Claude 3.5 Sonnet', provider: 'lobsterai', providerName: 'LobsterAI', isFree: true, isBuiltin: true },
+
+    // Trae
+    { id: 'trae/claude-3-5-sonnet', name: 'Claude 3.5 Sonnet', provider: 'trae', providerName: '字节 Trae', isFree: true, isBuiltin: true },
+    { id: 'trae/gpt-4o', name: 'GPT-4o', provider: 'trae', providerName: '字节 Trae', isFree: true, isBuiltin: true },
+    { id: 'trae/deepseek-v4.1-flash', name: 'DeepSeek V4.1 Flash', provider: 'trae', providerName: '字节 Trae', isFree: true, isBuiltin: true },
+
+    // Gemini
+    { id: 'gemini/gemini-2.5-pro', name: 'Gemini 2.5 Pro', provider: 'gemini', providerName: 'Google Gemini', isFree: true, isBuiltin: true },
+    { id: 'gemini/gemini-2.5-flash', name: 'Gemini 2.5 Flash', provider: 'gemini', providerName: 'Google Gemini', isFree: true, isBuiltin: true },
+    { id: 'gemini/gemini-2.0-flash', name: 'Gemini 2.0 Flash', provider: 'gemini', providerName: 'Google Gemini', isFree: true, isBuiltin: true },
+
+    // Cline
+    { id: 'cline/claude-3-5-sonnet', name: 'Claude 3.5 Sonnet', provider: 'cline', providerName: 'Cline', isFree: true, isBuiltin: true },
+    { id: 'cline/deepseek-v3', name: 'DeepSeek V3', provider: 'cline', providerName: 'Cline', isFree: true, isBuiltin: true },
+
+    // OpenCode
+    { id: 'opencode/claude-3-5-sonnet', name: 'Claude 3.5 Sonnet', provider: 'opencode', providerName: 'OpenCode Zen', isFree: true, isBuiltin: true },
+    { id: 'opencode/gpt-4o', name: 'GPT-4o', provider: 'opencode', providerName: 'OpenCode Zen', isFree: true, isBuiltin: true },
+    { id: 'opencode/deepseek-v3', name: 'DeepSeek V3', provider: 'opencode', providerName: 'OpenCode Zen', isFree: true, isBuiltin: true },
+
+    // Raccoon
+    { id: 'raccoon/sensechat-5', name: 'SenseChat 5.0 (日日新)', provider: 'raccoon', providerName: '商汤 Raccoon', isFree: true, isBuiltin: true },
+    { id: 'raccoon/deepseek-v3', name: 'DeepSeek V3', provider: 'raccoon', providerName: '商汤 Raccoon', isFree: true, isBuiltin: true },
+
+    // ZCode
+    { id: 'zcode/deepseek-v3', name: 'DeepSeek V3', provider: 'zcode', providerName: 'ZCode', isFree: true, isBuiltin: true },
+    { id: 'zcode/zcode-coder', name: 'ZCode Coder', provider: 'zcode', providerName: 'ZCode', isFree: true, isBuiltin: true },
+
+    // Loomy
+    { id: 'loomy/DeepSeek-V4.1-Flash', name: 'DeepSeek V4.1 Flash', provider: 'loomy', providerName: '讯飞 Loomy', isFree: true, isBuiltin: true },
+    { id: 'loomy/MiniMax-M3', name: 'MiniMax M3', provider: 'loomy', providerName: '讯飞 Loomy', isFree: true, isBuiltin: true },
+  ]
+}

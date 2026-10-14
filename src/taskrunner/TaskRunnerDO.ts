@@ -175,7 +175,29 @@ export class TaskRunnerDO extends DurableObject<Env> {
     state.done.push({ code: step.code, action: step.action, ok: result.ok, detail: result.detail })
     state.updatedAt = now
     if (!result.ok) state.lastError = result.detail
-    if (state.queue.length === 0) state.finished = true
+    if (state.queue.length === 0) {
+      state.finished = true
+      try {
+        const pool = this.env.ACCOUNT_POOL.get(this.env.ACCOUNT_POOL.idFromName(context.realm))
+        const okCount = state.done.filter((d) => d.ok).length
+        const planName = state.plan ?? 'daily'
+        await pool.appendLog({
+          id: Math.random().toString(36).slice(2, 10),
+          time: now,
+          type: 'task',
+          model: `TaskRunner/${planName}`,
+          provider: 'task',
+          uid: context.uid,
+          status: state.lastError ? 500 : 200,
+          durationMs: now - state.startedAt,
+          tokens: { input: 0, output: 0, total: 0 },
+          stream: false,
+          error: state.lastError
+            ? `计划执行完成（${okCount}/${state.done.length} 成功）：${state.lastError.slice(0, 120)}`
+            : `任务计划「${planName}」执行完毕，全部 ${state.done.length} 步执行成功`,
+        })
+      } catch {}
+    }
 
     await this.save(state)
 
