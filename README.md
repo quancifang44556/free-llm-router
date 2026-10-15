@@ -193,7 +193,8 @@ npm run deploy
 | `CREDENTIAL_KEY` | 凭据 AES-GCM 加密密钥 | **拒绝写入凭据**（不静默明文落盘） |
 
 域名绑定（Route vs Custom Domain / 优选 IP 前提）、`workers.dev` 兜底、GitHub 自动部署等，
-见 [DEPLOY.md](DEPLOY.md)。
+见 [DEPLOY.md](DEPLOY.md)。该文档同时是 **VPS 部署的详细版**
+（反向代理 / HTTPS / 数据备份迁移 / 更新 / 排障）。
 
 ---
 
