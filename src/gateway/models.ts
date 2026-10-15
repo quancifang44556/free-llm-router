@@ -35,6 +35,8 @@ export interface OpenAiModel {
   isDefault?: boolean
   /** 厂商（上游 `vendor`）。 */
   vendor?: string
+  /** 上游官方资费/倍率（如 "x0.00", "x0.11", "x0.51"）。 */
+  credits?: string
 }
 
 /** 从账号池取第一个可用账号（1–3 账号场景下够用）。 */
@@ -162,6 +164,7 @@ function mapModels(models: unknown[]): OpenAiModel[] {
       ...(bool('supportsReasoning') === undefined ? {} : { supportsReasoning: bool('supportsReasoning') as boolean }),
       ...(bool('isDefault') === undefined ? {} : { isDefault: bool('isDefault') as boolean }),
       ...(str('vendor') === undefined ? {} : { vendor: str('vendor') as string }),
+      ...(str('credits') === undefined ? {} : { credits: str('credits') as string }),
     })
   }
   return out

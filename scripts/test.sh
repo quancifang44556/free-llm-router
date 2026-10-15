@@ -17,14 +17,10 @@ mkdir -p "$OUT"
 
 for f in tests/*.test.ts; do
   name=$(basename "$f" .test.ts)
-  # --external:cloudflare:workers 是必需的：actions.ts 会（通过类型与常量）
-  # 拽进 TaskRunnerDO，而后者 import 'cloudflare:workers'（Workers 运行时内置模块）。
-  # 单测在 Node 下跑，标记为 external 即可 —— 测试不会真的实例化 DO。
-  # --loader 让面板的静态资源在单测里也当**字符串**导入（与 wrangler 的
-  # Text 规则一致）。不配的话 esbuild 会因为不知道 .html/.css.txt 怎么处理而报错。
+  # --alias:cloudflare:workers 让 Node.js 环境下测试能够无缝加载并实例化 DurableObject 状态机
   ./node_modules/.bin/esbuild "$f" \
     --bundle --format=esm --platform=node \
-    --external:cloudflare:workers \
+    --alias:cloudflare:workers=./src/server/cf-shim.ts \
     --loader:.html=text --loader:.css.txt=text --loader:.js.txt=text \
     --loader:.wasm=file \
     --outfile="$OUT/$name.test.mjs" --log-level=warning

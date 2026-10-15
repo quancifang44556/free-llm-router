@@ -111,6 +111,8 @@ export interface ProviderModel {
   supportsImage: boolean
   /** 是否免费额度模型。 */
   isFree: boolean
+  /** 上游官方资费 / 倍率（如 "x0.00", "x0.11", "x0.51"）。 */
+  credits?: string
 }
 
 /** 余额信息（统一形状）。 */

@@ -64,9 +64,15 @@ function fromBase64Url(value: string): Uint8Array {
  * `CREDENTIAL_KEY` 应当是高熵随机串（用 `openssl rand -base64 32` 生成）。
  * 若将来要支持用户自设密码，必须换成 PBKDF2/scrypt。
  */
+const keyCache = new Map<string, CryptoKey>()
+
 async function deriveKey(secret: string): Promise<CryptoKey> {
+  const cached = keyCache.get(secret)
+  if (cached !== undefined) return cached
   const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(secret))
-  return await crypto.subtle.importKey('raw', digest, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt'])
+  const key = await crypto.subtle.importKey('raw', digest, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt'])
+  keyCache.set(secret, key)
+  return key
 }
 
 /**

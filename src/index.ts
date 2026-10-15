@@ -2375,7 +2375,7 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
 
   // ── 模型资费探针（发送 1-token 极简请求，检查上游返回的 usage.credit 判定是否免费） ──
   if (path === '/admin/models/probe' && request.method === 'POST') {
-    const body = (await request.json().catch(() => ({}))) as { model?: string }
+    const body = (await request.json().catch(() => ({}))) as { model?: string; credits?: string }
     const model = body.model ?? ''
     if (model === '') return jsonError(400, 'model 必填', 'invalid_request')
 
@@ -2394,7 +2394,9 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
         }),
       })
 
-      const gatewayResult = await handleChatCompletions(probeReq, env, 'cn', ctx)
+      // ⚠️ 分片消歧：根据模型前缀选择正确的 realm，国际版走 global，国内版走 cn
+      const targetRealm = model.startsWith('workbuddy/') ? 'global' : 'cn'
+      const gatewayResult = await handleChatCompletions(probeReq, env, targetRealm, ctx)
       const res = gatewayResult.response
       if (!res.ok) {
         const errJson = (await res.json().catch(() => ({}))) as { error?: { message?: string } }
@@ -2411,14 +2413,40 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
       const reply = (await res.json().catch(() => ({}))) as {
         usage?: { credit?: number }
       }
-      const credit = typeof reply.usage?.credit === 'number' ? reply.usage.credit : 0
-      const isFree = credit === 0
+      const rawCredit = reply.usage?.credit
+      const hasCreditNum = typeof rawCredit === 'number' && Number.isFinite(rawCredit)
+      const creditNum = hasCreditNum ? rawCredit : 0
+      const officialCredits = body.credits?.trim() || ''
+
+      // 资费判断：
+      // 1. 若实测扣费 > 0，明确为计费模型
+      // 2. 若实测扣费为 0，但官方倍率明确为非 0（如 x0.11、x0.51 等），绝不误标为免费 0 积分！
+      // 3. 只有官方下发 x0.00 / x0 或确认为免费基模时，才标为 0 积分免费
+      let isFree = false
+      let statusText = ''
+
+      if (creditNum > 0) {
+        isFree = false
+        statusText = `单次消耗 ~${creditNum} 积分`
+      } else if (officialCredits && officialCredits !== 'x0.00' && officialCredits !== 'x0' && officialCredits !== '0') {
+        isFree = false
+        statusText = `${officialCredits} 倍率 (计费)`
+      } else if (officialCredits === 'x0.00' || officialCredits === 'x0' || officialCredits === '0') {
+        isFree = true
+        statusText = '0 积分 (完全免费)'
+      } else {
+        // 未声明倍率且单字扣费为 0 的模型
+        isFree = creditNum === 0
+        statusText = isFree ? '免费 (0积分)' : `消耗 ${creditNum} 积分`
+      }
+
       return json({
         model,
         ok: true,
         isFree,
-        credit,
-        status: isFree ? '免费 (0积分)' : `消耗 ${credit} 积分`,
+        credit: creditNum,
+        officialCredits: officialCredits || undefined,
+        status: statusText,
       })
     } catch (error) {
       return json({

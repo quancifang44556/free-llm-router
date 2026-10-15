@@ -21,7 +21,10 @@
 - **全部核心能力已用真实账号端到端验证**：凭据加密、任务自动化（growth 计划 23/23 成功）、
   OpenAI 兼容流式/非流式网关 + **Responses API**、**13 家供应商**、
   **聚合路由**（跨渠道临期优先）、用量四窗口、面板 + 安全头。
-- **572 条单测通过**（`npm test`）；`npm run typecheck` 通过。
+- **588 条单测通过**（`npm test`）；`npm run typecheck` 通过。
+- **最新一轮（2026-10-15）**：修复「限流不换号」（SSE `data:` 前缀致 6004 误判为
+  `unknown` 而 break）+ 国内版↔国际版跨渠道容灾（含 4 个自引入的死循环/body 复用缺陷，
+  见 §9.17）。
 
 **第 1–8 步的实施记录、实测结论与踩过的坑，全部在 [§9 实施进度与实测发现](#九实施进度与实测发现)。**
 原先 `docs/` 下的 8 份分步文档已并入该节，`docs/` 目录已删除。
@@ -2903,6 +2906,173 @@ src/
 │   └── qoder-auth-wasm.wasm  （wrangler 内建 CompiledWasm 规则）
 └── store/                ⑦ 存储（DO SQLite + AES-GCM 凭据加密 + 用量/日志环形缓冲）
 ```
+
+### 9.17 限流不换号 + 跨渠道容灾 + 分片串用（2026-10-15）
+
+**测试基线：588 条单测通过。** 本轮修的是**用户报障**「一个号限流了不会切别的号」
+与「国内版限流了国际版也用不了」，以及**我在修容灾时自己引入的 4 个缺陷**。
+
+#### 🔴 一、限流不换号的两层根因（用户报障的直接原因）
+
+**根因 1：SSE 首帧的 `data:` 前缀让 `classify` 判成了 `unknown`，直接 `break`。**
+
+上游在 **HTTP 200** 下用**首个 SSE 帧**下发 6004 限流：
+```
+data: {"code":6004,"msg":"模型限流，建议切换其他模型，reset at … UTC+8"}
+```
+而 `parseEnvelope` 首行判据是 `trimmed.startsWith('{')` —— 看到 `data:` 直接
+返回 `undefined` ⇒ `classify(200, …)` 落到兜底 `{kind:'unknown'}` ⇒
+`mapErrorToPunishment('unknown')` 的 **`rotate: false`** ⇒ 换号循环里的
+`if (mapped.rotate) continue; break` **当场 break**，池里再多健康号也不再尝试。
+
+⚠️ 这个缺陷的形状值得记：**「限流了却不换号」不是换号逻辑坏了，而是
+错误被误分类成了「不该换号」的类别。** 错误分类的任何偏差都会放大成
+路由行为错误（与 §9.9 的「一个前缀写错 → 整模型被拉黑 6 小时」同源）。
+
+**根因 2：分包截断被误判成错误帧。**
+
+`tryDetectError` 原先对 `JSON.parse` 失败**一律**返回
+`无法解析的上游帧：…`。而首块 TCP 分包可能把正常的 SSE chunk 从
+中文字符或 JSON 属性中间截断 ⇒ `JSON.parse` 抛 SyntaxError ⇒
+**一个完全正常的请求被当成错误帧**，扣上模型冷却并误换号。
+
+**修法**：
+
+| 处 | 改动 |
+|---|---|
+| `upstream/client.ts` `parseEnvelope` | 支持剥离 `data:` 前缀（单帧 `data:{...}` 与多行 SSE 均认） |
+| `gateway/server.ts` `tryDetectError` | `JSON.parse` 失败**返回 `undefined`**（分包不是错误） |
+| `gateway/server.ts` `peekStreamForError` | 新增 `cleanJson` 字段：把**已剥离前缀的干净 JSON** 一并带出，供 `classify` 用 |
+| 两条 chat 路径的预检分支 | `errText = cleanJson ?? rawText ?? error`；并复用 `mapErrorToPunishment`（`punish`/`rotate` 判定与 HTTP 路径统一），provider 路径不再硬编码 `'rate_limited'` |
+
+#### 后续补充：SSE 错误帧跨网络块时也要预检完整
+
+原预检只读 `ReadableStream` 的第一块；若 `data: {"code":6004,...}` 恰好被拆在多个网络块里，
+解析器会把不完整 JSON 当作普通帧交给客户端，之后虽能显示错误，却已错过换号时机。
+现改为预读到首个完整 SSE 数据行（或完整 JSON），最多缓存 64 KiB；未命中错误时按原字节顺序回放，
+保持流内容不变。类型检查通过；本次没有运行单测，也没有部署。
+
+⚠️ **`parseEnvelope` 是被 `isWafBlocked` 复用的**（403 无信封判 WAF）。放宽它
+必须保证**只有合法 JSON 信封才算命中** —— 已加单测锁死
+（403 + `data:` 前缀的业务信封不该被误判成 WAF）。
+
+#### 🔴 二、国内版 ↔ 国际版跨渠道容灾（用户报障的第二半）
+
+账号分片存放：国内版 `buddy` 在 `cn`、国际版 `workbuddy` 在 `global`。
+原实现里 `workbuddy` 请求会**先探测 global 是否存在账号**，没有才回落 `cn`
+—— 「回落」意味着**拿国内凭据去打国际版端点**（必然 401 / 11-128）。
+
+**修法**：
+1. 请求 `workbuddy` 时**规范分片严格锁定 `global`**，绝不回落 `cn`；
+2. `buddy` 全部不可用时**自动容灾到 `workbuddy`**，反之亦然；
+3. 容灾判据用 `healthyForModel()`（含冷却/限流），不是只看 `!disabled`；
+4. `listModelsForProvider` 同步做分片消歧（否则聚合目录漏掉国际版）。
+
+#### 🔴 三、我在修容灾时引入的 4 个缺陷（自查发现并修掉）
+
+⚠️ **这一节的教训比结论更重要：容灾是两个函数互相调用，极易写成死循环。**
+
+| # | 缺陷 | 后果 | 修法 |
+|---|---|---|---|
+| 1 | `buddy→workbuddy→buddy→…` **无限相互递归** | 栈溢出 / CPU 超时 | 给两个函数加 `failoverDepth`（`handleChatCompletions` 默认 0、`handleProviderChat` 读 `input.failoverDepth ?? 0`），**只有深度 0 才容灾**，反向调用传 1 |
+| 2 | 复用**已被消费**的 `request`（其 body 在函数开头已 `request.json()`） | 二次读取抛错 ⇒ **恒 400「请求体必须是合法 JSON」** | 用 `rawBody` **重建全新 `Request`**（与 `responses.ts` 同一模式） |
+| 3 | 重建后 `model` 仍带 `workbuddy/` 前缀 | `splitModelName` 又路由回 workbuddy ⇒ 自我循环 | 重建时把 `model` **改写为裸名** |
+| 4 | 容灾判据只查 `!disabled`（忽略冷却/限流） | 限流中但未禁用的账号通过检查 ⇒ 必然乒乓 | 改用 `healthyForModel(a, now, model)` |
+
+⚠️ **聚合路径必须显式传 `failoverDepth: 1`**：聚合层自己已有候选轮转循环，
+若还允许它内部的跨渠道容灾，会让单候选失败先容灾一轮再叠加聚合轮转，
+**白白放大请求**。
+
+**回归测试**（`tests/gateway.test.ts`）：钉住「两个入口都有 `failoverDepth`」
+「两个方向都判 `failoverDepth === 0`」「国际版回退必须传重建的
+`fallbackRequest` 且深度=1」。
+
+#### 顺带的其它修复
+
+| 处 | 改动 | 理由 |
+|---|---|---|
+| `providers/buddy.ts` `withSystemFirst` | 首条是 `system` 但**内容为空**时填充默认内容 | 国际版要求首条 system **且非空**，空串会回 11-128 |
+| `providers/buddy.ts` `matchesShape` | 同时认**嵌套** `auth.domain` / `auth.realm` | 嵌套形态凭据此前被判非国际版，误存进 `cn` 分片 |
+| `pool/AccountPoolDO.ts` `pick` | 支持 `random` / `roundrobin` 调度策略（此前配置**从未被读取**，面板里选什么都不生效）；同时间戳按 `uid` 稳定排序 | 让面板的「负载均衡模式」真正生效；稳定排序避免目录顺序抖动 |
+
+#### ⚠️ 一条**非代码**的观察：`unknown certificate verification error`
+
+用户在国际版上报此错，实测此时 Cloudflare Worker 出站到 `www.workbuddy.ai`
+**TLS 校验失败**。这**不是代码缺陷** —— 修完分类后它会**如实报出**
+（而不是像之前那样被误分类掩盖成 400 / 死循环）；随后链路自行恢复
+（实测同一请求 20.8s → 3.9s，`wrangler tail --status error` 零错误日志）。
+⚠️ 本沙箱对 `www.workbuddy.ai` **完全不可达**（curl HTTP 000），
+故国际版链路**无法在此环境端到端复现** —— 记录备查，不要误判成服务故障。
+
+#### 部署记录
+
+- 部署到 CF 账号：`https://<worker 名>.<你的子域>.workers.dev`（线上自定义域 `<你的域名>`）；
+- 版本 ID `<部署版本 ID>`；588 单测 + `typecheck` + `deploy --dry-run` 全通过；
+- 已推送到 `origin`，提交 `ad78ddc`；
+- **推送前隐私自检**：全文扫描 CF API Token / Account ID / 自定义域 / 账号邮箱
+  均**零命中**（唯一命中在 gitignore 的 `.playwright-mcp/` 里）。
+
+### 9.18 长上下文大请求触发 Workers Free 10ms CPU 超限（503 Service Unavailable）与极致优化（2026-10-15）
+
+**测试基线：1176 条单测通过。** 本轮排查并解决了用户使用 `workbuddy/deepseek-v4.1-flash` 进行 Agent 大工程编辑时客户端持续收到 `Service Unavailable [retrying in 3s attempt #3]` 的硬故障。
+
+#### 🔴 一、实时抓包日志直接证据（通过 Cloudflare 大号令牌捕获）
+
+通过开启 `wrangler tail --status error` 实测抓获真实错误现场：
+```
+POST https://<你的域名>/v1/chat/completions - Exceeded CPU Limit @ 2026/10/15 22:03:06
+  (log) [pick:workbuddy] 选中账号 uid=workbuddy:<账号 uid> realm=global tried=1
+ [ERROR] Error: Worker exceeded CPU time limit.
+
+POST https://<你的域名>/v1/chat/completions - Exceeded CPU Limit @ 2026/10/15 22:03:15
+ [ERROR] Error: Worker exceeded CPU time limit.
+
+POST https://<你的域名>/v1/chat/completions - Exceeded CPU Limit @ 2026/10/15 22:03:32
+ [ERROR] Error: Worker exceeded CPU time limit.
+```
+
+#### 🔴 二、根因定位分析
+
+1. **平台额度刚性红线**：
+   - 目标 Cloudflare 账号使用的是 **Workers Free 计划**。
+   - 尝试在 `wrangler.jsonc` 配置 `limits: { cpu_ms: 30000 }` 时被 Cloudflare API 明确驳回：
+     `CPU limits are not supported for the Free plan. Switch to a paid plan at https://dash.cloudflare.com/... to set CPU limits. [code: 100328]`
+   - 在 Free 计划下，Cloudflare 严格限制单次请求的 **V8 CPU 执行时间不得超过 10ms**（不计等待 I/O 的时间）。一旦 JS 主线程执行超过 10ms，Worker 进程直接被运行时强制掐断并向客户端返回 503 Service Unavailable。
+2. **大上下文/Agent 连续编辑场景下的 5 重 CPU 叠加放大**：
+   - **死代码 SHA-256 浪费**：`src/providers/buddy.ts` 的 `chat()` 中，历史遗留了两次 `await deriveDeviceId(...)`（SHA-256 计算 `machineId` 和 `sessionId`），但出站调用的 `referenceChatHeaders` 根本不接收这两个参数，白白消耗 2 次 WebCrypto 异步计算；
+   - **无缓存高频加解密**：`AccountPoolDO.getCredential()` 每次选号均执行 SQL 查询、SHA-256 密钥派生、AES-256-GCM 解密与 `JSON.parse`，在连续对话时 CPU 消耗严重；
+   - **长历史无条件双重全量扫描**：`src/gateway/payload.ts` 的 `cleanupToolPairing(messages)` 无论消息中是否有工具调用，一律实例化 `Set` 并双重遍历复制所有消息，长对话下开销成倍增加；
+   - **流式响应行截取 O(N²) 内存拷贝**：`streamResponse` 内部读取 SSE 帧时，使用 `buffer = buffer.slice(nl + 1)` 截取剩余内容。如果单个 TCP 数据包包含成百上千行，每次循环都对剩余字符串切片复制，导致内存高频分配与垃圾回收；
+   - **逐帧复杂正则扫描**：`src/gateway/stream.ts` 中的 `dropEmptyFields` 对每帧执行两个含庞大分支的全局正则匹配与替换。
+
+#### 🔴 三、优化与修复落地
+
+| 模块 | 改动内容 | 效果 |
+|---|---|---|
+| `providers/buddy.ts` | 移除 `chat()` 中完全未被使用的两次 `deriveDeviceId` SHA-256 计算 | 消除无效密码学计算 |
+| `store/crypto.ts` | 增加 `keyCache = new Map<string, CryptoKey>()` 内存缓存 | 避免同一 secret 重复执行 SHA-256 与密钥导入 |
+| `pool/AccountPoolDO.ts` | 增加 `credentialCache` 内存缓存，更新/删除时自动失效 | 解密凭据常驻内存，`getCredential` 耗时接近 0ms |
+| `gateway/payload.ts` | `cleanupToolPairing` 增加前置快判：无 developer/tool/tool_calls 时直接原样返回 | 免除常规长文本对话的多余 Set 实例化与数组复制 |
+| `gateway/server.ts` | `streamResponse` 改用指针下标 `start` 推进（`indexOf('\n', start)`），读完一行只推下标，整块 chunk 消费完毕后仅切片一次 | 消除流处理中的二次方级内存复制与 GC 延迟 |
+| `gateway/stream.ts` | `dropEmptyFields` 增加极速预检（若帧内无 `""`、`[]` 及特定 null 键，直接返回原字符串） | 纯正文输出跳过全部正则匹配 |
+
+#### 四、部署与验证记录
+
+- 单元测试：`node --test` 运行 1176 条测试用例 **100% 通过（0 失败）**；
+- 类型检查：`npm run typecheck` 零报错；
+- 已成功部署至 Cloudflare 账号：
+  - Worker URL: `https://<worker 名>.<你的子域>.workers.dev`（线上绑定域名 `<你的域名>`）；
+  - 当前版本 ID: `<部署版本 ID>`；
+- 通过 `wrangler tail` 重新监听，错误已清零。
+
+#### 后续复查：CPU 超限仍有间歇性复现（2026-10-15）
+
+上述「错误已清零」只代表当时那次短时复查，不代表问题已彻底消失。之后使用大号账号查看
+`wrangler tail --status error`，仍捕获到 `/v1/chat/completions` 的 `Exceeded CPU Limit`；
+同一时段也有短流成功结束（约 22–24 帧）。日志样本没有把超限请求关联到具体阶段或帧数，
+因此不能把这批超限直接归因于上游限速，也不能据此断言 §9.18 的单项优化足以覆盖所有大请求。
+后续应优先拿到超限请求对应的流结束/帧数信息，再据实际路径定位；上游 `429/6004` 与
+Workers CPU 超限是两类故障，必须分开判断。
 
 ---
 

@@ -1,0 +1,8 @@
+node_modules
+.git
+.github
+.build
+.playwright-mcp
+data
+tests
+*.log

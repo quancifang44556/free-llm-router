@@ -83,6 +83,20 @@ export function ensureStreamOptions(body: Record<string, unknown>): void {
  * @returns 清理后的消息数组（无改动时返回原数组）
  */
 export function cleanupToolPairing(messages: unknown[]): unknown[] {
+  // ⚡ 性能快判：如果消息历史中完全没有 developer、tool 角色，也没有任何 tool_calls，
+  // 直接原样返回，彻底免除 Set 实例化、双重扫描与新数组内存分配（长对话省下数毫秒 CPU）。
+  let needsScan = false
+  for (const raw of messages) {
+    if (raw !== null && typeof raw === 'object') {
+      const msg = raw as Record<string, unknown>
+      if (msg.role === 'developer' || msg.role === 'tool' || msg.tool_calls !== undefined) {
+        needsScan = true
+        break
+      }
+    }
+  }
+  if (!needsScan) return messages
+
   // 第一遍：收集所有 assistant 消息声明的 tool_call id
   const declared = new Set<string>()
   for (const raw of messages) {

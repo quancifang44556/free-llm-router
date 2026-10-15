@@ -1,6 +1,7 @@
 node_modules/
 .wrangler/
 .build/
+dist/
 *.log
 .dev.vars
 
@@ -17,6 +18,11 @@ real_cred*.json
 # 私有本地记忆文档（不提交到 GitHub）
 MEMORY.md
 *memory*.md
+AGENT_NOTES.md
+
+# 个人调试脚本（会读真实凭据，不提交）
+scripts/inspect-models.cjs
+scripts/inspect_models.js
 
 # Playwright 临时测试快照与截图
 .playwright-mcp/

@@ -1275,6 +1275,7 @@ function renderUsageRanking(box, rows, key, labelOf) {
 
 let cachedModels = []
 let activeModelFilter = 'all' // 'all' | 'free'
+let activeModelProviderFilter = 'all' // 'all' | providerId
 
 function getModelProbeCache() {
   try {
@@ -1290,7 +1291,7 @@ function saveModelProbeCache(cache) {
   } catch {}
 }
 
-async function probeSingleModel(modelId, btnElement) {
+async function probeSingleModel(modelId, btnElement, modelCredits) {
   if (btnElement) {
     btnElement.disabled = true
     btnElement.textContent = '测试中…'
@@ -1298,7 +1299,7 @@ async function probeSingleModel(modelId, btnElement) {
   const res = await api('/admin/models/probe', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ model: modelId }),
+    body: JSON.stringify({ model: modelId, credits: modelCredits }),
   })
   if (btnElement) {
     btnElement.disabled = false
@@ -1327,6 +1328,18 @@ async function probeAllFreeModels() {
   }
   if (!cachedModels || cachedModels.length === 0) return
 
+  // ⚠️ 针对当前已筛选的渠道模型进行检测，不盲目扫描未绑定的其它渠道
+  let toProbe = cachedModels
+  if (activeModelProviderFilter !== 'all') {
+    toProbe = cachedModels.filter((m) => {
+      if (activeModelProviderFilter === 'buddy') return m.id.startsWith('buddy/')
+      if (activeModelProviderFilter === 'workbuddy') return m.id.startsWith('workbuddy/')
+      if (activeModelProviderFilter === 'aggregate') return m.id.startsWith('aggregate/')
+      return m.id.startsWith(activeModelProviderFilter + '/')
+    })
+  }
+  if (toProbe.length === 0) toProbe = cachedModels
+
   const probeBtn = $('probe-models-free')
   if (probeBtn) probeBtn.disabled = true
   const statusEl = $('probe-status-text')
@@ -1335,15 +1348,15 @@ async function probeAllFreeModels() {
   let checked = 0
   let freeCount = 0
 
-  for (let i = 0; i < cachedModels.length; i++) {
-    const m = cachedModels[i]
+  for (let i = 0; i < toProbe.length; i++) {
+    const m = toProbe[i]
     if (statusEl) {
-      statusEl.textContent = '正在检测 (' + (i + 1) + '/' + cachedModels.length + ')：' + m.id + '…'
+      statusEl.textContent = '正在检测 (' + (i + 1) + '/' + toProbe.length + ')：' + m.id + '…'
     }
     const res = await api('/admin/models/probe', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ model: m.id }),
+      body: JSON.stringify({ model: m.id, credits: m.credits }),
     })
     checked++
     if (res.ok && res.body) {
@@ -1374,9 +1387,58 @@ function renderModelsTable() {
   clear(box)
 
   const cache = getModelProbeCache()
+
+  // 动态提取当前存在的渠道分类标签
+  const provMap = new Map()
+  provMap.set('all', '全部已绑定渠道')
+  for (const m of (cachedModels || [])) {
+    let pid = 'other'
+    let pname = m.owned_by || '其它'
+    if (m.id.startsWith('buddy/')) { pid = 'buddy'; pname = '国内版 (buddy)' }
+    else if (m.id.startsWith('workbuddy/')) { pid = 'workbuddy'; pname = '国际版 (workbuddy)' }
+    else if (m.id.startsWith('aggregate/')) { pid = 'aggregate'; pname = '聚合路由 (aggregate)' }
+    else if (m.id.includes('/')) {
+      pid = m.id.split('/')[0]
+      pname = m.owned_by || pid
+    }
+    if (!provMap.has(pid)) provMap.set(pid, pname)
+  }
+
+  // 渠道快捷切换分段栏（仅在有多种渠道时展现）
+  if (provMap.size > 2) {
+    const provBar = document.createElement('div')
+    provBar.className = 'model-prov-bar'
+    provBar.style.cssText = 'display:flex; flex-wrap:wrap; gap:6px; margin-bottom:12px;'
+    for (const [pid, pname] of provMap) {
+      const btn = document.createElement('button')
+      btn.className = 'seg-btn small' + (activeModelProviderFilter === pid ? ' active' : '')
+      btn.textContent = pname
+      btn.onclick = () => {
+        activeModelProviderFilter = pid
+        renderModelsTable()
+      }
+      provBar.appendChild(btn)
+    }
+    box.appendChild(provBar)
+  }
+
   let list = cachedModels || []
+  if (activeModelProviderFilter !== 'all') {
+    list = list.filter((m) => {
+      if (activeModelProviderFilter === 'buddy') return m.id.startsWith('buddy/')
+      if (activeModelProviderFilter === 'workbuddy') return m.id.startsWith('workbuddy/')
+      if (activeModelProviderFilter === 'aggregate') return m.id.startsWith('aggregate/')
+      return m.id.startsWith(activeModelProviderFilter + '/')
+    })
+  }
+
   if (activeModelFilter === 'free') {
-    list = list.filter((m) => cache[m.id] && cache[m.id].isFree === true)
+    list = list.filter((m) => {
+      const info = cache[m.id]
+      if (info && info.isFree === true) return true
+      if (m.credits === 'x0.00' || m.credits === 'x0') return true
+      return false
+    })
   }
 
   if (list.length === 0) {
@@ -1424,21 +1486,35 @@ function renderModelsTable() {
     // 资费状态
     const tdStatus = document.createElement('td')
     const info = cache[m.id]
+    const officialCredits = m.credits || info?.officialCredits
+
     if (!info) {
-      const tag = document.createElement('span')
-      tag.className = 'tag'
-      tag.textContent = '未检测'
-      tdStatus.appendChild(tag)
-    } else if (info.ok && info.isFree) {
-      const tag = document.createElement('span')
-      tag.className = 'tag ok'
-      tag.textContent = '完全免费 (0积分)'
-      tdStatus.appendChild(tag)
-    } else if (info.ok && !info.isFree) {
-      const tag = document.createElement('span')
-      tag.className = 'tag warn'
-      tag.textContent = '消耗 ' + info.credit + ' 积分'
-      tdStatus.appendChild(tag)
+      if (officialCredits) {
+        const isFree = officialCredits === 'x0.00' || officialCredits === 'x0'
+        const tag = document.createElement('span')
+        tag.className = 'tag ' + (isFree ? 'ok' : 'warn')
+        tag.textContent = isFree ? '0 积分 (官方免费)' : officialCredits + ' 倍率'
+        tag.title = isFree ? '官方标定 0 积分免费模型' : '官方标定积分消耗倍率：' + officialCredits
+        tdStatus.appendChild(tag)
+      } else {
+        const tag = document.createElement('span')
+        tag.className = 'tag'
+        tag.textContent = '未检测'
+        tdStatus.appendChild(tag)
+      }
+    } else if (info.ok) {
+      if (info.isFree) {
+        const tag = document.createElement('span')
+        tag.className = 'tag ok'
+        tag.textContent = info.status || '0 积分 (完全免费)'
+        tdStatus.appendChild(tag)
+      } else {
+        const tag = document.createElement('span')
+        tag.className = 'tag warn'
+        tag.textContent = info.status || (officialCredits ? officialCredits + ' 倍率' : (typeof info.credit === 'number' && info.credit > 0 ? '消耗 ' + info.credit + ' 积分' : '按量计费'))
+        if (officialCredits) tag.title = '官方倍率: ' + officialCredits
+        tdStatus.appendChild(tag)
+      }
     } else {
       const tag = document.createElement('span')
       tag.className = 'tag err'
@@ -1456,7 +1532,7 @@ function renderModelsTable() {
     const testBtn = document.createElement('button')
     testBtn.className = 'ghost small'
     testBtn.textContent = '测资费'
-    testBtn.onclick = () => probeSingleModel(m.id, testBtn)
+    testBtn.onclick = () => probeSingleModel(m.id, testBtn, m.credits)
     btnGroup.appendChild(testBtn)
 
     const copyBtn = document.createElement('button')
@@ -1498,18 +1574,20 @@ async function loadModels() {
   const remote = (res.ok && res.body && Array.isArray(res.body.data)) ? res.body.data : []
   const builtins = (builtinRes.ok && builtinRes.body && Array.isArray(builtinRes.body.data)) ? builtinRes.body.data : []
 
-  // 按 id 合并，优先保留网关动态拉取到的模型信息
-  const map = new Map()
-  for (const b of builtins) {
-    if (!b || !b.id) continue
-    map.set(b.id, { id: b.id, name: b.name, owned_by: b.providerName || b.provider, isBuiltin: true })
-  }
-  for (const r of remote) {
-    if (!r || !r.id) continue
-    map.set(r.id, { ...r, isOnline: true })
+  // ⚠️ 体验优化：若网关已成功拉取到当前已绑定账号的可用模型，则100%只展示已绑定的渠道模型，
+  // 杜绝将用户未绑定的其它渠道模型混入导致测资费报错；若当前未绑定任何账号，则以内置目录作为示范兜底
+  if (remote.length > 0) {
+    cachedModels = remote.map((r) => ({ ...r, isOnline: true }))
+  } else {
+    cachedModels = builtins.map((b) => ({
+      id: b.id,
+      name: b.name,
+      owned_by: b.providerName || b.provider,
+      isBuiltin: true,
+      credits: b.isFree ? 'x0.00' : undefined,
+    }))
   }
 
-  cachedModels = Array.from(map.values())
   renderModelsTable()
 }
 

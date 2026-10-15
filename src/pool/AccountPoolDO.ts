@@ -271,8 +271,9 @@ export class AccountPoolDO extends DurableObject<Env> {
     return out
   }
 
-  /** 删除账号（连带其会话绑定）。 */
+  /** 删除账号（连带其会话绑定与凭据内存缓存）。 */
   async removeAccount(uid: string): Promise<void> {
+    this.credentialCache.delete(uid)
     deleteAccount(this.ctx.storage.sql, uid)
     this.ctx.storage.sql.exec('DELETE FROM sessions WHERE uid = ?', uid)
   }
@@ -402,6 +403,11 @@ export class AccountPoolDO extends DurableObject<Env> {
    * 缓存的系统路由与调度配置（避免每次 pick 高频读 storage）。
    */
   private cachedRoutingConfig?: RoutingConfig
+
+  /**
+   * 解密凭据的内存缓存（避免每次对话高频执行 SQLite 读取与 AES-GCM 解密，节约 CPU 预算）。
+   */
+  private credentialCache = new Map<string, unknown>()
 
   /**
    * 最近一次选中该账号的时刻（**进程内**，不落存储）。
@@ -624,6 +630,10 @@ export class AccountPoolDO extends DurableObject<Env> {
       case 'model': {
         const model = input.model ?? ''
         if (model === '') break
+        // ⚠️ 先剪枝再读 `hits`：否则一个**已自然到期**的旧冷却会让本次新失败
+        // 从上次的陈旧 `hits` 继续往上叠（11102 路径 6h→12h→24h），使一次新
+        // 失败直接吃到封顶退避。`state.ts` 明确要求 `hits` 从新鲜基数重新学习。
+        pruneExpired(state, now, MODEL_COST_TTL_MS)
         const prev = state.modelCooldowns[model]
         const hits = (prev?.hits ?? 0) + 1
         // 6004：对齐上游重置墙钟，未下发墙钟时按 60s 起步退避（频次超限短时退避）；
@@ -814,23 +824,29 @@ export class AccountPoolDO extends DurableObject<Env> {
    * 静默降级是最糟的选择 —— 用户会以为已经加密了。
    */
   async putCredential(uid: string, credential: unknown, now: number): Promise<void> {
+    this.credentialCache.set(uid, credential)
     const key = requireCredentialKey(this.env.CREDENTIAL_KEY)
     const ciphertext = await encryptCredential(key, credential)
     writeCredential(this.ctx.storage.sql, uid, ciphertext, now)
   }
 
   /**
-   * 读取并解密凭据。不存在返回 undefined；解密失败抛错（GCM 认证保证不返回垃圾）。
+   * 读取并解密凭据。优先读内存缓存，不存在读 SQLite 并解密。
    *
    * ⚠️ 返回 `unknown` 而不是泛型：**DO RPC 的类型映射不支持把泛型参数透传**
    * （写成 `getCredential<T>()` 会在调用点报 `Expected 0 type arguments`）。
    * 由调用方在边界处断言一次具体类型。
    */
   async getCredential(uid: string): Promise<unknown | undefined> {
+    const cached = this.credentialCache.get(uid)
+    if (cached !== undefined) return cached
+
     const ciphertext = readCredential(this.ctx.storage.sql, uid)
     if (ciphertext === undefined) return undefined
     const key = requireCredentialKey(this.env.CREDENTIAL_KEY)
-    return await decryptCredential(key, ciphertext)
+    const cred = await decryptCredential(key, ciphertext)
+    this.credentialCache.set(uid, cred)
+    return cred
   }
 
   /**

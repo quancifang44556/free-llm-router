@@ -1,0 +1,19 @@
+[Unit]
+Description=free-llm-router API Gateway Service
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/free-llm-router
+ExecStart=/usr/bin/node dist/server.mjs
+Restart=always
+RestartSec=5
+Environment=NODE_ENV=production
+Environment=PORT=11451
+Environment=HOST=0.0.0.0
+Environment=DATABASE_PATH=/opt/free-llm-router/data/router.db
+EnvironmentFile=-/opt/free-llm-router/.env
+
+[Install]
+WantedBy=multi-user.target

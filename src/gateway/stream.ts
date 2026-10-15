@@ -273,6 +273,17 @@ export function dropEmptyFields(rawData: string, learned?: string): string {
   // 循环（第一版写法）会在每轮重新扫描整帧，帧数一多就是**二次方**开销。
   let out = rawData
 
+  // ⚡ 极速短路：如果帧内完全没有空串 `""`、空数组 `[]`，也没有特定 null 字段，
+  // 证明该帧是完全规范的纯文本/思考输出，直接返回，跳过全部正则扫描（大回答节约大量 CPU）。
+  if (
+    !out.includes('""')
+    && !out.includes('[]')
+    && !out.includes('function_call')
+    && !out.includes('extra_fields')
+  ) {
+    return out
+  }
+
   // ① 首帧学到的字面量（若有）：定点替换，比通用正则快。
   // ⚠️ 学不到就跳过，由 ② 兜底 —— **绝不因为「学不到」而漏净化**。
   if (learned !== undefined && learned !== '') out = out.replaceAll(learned, '')

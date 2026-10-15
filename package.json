@@ -10,6 +10,9 @@
     "tail": "wrangler tail",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "build:check": "wrangler deploy --dry-run --outdir=.build",
+    "build:node": "node scripts/build-node.mjs",
+    "start": "node dist/server.mjs",
+    "start:node": "node dist/server.mjs",
     "test": "bash scripts/test.sh"
   },
   "devDependencies": {

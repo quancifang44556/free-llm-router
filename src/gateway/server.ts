@@ -906,6 +906,8 @@ function streamResponse(
       // 上游要拒绝请求必然在开头，不可能先正常输出几万字再报错。
       // 而每帧全串扫描要 9.6ms/2 万帧 —— 直接超 10ms 配额。
       let frameSeq = 0
+      // 是否已在流内检出错误帧（检出后立刻终止整条流，见下方 break）。
+      let errorDetected = false
       // ⚠️ **有状态**转换器：首帧判断一次，之后全程沿用该决定。
       //
       // 逐帧扫描整帧字符串**必然超预算**（实测 8000 帧的单次 `includes`
@@ -923,10 +925,11 @@ function streamResponse(
           // ⚠️ `{stream:true}` 必需：多字节字符可能跨 chunk，否则解码出乱码
           buffer += decoder.decode(value, { stream: true })
 
-          let nl = buffer.indexOf('\n')
+          let start = 0
+          let nl = buffer.indexOf('\n', start)
           while (nl >= 0) {
-            const line = buffer.slice(0, nl)
-            buffer = buffer.slice(nl + 1)
+            const line = buffer.slice(start, nl)
+            start = nl + 1
             const frame = parseSseLine(line)
 
             if (frame.kind === 'done') {
@@ -944,8 +947,12 @@ function streamResponse(
                 if (errMsg !== undefined) {
                   hooks.onError(errMsg)
                   controller.enqueue(encoder.encode(errorFrame(errMsg)))
-                  nl = buffer.indexOf('\n')
-                  continue
+                  // ⚠️ 必须是 break（终止整条流），不能是 continue：
+                  // continue 只回到 while 判断，上游在 HTTP 200 下「先发错误帧、
+                  // 后续正常帧照发」时，客户端会**同时**收到 error 帧与 choices 帧，
+                  // 违反 OpenAI SSE 语义（客户端行为未定义：可能既报错又渲染内容）。
+                  errorDetected = true
+                  break
                 }
               }
               sawChunk = true
@@ -966,12 +973,16 @@ function streamResponse(
               // ⚠️ 非预期形状必须让客户端看到（不静默丢）
               controller.enqueue(encoder.encode(errorFrame(frame.error ?? '非预期帧')))
             }
-            nl = buffer.indexOf('\n')
+            nl = buffer.indexOf('\n', start)
           }
+          // 检出错误帧：终止整条流，不再继续读取上游（避免 error 帧与内容帧混发）。
+          if (errorDetected) break
+          buffer = start > 0 ? buffer.slice(start) : buffer
         }
 
         // 流结束但从未产生内容 → 明确报「疑似截断」，而不是假装模型没话说
-        if (!sawChunk && !sawDone) {
+        // ⚠️ 已检出错误帧时不重复报：错误已发过，再补一条会污染客户端判断。
+        if (!errorDetected && !sawChunk && !sawDone) {
           const msg = '上游流在产生任何内容前结束（疑似被截断）'
           if (!hooks.clientGone?.()) {
             hooks.onError(msg)
@@ -980,7 +991,7 @@ function streamResponse(
             } catch {}
           }
         }
-        if (!sawDone && !hooks.clientGone?.()) {
+        if (!errorDetected && !sawDone && !hooks.clientGone?.()) {
           try {
             controller.enqueue(encoder.encode(doneFrame()))
           } catch {}
@@ -1054,9 +1065,9 @@ function tryDetectError(data: string): string | undefined {
  * 原实现一旦看到 200 就直接返回 `streamResponse` 给客户端，外层换号循环瞬间退出，
  * 导致池中有健康账号也无法自动轮换，客户端直接收到限流错误。
  *
- * ⇒ 在把响应交付给客户端之前，在内部预读取首块数据：
+ * ⇒ 在把响应交付给客户端之前，在内部预读取首帧：
  * 1. 若检测到限流或错误：拦截并记账，解绑会话粘性，继续外层循环挑选下一个账号！
- * 2. 若首块正常：无缝还原流传递给 streamResponse。
+ * 2. 若首帧正常：无缝还原流传递给 streamResponse。
  */
 async function peekStreamForError(body: ReadableStream<Uint8Array>): Promise<{
   error?: string
@@ -1065,84 +1076,164 @@ async function peekStreamForError(body: ReadableStream<Uint8Array>): Promise<{
   stream: ReadableStream<Uint8Array>
 }> {
   const reader = body.getReader()
-  const first = await reader.read()
-  if (first.done || !first.value) {
-    reader.releaseLock()
-    return {
-      stream: new ReadableStream<Uint8Array>({
-        start(controller) {
-          controller.close()
-        },
-      }),
-    }
-  }
-
-  const firstValue = first.value
   const decoder = new TextDecoder()
-  const text = decoder.decode(firstValue)
+  const prefixChunks: Uint8Array[] = []
+  const maxPeekBytes = 64 * 1024
+  let prefixBytes = 0
+  let text = ''
+  let lineStart = 0
+  let candidate: 'unknown' | 'sse' | 'json' | 'plain' = 'unknown'
 
-  let isError = false
-  let errorMsg: string | undefined
-  let cleanJson: string | undefined
-
-  // 1. 尝试直接检测完整或部分 JSON
-  const trimmed = text.trim()
-  if (trimmed.startsWith('{')) {
-    try {
-      const parsed = JSON.parse(trimmed) as Record<string, unknown>
-      const err = detectErrorFrame(parsed)
-      if (err !== undefined) {
-        isError = true
-        errorMsg = err
-        cleanJson = trimmed
-      }
-    } catch {}
-  }
-
-  // 2. 检查是否有 data: 开头的 SSE 错误帧
-  if (!isError && (text.includes('data:') || text.includes('code') || text.includes('error'))) {
-    const lines = text.split('\n')
-    for (const line of lines) {
-      const parsedLine = parseSseLine(line)
-      if (parsedLine.kind === 'chunk' && parsedLine.data !== undefined) {
-        const err = tryDetectError(parsedLine.data)
-        if (err !== undefined) {
-          isError = true
-          errorMsg = err
-          cleanJson = parsedLine.data
-          break
+  // 预读到第一个完整 SSE 数据行，避免 TCP 分包恰好截断 `data: {...6004...}` 时漏判。
+  // 仅缓存首行，且有 64 KiB 上限；未识别为限流时把全部预读字节原样交回客户端。
+  const replay = (): ReadableStream<Uint8Array> => {
+    let index = 0
+    return new ReadableStream<Uint8Array>({
+      async pull(controller) {
+        if (index < prefixChunks.length) {
+          controller.enqueue(prefixChunks[index++]!)
+          return
         }
-      }
-    }
+        const { done, value } = await reader.read()
+        if (done) {
+          controller.close()
+        } else {
+          controller.enqueue(value)
+        }
+      },
+      cancel(reason) {
+        return reader.cancel(reason)
+      },
+    })
   }
 
-  if (isError) {
-    reader.releaseLock()
-    return { error: errorMsg ?? '上游返回了错误', rawText: text, cleanJson, stream: body }
-  }
-
-  // 不是错误：构建包含首块的透明可读流
-  let firstEnqueued = false
-  const stream = new ReadableStream<Uint8Array>({
-    async pull(controller) {
-      if (!firstEnqueued) {
-        firstEnqueued = true
-        controller.enqueue(firstValue)
-        return
-      }
-      const { done, value } = await reader.read()
-      if (done) {
-        controller.close()
-      } else {
-        controller.enqueue(value)
-      }
-    },
-    cancel(reason) {
-      return reader.cancel(reason)
+  const emptyStream = (): ReadableStream<Uint8Array> => new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.close()
     },
   })
 
-  return { stream }
+  const detectJsonError = (raw: string): { error: string; cleanJson: string } | undefined => {
+    const trimmed = raw.trim()
+    if (!trimmed.startsWith('{') || !trimmed.endsWith('}')) return undefined
+    try {
+      const parsed = JSON.parse(trimmed) as Record<string, unknown>
+      const error = detectErrorFrame(parsed)
+      return error === undefined ? undefined : { error, cleanJson: trimmed }
+    } catch {
+      return undefined
+    }
+  }
+
+  const errorResult = async (error: string, cleanJson?: string): Promise<{
+    error: string
+    rawText: string
+    cleanJson?: string
+    stream: ReadableStream<Uint8Array>
+  }> => {
+    await reader.cancel().catch(() => {})
+    reader.releaseLock()
+    return {
+      error,
+      rawText: text,
+      ...(cleanJson === undefined ? {} : { cleanJson }),
+      stream: body,
+    }
+  }
+
+  const detectSseLine = async (line: string): Promise<{
+    error?: string
+    cleanJson?: string
+    complete: boolean
+  }> => {
+    const parsedLine = parseSseLine(line)
+    if (parsedLine.kind === 'chunk' && parsedLine.data !== undefined) {
+      const error = ERROR_HINT_PATTERN.test(parsedLine.data)
+        ? tryDetectError(parsedLine.data)
+        : undefined
+      if (error !== undefined) return { error, cleanJson: parsedLine.data, complete: true }
+      // 首个完整的正常数据帧已经足以判定这是流式响应，不再预读。
+      return { complete: true }
+    }
+    if (parsedLine.kind === 'done' || parsedLine.kind === 'error') return { complete: true }
+    return { complete: false }
+  }
+
+  for (;;) {
+    const { done, value } = await reader.read()
+    if (done) {
+      text += decoder.decode()
+      if (prefixChunks.length === 0) {
+        reader.releaseLock()
+        return { stream: emptyStream() }
+      }
+      if (candidate === 'json') {
+        const detected = detectJsonError(text)
+        if (detected !== undefined) return await errorResult(detected.error, detected.cleanJson)
+      } else if (candidate === 'sse' && lineStart < text.length) {
+        // ⚠️ 只喂**第一行**给 detectSseLine：`text.slice(lineStart)` 可能含多个
+        // `data:` 帧（预读缓冲跨过帧边界就 EOF）。整段喂进去时，parseSseLine 会
+        // `slice(5)` 得到 `{...}\ndata: {...}` —— 不以 `{` 开头 ⇒ 被判成
+        // 「非预期的 SSE 数据帧」错误 ⇒ 一条**完全正常**的流在结束边界被误拦成 502。
+        const rest = text.slice(lineStart)
+        const nlIdx = rest.indexOf('\n')
+        const firstLine = nlIdx >= 0 ? rest.slice(0, nlIdx) : rest
+        const detected = await detectSseLine(firstLine)
+        if (detected.error !== undefined) return await errorResult(detected.error, detected.cleanJson)
+      }
+      return { stream: replay() }
+    }
+    if (value === undefined) continue
+    prefixChunks.push(value)
+    prefixBytes += value.byteLength
+    text += decoder.decode(value, { stream: true })
+
+    if (candidate === 'unknown') {
+      const leading = text.trimStart()
+      if (leading === '') continue
+      if (leading.startsWith('{')) {
+        candidate = 'json'
+      } else if (
+        'data:'.startsWith(leading)
+        || leading.startsWith('data:')
+        || leading.startsWith(':')
+        || leading.startsWith('event:')
+        || leading.startsWith('id:')
+        || leading.startsWith('retry:')
+      ) {
+        candidate = 'sse'
+      } else {
+        candidate = 'plain'
+      }
+    }
+
+    if (candidate === 'plain') return { stream: replay() }
+
+    if (candidate === 'json') {
+      const detected = detectJsonError(text)
+      if (detected !== undefined) return await errorResult(detected.error, detected.cleanJson)
+      // 完整 JSON 且不是错误帧时，直接交给既有响应转换路径。
+      if (text.trimEnd().endsWith('}')) {
+        try {
+          JSON.parse(text.trim())
+          return { stream: replay() }
+        } catch {
+          // 仍可能是被拆包的 JSON，继续等下一块。
+        }
+      }
+    } else if (candidate === 'sse') {
+      let newline = text.indexOf('\n', lineStart)
+      while (newline >= 0) {
+        const detected = await detectSseLine(text.slice(lineStart, newline))
+        lineStart = newline + 1
+        if (detected.error !== undefined) return await errorResult(detected.error, detected.cleanJson)
+        if (detected.complete) return { stream: replay() }
+        newline = text.indexOf('\n', lineStart)
+      }
+    }
+
+    if (prefixBytes >= maxPeekBytes) return { stream: replay() }
+  }
 }
 
 /**

@@ -232,9 +232,9 @@ export function toProviderModels(models: OpenAiModel[]): ProviderModel[] {
     contextWindow: m.contextWindow ?? 0,
     maxOutput: m.maxOutput ?? 0,
     supportsImage: m.supportsImage ?? false,
-    // 「免费」上游不直接下发（是营销状态，随时可变），故保持 false，
-    // 不猜测 —— 猜错会让用户以为某个付费模型免费。
-    isFree: false,
+    // 官方下发 x0.00 则标为免费，其余收费或未知
+    isFree: m.credits === 'x0.00' || m.credits === 'x0',
+    ...(m.credits ? { credits: m.credits } : {}),
   }))
 }
 
@@ -281,9 +281,6 @@ export function buildBuddyProvider(config: VariantConfig, env?: Env): Provider {
   }
 
   async function chat(credential: ProviderCredential, request: ChatRequest): Promise<Response> {
-    const machineId = await deriveDeviceId(credential.uid, 'machine')
-    const sessionId = await deriveDeviceId(credential.uid, 'session')
-
     // 复用网关的请求体准备逻辑（4 处必改 + 工具配对清理）
     let body: string
     try {
