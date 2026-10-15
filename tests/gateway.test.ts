@@ -671,12 +671,31 @@ test('⚠️ 会话粘性只在首轮生效（换号后还粘回去会死循环�
   assert.ok(hits >= 2, `两条路径都应限定首轮，实际匹配 ${hits} 处`)
 })
 
+test('🔴 跨渠道容灾必须有深度保护，且不得复用已消费的 request', () => {
+  const src = readFileSync('src/gateway/server.ts', 'utf8')
+  const code = stripComments(src)
+
+  // ① 两个入口都必须接受 failoverDepth 参数（否则无法阻止相互递归）
+  assert.ok(/failoverDepth = 0/.test(code), '⚠️ handleChatCompletions 必须有 failoverDepth 默认参数')
+  assert.ok(/input\.failoverDepth \?\? 0/.test(code), '⚠️ handleProviderChat 必须读取 failoverDepth')
+
+  // ② 反向往返容灾必须受 `failoverDepth === 0` 约束
+  const guards = [...code.matchAll(/failoverDepth === 0/g)].length
+  assert.ok(guards >= 2, `⚠️ 两个方向的容灾都必须判 failoverDepth===0（实际 ${guards} 处）`)
+
+  // ③ 国际版→国内版回退**不得**复用被消费过的 request —— 必须重建
+  //    （否则 request.json() 二次读取必抛错 ⇒ 恒 400）。
+  const failoverCall = /handleChatCompletions\(fallbackRequest, env, 'cn', ctx, 1\)/
+  assert.ok(failoverCall.test(code), '⚠️ 国际版容灾必须传重建的 fallbackRequest 且深度=1')
+  assert.ok(/new Request\(request\.url/.test(code), '⚠️ 必须用 rawBody 重建 Request，不能复用原 request')
+})
+
 test('⚠️ 绑定会话必须在成功后（首帧到达）才做，且用 waitUntil 托住', () => {
   const src = readFileSync('src/gateway/server.ts', 'utf8')
-  const binds = [...src.matchAll(/bindSession\(/g)].length
+  const binds = [...src.matchAll(/\bbindSession\(/g)].length
   assert.ok(binds >= 2, `两条成功路径都应绑定会话，实际 ${binds} 处`)
   // ⚠️ 记账/绑定都是「流结束后才发生的事」，不用 waitUntil 会被 Worker 取消
-  for (const m of src.matchAll(/([^\n]*)bindSession\(/g)) {
+  for (const m of src.matchAll(/([^\n]*)\bbindSession\(/g)) {
     const line = m[1] ?? ''
     assert.ok(
       /waitUntil/.test(line) || line.includes('ctx.waitUntil'),

@@ -2169,3 +2169,17 @@ test('⚠️ 聚合白名单必须在 buildVirtualModels 里收口（覆盖目�
   assert.ok(server.includes('buildVirtualModels'), 'chat 路径应走 buildVirtualModels')
   assert.ok(idx.includes('buildVirtualModels'), '/v1/models 路径应走 buildVirtualModels')
 })
+
+test('⚠️ workbuddy 国际版 matchesShape 必须支持嵌套与顶层 domain/realm', () => {
+  const wb = findProvider('workbuddy')
+  assert.notEqual(wb, undefined)
+  assert.notEqual(wb?.matchesShape, undefined)
+  // 顶层 domain
+  assert.equal(wb?.matchesShape?.({ domain: 'www.workbuddy.ai', accessToken: 'x' }), true)
+  // 嵌套形态（OAuth 或客户端导出）
+  assert.equal(wb?.matchesShape?.({ auth: { domain: 'www.workbuddy.ai' }, account: { uid: 'u1' } }), true)
+  assert.equal(wb?.matchesShape?.({ auth: { realm: 'global' } }), true)
+  // 国内版凭据不应误判为国际版
+  assert.equal(wb?.matchesShape?.({ domain: 'copilot.tencent.com' }), false)
+  assert.equal(wb?.matchesShape?.({ auth: { domain: 'copilot.tencent.com' } }), false)
+})

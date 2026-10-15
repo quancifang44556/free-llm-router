@@ -128,3 +128,18 @@ test('应罚号：限流/余额/WAF/session 死亡/5xx', () => {
 test('⚠️ auth_error 不罚号 —— 续期凭据即可，不该惩罚账号', () => {
   assert.equal(shouldPunish('auth_error'), false)
 })
+
+test('⚠️ 关键回归：parseEnvelope 与 classify 必须能识别带 data: 前缀的 SSE 错误帧', () => {
+  const sseSingle = 'data: {"code":6004,"msg":"模型限流，建议切换其他模型"}'
+  const env1 = parseEnvelope(sseSingle)
+  assert.notEqual(env1, undefined, 'parseEnvelope 必须能剥离单行 data: 前缀')
+  assert.equal(env1?.code, 6004)
+  assert.equal(classify(200, sseSingle).kind, 'rate_limited')
+
+  const sseMulti = ': heartbeat\n\ndata: {"code":6004,"msg":"模型限流"}\n\n'
+  const env2 = parseEnvelope(sseMulti)
+  assert.notEqual(env2, undefined, 'parseEnvelope 必须能从多行 SSE 中提取数据帧')
+  assert.equal(env2?.code, 6004)
+  assert.equal(classify(200, sseMulti).kind, 'rate_limited')
+  assert.equal(shouldRotate(classify(200, sseMulti).kind), true, '限流帧必须触发换号重试')
+})

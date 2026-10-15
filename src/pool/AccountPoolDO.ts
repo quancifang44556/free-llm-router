@@ -358,28 +358,36 @@ export class AccountPoolDO extends DurableObject<Env> {
     const fresh = candidates.filter((s) => now - this.notePickedAt(s.uid) >= SPREAD_WINDOW_MS)
     const pool = fresh.length > 0 ? fresh : candidates
 
-    // ⚠️ 真实 Round-Robin 轮换与负载均衡：
-    // 优先选择「最久没有被调用过的健康账号」（notePickedAt 升序排序），
-    // 确保请求严格在池中多个账号之间均匀交替轮转，
-    // 单账号 RPM 严格压低至 1/N，避免单个账号连续承载高频流量导致上游频次瞬间超限。
-    const sorted = [...pool].sort((a, b) => this.notePickedAt(a.uid) - this.notePickedAt(b.uid))
-    const chosen = sorted[0]
-    if (chosen !== undefined) {
-      this.notePicked(chosen.uid, now)
-      return { uid: chosen.uid, state: chosen }
-    }
+    const strategy = this.cachedRoutingConfig?.strategy ?? 'roundrobin'
 
-    const weights = pool.map((s) => 1 + Math.max(0, s.credits) / 100)
-    const total = weights.reduce((a, b) => a + b, 0)
-    let roll = Math.random() * total
-    for (let i = 0; i < pool.length; i += 1) {
-      roll -= weights[i] ?? 0
-      if (roll <= 0) {
-        const pickedFallback = pool[i]
-        if (pickedFallback !== undefined) {
-          this.notePicked(pickedFallback.uid, now)
-          return { uid: pickedFallback.uid, state: pickedFallback }
+    if (strategy === 'random') {
+      const weights = pool.map((s) => 1 + Math.max(0, s.credits) / 100)
+      const total = weights.reduce((a, b) => a + b, 0)
+      let roll = Math.random() * total
+      for (let i = 0; i < pool.length; i += 1) {
+        roll -= weights[i] ?? 0
+        if (roll <= 0) {
+          const pickedFallback = pool[i]
+          if (pickedFallback !== undefined) {
+            this.notePicked(pickedFallback.uid, now)
+            return { uid: pickedFallback.uid, state: pickedFallback }
+          }
         }
+      }
+    } else {
+      // ⚠️ 真实 Round-Robin 轮换与负载均衡：
+      // 优先选择「最久没有被调用过的健康账号」（notePickedAt 升序排序），
+      // 当调用时间戳相同时（如均为 0），按 uid 字符串稳定排序，
+      // 确保请求严格在池中多个账号之间均匀交替轮转，
+      // 单账号 RPM 严格压低至 1/N，避免单个账号连续承载高频流量导致上游频次瞬间超限。
+      const sorted = [...pool].sort((a, b) => {
+        const diff = this.notePickedAt(a.uid) - this.notePickedAt(b.uid)
+        return diff !== 0 ? diff : a.uid.localeCompare(b.uid)
+      })
+      const chosen = sorted[0]
+      if (chosen !== undefined) {
+        this.notePicked(chosen.uid, now)
+        return { uid: chosen.uid, state: chosen }
       }
     }
 
@@ -389,6 +397,11 @@ export class AccountPoolDO extends DurableObject<Env> {
     this.notePicked(last.uid, now)
     return { uid: last.uid, state: last }
   }
+
+  /**
+   * 缓存的系统路由与调度配置（避免每次 pick 高频读 storage）。
+   */
+  private cachedRoutingConfig?: RoutingConfig
 
   /**
    * 最近一次选中该账号的时刻（**进程内**，不落存储）。
@@ -443,13 +456,15 @@ export class AccountPoolDO extends DurableObject<Env> {
   /** 获取系统调度与路由配置。 */
   async getRoutingConfig(): Promise<RoutingConfig> {
     const raw = await this.ctx.storage.get<Partial<RoutingConfig>>('systemRoutingConfig')
-    return {
+    const config: RoutingConfig = {
       strategy: raw?.strategy === 'roundrobin' || raw?.strategy === 'random' ? raw.strategy : 'expiry',
       maxRetries: typeof raw?.maxRetries === 'number' && raw.maxRetries >= 0 && raw.maxRetries <= 10 ? raw.maxRetries : 3,
       softCooldownSeconds: typeof raw?.softCooldownSeconds === 'number' && raw.softCooldownSeconds >= 10 && raw.softCooldownSeconds <= 3600 ? raw.softCooldownSeconds : 60,
       autoTaskCron: raw?.autoTaskCron !== false,
       autoRefreshCredential: raw?.autoRefreshCredential !== false,
     }
+    this.cachedRoutingConfig = config
+    return config
   }
 
   /** 更新系统调度与路由配置。 */
@@ -463,6 +478,7 @@ export class AccountPoolDO extends DurableObject<Env> {
       autoRefreshCredential: typeof input.autoRefreshCredential === 'boolean' ? input.autoRefreshCredential : cur.autoRefreshCredential,
     }
     await this.ctx.storage.put('systemRoutingConfig', next)
+    this.cachedRoutingConfig = next
     return next
   }
 

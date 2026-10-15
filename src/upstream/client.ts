@@ -119,9 +119,26 @@ const CODE_KIND: Record<number, ErrorKind> = {
   14051: 'already_done',
 }
 
-/** 判定响应体是否为「业务信封」形态。 */
+/** 判定响应体是否为「业务信封」形态。支持纯 JSON 与 SSE（带 data: 前缀）形态。 */
 export function parseEnvelope(text: string): Envelope | undefined {
-  const trimmed = text.trim()
+  let trimmed = text.trim()
+  // 支持 SSE 单帧或多行帧（提取 data: 后面的内容）
+  if (trimmed.startsWith('data:')) {
+    trimmed = trimmed.slice(5).trim()
+  } else if (!trimmed.startsWith('{') && trimmed.includes('data:')) {
+    const lines = trimmed.split('\n')
+    for (const line of lines) {
+      const l = line.trim()
+      if (l.startsWith('data:')) {
+        const candidate = l.slice(5).trim()
+        if (candidate.startsWith('{')) {
+          trimmed = candidate
+          break
+        }
+      }
+    }
+  }
+
   if (!trimmed.startsWith('{')) return undefined
   try {
     const value = JSON.parse(trimmed) as unknown

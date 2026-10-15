@@ -44,6 +44,7 @@ import {
 import { splitModelName, type ProviderCredential } from '../providers/types.js'
 import type { LoginCredential } from '../upstream/auth.js'
 import type { AccountPoolDO } from '../pool/AccountPoolDO.js'
+import { healthyForModel } from '../pool/state.js'
 
 /**
  * 将 API 请求摘要记录到日志环形缓冲（供管理面板「日志」Tab 实时展示）。
@@ -391,9 +392,11 @@ function clearSessionBinding(
   ctx?: ExecutionContext,
 ): void {
   if (sessionKey === '') return
-  // 必须用 ctx.waitUntil 托住避免流关闭被取消
-  const t = (ctx?.waitUntil ? ctx.waitUntil : void 0, pool.unbindSession(sessionKey).catch(() => {}))
-  if (ctx !== undefined) ctx.waitUntil(t)
+  if (ctx !== undefined && typeof ctx.waitUntil === 'function') {
+    ctx.waitUntil(pool.unbindSession(sessionKey).catch(() => {}))
+  } else {
+    void pool.unbindSession(sessionKey).catch(() => {})
+  }
 }
 
 /** 网关处理结果。 */
@@ -415,6 +418,14 @@ export async function handleChatCompletions(
    * 否则响应一结束 Worker 就会取消它。
    */
   ctx?: ExecutionContext,
+  /**
+   * 跨渠道容灾深度（内部用，默认 0）。
+   *
+   * ⚠️ **必须存在**：buddy 与国际版 workbuddy 互为容灾目标，
+   * 若两边都不加深度限制，会形成 `buddy→workbuddy→buddy→…` 的
+   * **无限相互递归**（栈溢出 / CPU 超时）。深度 ≥1 时不再触发任何容灾。
+   */
+  failoverDepth = 0,
 ): Promise<GatewayResult> {
   // ① 解析并准备请求体（一次性，不随换号重复）
   let rawBody: unknown
@@ -574,6 +585,39 @@ export async function handleChatCompletions(
       buddyPreferred === undefined ? '' : buddyPreferred,
     )
     if (candidate === undefined) {
+      // ⚠️ 国内版（buddy）所有可用账号已尝试或全部处于限流/冷却中。
+      // 跨渠道智能容灾：如果用户配置了国际版（workbuddy）账号且**真的可选**，
+      // 自动无缝降级派发至国际版同名模型，避免直接向客户端返回 502/503。
+      //
+      // ⚠️ **只在 `failoverDepth === 0` 时触发**：否则会与 workbuddy 路径的
+      // 反向容灾形成无限相互递归（`buddy→workbuddy→buddy→…`）。
+      if (failoverDepth === 0 && model !== '') {
+        try {
+          const intlPool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('global'))
+          const hasIntlUsable = (await intlPool.listAccounts('global', now)).some(
+            (a) => (a.provider ?? DEFAULT_PROVIDER) === 'workbuddy' && healthyForModel(a, now, model),
+          )
+          if (hasIntlUsable) {
+            console.log(`[failover] 国内版 ${DEFAULT_PROVIDER} 全部不可用或已限流，自动无缝跨渠道容灾至国际版 workbuddy (模型: ${model})`)
+            return await handleProviderChat({
+              providerId: 'workbuddy',
+              model,
+              wantsStream,
+              rawBody,
+              request,
+              env,
+              realm: 'global',
+              ...(ctx !== undefined ? { ctx } : {}),
+              tried: [],
+              sessionKey,
+              failoverDepth: 1,
+            })
+          }
+        } catch (failoverError) {
+          console.warn('[failover] 跨渠道容灾检查失败：', failoverError)
+        }
+      }
+
       // 没有可用账号了：若之前有过失败，报最后一次的真实原因（更有信息量）
       if (lastError !== undefined) {
         return {
@@ -685,7 +729,7 @@ export async function handleChatCompletions(
     // 预检首块数据：上游若以 HTTP 200 返回 6004 限流或错误帧，立即拦截并换号重试
     const peeked = await peekStreamForError(upstream.body)
     if (peeked.error !== undefined) {
-      const errText = peeked.rawText ?? peeked.error
+      const errText = peeked.cleanJson ?? peeked.rawText ?? peeked.error
       const { kind, msg } = classify(200, errText)
       const mapped = mapErrorToPunishment(kind)
       const { dimension, resetAt } = refineModelScoped(kind, errText)
@@ -993,7 +1037,10 @@ function tryDetectError(data: string): string | undefined {
     if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined
     return detectErrorFrame(parsed as Record<string, unknown>)
   } catch {
-    return `无法解析的上游帧：${data.slice(0, 160)}`
+    // ⚠️ 绝不能把所有 JSON.parse 失败都当成错误！
+    // 首块分包如果把正常的 SSE chunk 从中文字符或属性中间截断，JSON.parse 就会抛 SyntaxError。
+    // 如果把分包误报成错误，会导致正常请求被假限流拦截并误换号！
+    return undefined
   }
 }
 
@@ -1014,6 +1061,7 @@ function tryDetectError(data: string): string | undefined {
 async function peekStreamForError(body: ReadableStream<Uint8Array>): Promise<{
   error?: string
   rawText?: string
+  cleanJson?: string
   stream: ReadableStream<Uint8Array>
 }> {
   const reader = body.getReader()
@@ -1035,6 +1083,7 @@ async function peekStreamForError(body: ReadableStream<Uint8Array>): Promise<{
 
   let isError = false
   let errorMsg: string | undefined
+  let cleanJson: string | undefined
 
   // 1. 尝试直接检测完整或部分 JSON
   const trimmed = text.trim()
@@ -1045,6 +1094,7 @@ async function peekStreamForError(body: ReadableStream<Uint8Array>): Promise<{
       if (err !== undefined) {
         isError = true
         errorMsg = err
+        cleanJson = trimmed
       }
     } catch {}
   }
@@ -1059,6 +1109,7 @@ async function peekStreamForError(body: ReadableStream<Uint8Array>): Promise<{
         if (err !== undefined) {
           isError = true
           errorMsg = err
+          cleanJson = parsedLine.data
           break
         }
       }
@@ -1067,7 +1118,7 @@ async function peekStreamForError(body: ReadableStream<Uint8Array>): Promise<{
 
   if (isError) {
     reader.releaseLock()
-    return { error: errorMsg ?? '上游返回了错误', rawText: text, stream: body }
+    return { error: errorMsg ?? '上游返回了错误', rawText: text, cleanJson, stream: body }
   }
 
   // 不是错误：构建包含首块的透明可读流
@@ -1120,8 +1171,15 @@ async function handleProviderChat(input: {
   tried: string[]
   /** 会话粘性 key（由 `handleChatCompletions` 统一派生，空串 = 不做粘性）。 */
   sessionKey: string
+  /**
+   * 跨渠道容灾深度（默认 0）。
+   *
+   * ⚠️ ≥1 时**不再触发**反向容灾，避免与 buddy 路径形成无限相互递归。
+   */
+  failoverDepth?: number
 }): Promise<GatewayResult> {
   const { providerId, model, wantsStream, rawBody, request, env, realm, ctx, sessionKey } = input
+  const failoverDepth = input.failoverDepth ?? 0
 
   const provider = findProvider(providerId)
   if (provider === undefined) {
@@ -1139,26 +1197,15 @@ async function handleProviderChat(input: {
     }
   }
 
-  // ⚠️ **realm 自动回退与分片消歧**（实测踩到：国际版与国内版分片串用导致提示限流）。
+  // ⚠️ **realm 自动回退与分片消歧**：
   //
   // 账号按凭据的 `extras.realm` 分片存放（WorkBuddy 国际版在 `global`，国内版在 `cn`）。
-  // 客户端请求通常缺省 `realm=cn`，若不消歧：
-  // 1. 国际版（workbuddy）会误在 cn 分片探测到存留的同名账号，拿国内凭据去打国际版端点必然 401/限流；
-  // 2. 国内版限流后换国际版，也会误在 cn 分片复用已限流账号。
-  //
-  // 规则：
-  // · 请求 `workbuddy` 时，只要 global 分片有可用/存在的账号，优先走 global 分片；
-  // · 其余供应商先看当前 realm，若该分片完全无此供应商账号再回退到另一个 realm。
-  let activeRealm = realm
-  if (providerId === 'workbuddy') {
-    const probeGlobal = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('global'))
-    const hasGlobal = (await probeGlobal.listAccounts('global', Date.now())).some(
-      (a) => a.provider === 'workbuddy' || (a.provider ?? DEFAULT_PROVIDER) === 'workbuddy',
-    )
-    if (hasGlobal) {
-      activeRealm = 'global'
-    }
-  } else {
+  // 客户端请求通常缺省 `realm=cn`：
+  // 1. 请求 `workbuddy` 时，规范分片**严格锁定为 `global`**，绝不能在 `cn` 分片探测，
+  //    避免误把国内凭据拿去打国际版端点（必然 401/11128 拦截）；
+  // 2. 其余供应商先看当前 realm，若该分片完全无此供应商账号再回退到另一个 realm。
+  let activeRealm = providerId === 'workbuddy' ? 'global' : realm
+  if (providerId !== 'workbuddy') {
     const probe = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
     const hasHere = (await probe.listAccounts(realm, Date.now())).some(
       (a) => (a.provider ?? DEFAULT_PROVIDER) === providerId,
@@ -1495,30 +1542,35 @@ async function handleProviderChat(input: {
     // 预检首块数据：若上游以 HTTP 200 返回 6004 限流或错误帧，立即拦截并换号重试
     const peeked = await peekStreamForError(upstream.body)
     if (peeked.error !== undefined) {
-      const errText = peeked.rawText ?? peeked.error
-      const refined = refineModelScoped('rate_limited', errText)
+      const errText = peeked.cleanJson ?? peeked.rawText ?? peeked.error
+      const { kind, msg } = classify(200, errText)
+      const mapped = mapErrorToPunishment(kind)
+      const refined = refineModelScoped(kind, errText)
       const retryAfterMs = refined.resetAt === undefined ? parseRetryAfterMs(upstream.headers) : undefined
       const resolvedResetAt = refined.resetAt ?? (retryAfterMs === undefined ? undefined : Date.now() + retryAfterMs)
 
-      await pool
-        .applyFailure({
-          uid: picked.uid,
-          kind: refined.dimension,
-          now: Date.now(),
-          ...(model !== '' ? { model } : {}),
-          ...(resolvedResetAt !== undefined ? { resetAt: resolvedResetAt } : {}),
-          reason: `${providerId} sse: ${errText.slice(0, 160)}`,
-        })
-        .catch(() => {})
+      if (mapped.punish) {
+        await pool
+          .applyFailure({
+            uid: picked.uid,
+            kind: kind === 'rate_limited' ? refined.dimension : mapped.dimension === 'model' ? 'model' : mapped.dimension,
+            now: Date.now(),
+            ...(model !== '' ? { model } : {}),
+            ...(resolvedResetAt !== undefined ? { resetAt: resolvedResetAt } : {}),
+            reason: `${providerId} sse: ${(msg || errText).slice(0, 160)}`,
+          })
+          .catch(() => {})
+      }
 
       clearSessionBinding(pool, sessionKey, ctx)
 
       lastError = {
-        status: clientStatusFor(200, 'rate_limited'),
-        message: `${providerId} sse: ${errText.slice(0, 160)}`,
+        status: clientStatusFor(200, kind),
+        message: `${providerId} sse: ${msg || errText.slice(0, 160)}`,
       }
 
-      continue // 换号重试！
+      if (mapped.rotate) continue // 换号重试！
+      break
     }
 
     return {
@@ -1588,6 +1640,40 @@ async function handleProviderChat(input: {
           )
         },
       }, wantsStream ? undefined : { model }),
+    }
+  }
+
+  // ⚠️ 国际版（workbuddy）容灾回退：若国际版所有账号均失败或限流，
+  // 检查国内版（buddy）是否有**真可选**账号，自动无缝跨渠道容灾至国内版同名模型。
+  //
+  // ⚠️ **只在 `failoverDepth === 0` 时触发**（否则与 buddy 路径互相递归成死循环）。
+  // ⚠️ **绝不能复用 `request`**：它的 body 在 `handleChatCompletions` 开头
+  //    已被 `request.json()` 消费，再读会抛错 → 恒返回 400「请求体必须是合法 JSON」。
+  //    必须用 `rawBody` 重建一个**全新** Request。
+  // ⚠️ 重建时把 `model` 换成**裸名**（去掉 `workbuddy/` 前缀）：否则
+  //    `splitModelName` 会再次路由回 workbuddy，形成自我循环。
+  if (providerId === 'workbuddy' && failoverDepth === 0 && model !== '') {
+    try {
+      const cnPool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn'))
+      const now = Date.now()
+      const hasCnUsable = (await cnPool.listAccounts('cn', now)).some(
+        (a) => (a.provider ?? DEFAULT_PROVIDER) === DEFAULT_PROVIDER && healthyForModel(a, now, model),
+      )
+      if (hasCnUsable) {
+        console.log(`[failover] 国际版 workbuddy 全部不可用或已限流，自动无缝跨渠道容灾至国内版 ${DEFAULT_PROVIDER} (模型: ${model})`)
+        const fallbackBody =
+          rawBody !== null && typeof rawBody === 'object' && !Array.isArray(rawBody)
+            ? { ...(rawBody as Record<string, unknown>), model }
+            : rawBody
+        const fallbackRequest = new Request(request.url, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(fallbackBody),
+        })
+        return await handleChatCompletions(fallbackRequest, env, 'cn', ctx, 1)
+      }
+    } catch (failoverError) {
+      console.warn('[failover] 国际版->国内版容灾检查失败：', failoverError)
     }
   }
 
@@ -2086,6 +2172,9 @@ async function handleAggregateChat(input: {
         ...(ctx !== undefined ? { ctx } : {}),
         tried: [],
         sessionKey,
+        // ⚠️ 聚合层**自己**有候选轮转循环，故禁止它内部的跨渠道容灾
+        //（否则单个候选失败会先容灾一轮，与聚合的轮转叠加，白白放大请求）。
+        failoverDepth: 1,
       })
     } catch (error) {
       lastError = {
@@ -2164,9 +2253,24 @@ async function listModelsForProvider(
   realm: string,
   providerId: string,
 ): Promise<import('../providers/types.js').ProviderModel[]> {
-  const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
-  const accounts = await pool.listAccounts(realm, Date.now())
-  const usable = accounts.filter((a) => (a.provider ?? DEFAULT_PROVIDER) === providerId && !a.disabled)
+  // ⚠️ 分片消歧：国际版在 global 分片，优先走其规范分片
+  const targetRealm = providerId === 'workbuddy' ? 'global' : realm
+  let pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(targetRealm))
+  let accounts = await pool.listAccounts(targetRealm, Date.now())
+  let usable = accounts.filter((a) => (a.provider ?? DEFAULT_PROVIDER) === providerId && !a.disabled)
+
+  // 若目标分片未找到，自动回退探测另一个分片
+  if (usable.length === 0) {
+    const otherRealm = targetRealm === 'cn' ? 'global' : 'cn'
+    const otherPool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(otherRealm))
+    const otherAccounts = await otherPool.listAccounts(otherRealm, Date.now())
+    const otherUsable = otherAccounts.filter((a) => (a.provider ?? DEFAULT_PROVIDER) === providerId && !a.disabled)
+    if (otherUsable.length > 0) {
+      pool = otherPool
+      usable = otherUsable
+    }
+  }
+
   if (usable.length === 0) return []
 
   const provider = findProvider(providerId)

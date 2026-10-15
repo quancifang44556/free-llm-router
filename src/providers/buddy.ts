@@ -125,17 +125,31 @@ function withSystemFirst(input: unknown, required: boolean): unknown {
   const messages = body.messages
   if (!Array.isArray(messages)) return input
   const first = messages.length > 0 ? (messages[0] as Record<string, unknown> | undefined) : undefined
-  // ⚠️ **`developer` 也要算「已有 system」**（实测缺陷）。
-  //
-  // pi 这类客户端把系统提示词放在 `{role:'developer'}` 里（OpenAI 新规范），
-  // 而它在 `prepareChatBody` 里会被**降级为 `system`**（见 payload.ts）。
-  // 若这里只认 `role === 'system'`，就会**多补一条**无用的
-  // 「You are a helpful assistant.」并排在真正的提示词**前面** ——
-  // 那会稀释（甚至覆盖）客户端自己的行为约束。
+
   const roleOf = (m: Record<string, unknown> | undefined): string =>
     m === undefined ? '' : typeof m.role === 'string' ? m.role : ''
+  const hasText = (m: Record<string, unknown> | undefined): boolean => {
+    if (m === undefined) return false
+    const c = m.content
+    if (typeof c === 'string') return c.trim().length > 0
+    if (Array.isArray(c)) return c.length > 0
+    return false
+  }
+
   const firstRole = roleOf(first)
-  if (firstRole === 'system' || firstRole === 'developer') return input
+  // ⚠️ 国际版不仅要求首条是 system，还要求内容**不得为空**（空串会被上游 11128 拦截）。
+  if ((firstRole === 'system' || firstRole === 'developer') && hasText(first)) {
+    return input
+  }
+
+  // 首条是 system 但内容为空 ⇒ 填充默认内容
+  if (firstRole === 'system' && !hasText(first)) {
+    return {
+      ...body,
+      messages: [{ role: 'system', content: 'You are a helpful assistant.' }, ...messages.slice(1)],
+    }
+  }
+
   return {
     ...body,
     messages: [{ role: 'system', content: 'You are a helpful assistant.' }, ...messages],
@@ -413,10 +427,27 @@ export function buildBuddyProvider(config: VariantConfig, env?: Env): Provider {
     ...(config.id === WORKBUDDY_INTL.id
       ? {
           matchesShape(input: Record<string, unknown>) {
-            const domain = input['domain']
-            if (typeof domain === 'string' && domain.includes('workbuddy.ai')) return true
-            const platform = input['platform']
-            return typeof platform === 'string' && platform === 'workbuddy-ai'
+            const auth = input['auth'] as Record<string, unknown> | undefined
+            const domain = typeof input['domain'] === 'string'
+              ? input['domain']
+              : typeof auth?.['domain'] === 'string'
+                ? auth['domain']
+                : ''
+            if (domain.includes('workbuddy.ai')) return true
+
+            const realm = typeof input['realm'] === 'string'
+              ? input['realm']
+              : typeof auth?.['realm'] === 'string'
+                ? auth['realm']
+                : ''
+            if (realm === 'global') return true
+
+            const platform = typeof input['platform'] === 'string'
+              ? input['platform']
+              : typeof auth?.['platform'] === 'string'
+                ? auth['platform']
+                : ''
+            return platform === 'workbuddy-ai'
           },
         }
       : {}),
