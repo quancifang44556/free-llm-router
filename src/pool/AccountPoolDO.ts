@@ -307,7 +307,7 @@ export class AccountPoolDO extends DurableObject<Env> {
       // ⚠️ 解析失败（数据损坏）时跳过该条，而不是让整个列表 500
       if (state === undefined) continue
       // 供应商不匹配的直接跳过（不同家的凭据/协议完全不同）
-      if (wantProvider !== '' && (state.provider ?? 'workbuddy') !== wantProvider) continue
+      if (wantProvider !== '' && (state.provider ?? 'buddy') !== wantProvider) continue
       if (excludeSet.has(state.uid)) continue
       pruneExpired(state, now, MODEL_COST_TTL_MS)
       if (!healthyForModel(state, now, model)) continue
@@ -599,11 +599,19 @@ export class AccountPoolDO extends DurableObject<Env> {
         if (model === '') break
         const prev = state.modelCooldowns[model]
         const hits = (prev?.hits ?? 0) + 1
-        // 6004：对齐上游重置墙钟。11102：6h 起指数退避，封顶 24h。
+        // 6004：对齐上游重置墙钟，未下发墙钟时按 60s 起步退避（频次超限短时退避）；
+        // 11102（无此模型）：6h 起指数退避，封顶 24h。
+        const isNotAvailable =
+          input.reason?.includes('11102') ||
+          input.reason?.includes('service info not found') ||
+          input.reason?.includes('not found')
+        const fallbackCooldown = isNotAvailable
+          ? Math.min(6 * 60 * 60 * 1000 * 2 ** Math.min(hits - 1, 2), 24 * 60 * 60 * 1000)
+          : Math.min(60_000 * 2 ** Math.min(hits - 1, 3), 10 * 60 * 1000)
         const until =
           input.resetAt !== undefined && input.resetAt > now
             ? input.resetAt
-            : now + Math.min(6 * 60 * 60 * 1000 * 2 ** Math.min(hits - 1, 2), 24 * 60 * 60 * 1000)
+            : now + fallbackCooldown
         state.modelCooldowns[model] = {
           until,
           resetAt: input.resetAt ?? 0,

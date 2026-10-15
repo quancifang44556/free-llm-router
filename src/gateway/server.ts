@@ -378,6 +378,18 @@ async function pickCandidate(
   return { uid: result.uid, credential }
 }
 
+/** 账号请求失败时异步解绑会话粘性，防止下次请求死锁在坏账号上。 */
+function clearSessionBinding(
+  pool: DurableObjectStub<AccountPoolDO>,
+  sessionKey: string,
+  ctx?: ExecutionContext,
+): void {
+  if (sessionKey === '') return
+  // 必须用 ctx.waitUntil 托住避免流关闭被取消
+  const t = (ctx?.waitUntil ? ctx.waitUntil : void 0, pool.unbindSession(sessionKey).catch(() => {}))
+  if (ctx !== undefined) ctx.waitUntil(t)
+}
+
 /** 网关处理结果。 */
 export interface GatewayResult {
   response: Response
@@ -649,19 +661,56 @@ export async function handleChatCompletions(
         kind,
       }
 
+      // 账号失败，立即解绑该会话粘性，防止下次请求死锁在坏账号上
+      clearSessionBinding(pool, sessionKey, ctx)
+
       if (!mapped.rotate) break // 不该换号（参数错/WAF/网络已单独处理）
       continue // 换号重试
     }
 
     // ④ 成功：按上游流**逐帧透传**，同时判断是否需要记账
     if (upstream.body === null) {
+      clearSessionBinding(pool, sessionKey, ctx)
       lastError = { status: 502, message: '上游返回空 body', kind: 'unknown' }
       continue
     }
 
+    // 预检首块数据：上游若以 HTTP 200 返回 6004 限流或错误帧，立即拦截并换号重试
+    const peeked = await peekStreamForError(upstream.body)
+    if (peeked.error !== undefined) {
+      const errText = peeked.rawText ?? peeked.error
+      const { kind, msg } = classify(200, errText)
+      const mapped = mapErrorToPunishment(kind)
+      const { dimension, resetAt } = refineModelScoped(kind, errText)
+
+      if (mapped.punish) {
+        await pool
+          .applyFailure({
+            uid: candidate.uid,
+            kind: kind === 'rate_limited' ? dimension : mapped.dimension === 'model' ? 'model' : mapped.dimension,
+            now: Date.now(),
+            ...(model !== '' ? { model } : {}),
+            ...(resetAt !== undefined ? { resetAt } : {}),
+            ...(msg !== '' ? { reason: `${kind}: ${msg}`.slice(0, 200) } : {}),
+          })
+          .catch(() => {})
+      }
+
+      clearSessionBinding(pool, sessionKey, ctx)
+
+      lastError = {
+        status: clientStatusFor(200, kind),
+        message: `${kind}: ${msg || errText.slice(0, 160)}`,
+        kind,
+      }
+
+      if (mapped.rotate) continue // 换号重试！
+      break
+    }
+
     const startedAt = Date.now()
     return {
-      response: await streamResponse(upstream.body, {
+      response: await streamResponse(peeked.stream, {
         // ⚠️ 诊断 + 记账分界：客户端断开**不得**记成账号失败
         //（否则用户的取消动作会熔断健康账号，见 `nonStreamingResponse` 的说明）。
         clientGone: () => request.signal.aborted,
@@ -942,6 +991,103 @@ function tryDetectError(data: string): string | undefined {
 }
 
 /**
+ * 预读首块数据并预检是否为上游在 HTTP 200 下返回的限流/业务错误帧。
+ *
+ * ## 为什么必须做（解决限流后不会自动切换账号的问题）
+ *
+ * 腾讯 WorkBuddy / CodeBuddy 及部分第三方供应商在模型限流（6004）或拒绝时，
+ * HTTP 状态码依然返回的是 200 OK，错误信息作为首个 SSE 帧或首个 JSON 载荷下发。
+ * 原实现一旦看到 200 就直接返回 `streamResponse` 给客户端，外层换号循环瞬间退出，
+ * 导致池中有健康账号也无法自动轮换，客户端直接收到限流错误。
+ *
+ * ⇒ 在把响应交付给客户端之前，在内部预读取首块数据：
+ * 1. 若检测到限流或错误：拦截并记账，解绑会话粘性，继续外层循环挑选下一个账号！
+ * 2. 若首块正常：无缝还原流传递给 streamResponse。
+ */
+async function peekStreamForError(body: ReadableStream<Uint8Array>): Promise<{
+  error?: string
+  rawText?: string
+  stream: ReadableStream<Uint8Array>
+}> {
+  const reader = body.getReader()
+  const first = await reader.read()
+  if (first.done || !first.value) {
+    reader.releaseLock()
+    return {
+      stream: new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.close()
+        },
+      }),
+    }
+  }
+
+  const firstValue = first.value
+  const decoder = new TextDecoder()
+  const text = decoder.decode(firstValue)
+
+  let isError = false
+  let errorMsg: string | undefined
+
+  // 1. 尝试直接检测完整或部分 JSON
+  const trimmed = text.trim()
+  if (trimmed.startsWith('{')) {
+    try {
+      const parsed = JSON.parse(trimmed) as Record<string, unknown>
+      const err = detectErrorFrame(parsed)
+      if (err !== undefined) {
+        isError = true
+        errorMsg = err
+      }
+    } catch {}
+  }
+
+  // 2. 检查是否有 data: 开头的 SSE 错误帧
+  if (!isError && (text.includes('data:') || text.includes('code') || text.includes('error'))) {
+    const lines = text.split('\n')
+    for (const line of lines) {
+      const parsedLine = parseSseLine(line)
+      if (parsedLine.kind === 'chunk' && parsedLine.data !== undefined) {
+        const err = tryDetectError(parsedLine.data)
+        if (err !== undefined) {
+          isError = true
+          errorMsg = err
+          break
+        }
+      }
+    }
+  }
+
+  if (isError) {
+    reader.releaseLock()
+    return { error: errorMsg ?? '上游返回了错误', rawText: text, stream: body }
+  }
+
+  // 不是错误：构建包含首块的透明可读流
+  let firstEnqueued = false
+  const stream = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      if (!firstEnqueued) {
+        firstEnqueued = true
+        controller.enqueue(firstValue)
+        return
+      }
+      const { done, value } = await reader.read()
+      if (done) {
+        controller.close()
+      } else {
+        controller.enqueue(value)
+      }
+    },
+    cancel(reason) {
+      return reader.cancel(reason)
+    },
+  })
+
+  return { stream }
+}
+
+/**
  * 非 WorkBuddy 供应商的对话处理。
  *
  * ## 为什么要单独一条路径，而不是复用上面那段
@@ -986,17 +1132,26 @@ async function handleProviderChat(input: {
     }
   }
 
-  // ⚠️ **realm 自动回退**（实测踩到：国际版登录成功却报「没有可用账号」）。
+  // ⚠️ **realm 自动回退与分片消歧**（实测踩到：国际版与国内版分片串用导致提示限流）。
   //
-  // 账号按凭据的 `extras.realm` 分片存放（WorkBuddy 国际版在 `global`），
-  // 而客户端选分片靠查询参数 `?realm=`，缺省 `cn`。
-  // 于是「国际版登录成功 → 用的时候报没有账号」，用户完全看不出
-  // 是分片选错了（账号明明在，只是在另一个分片）。
+  // 账号按凭据的 `extras.realm` 分片存放（WorkBuddy 国际版在 `global`，国内版在 `cn`）。
+  // 客户端请求通常缺省 `realm=cn`，若不消歧：
+  // 1. 国际版（workbuddy）会误在 cn 分片探测到存留的同名账号，拿国内凭据去打国际版端点必然 401/限流；
+  // 2. 国内版限流后换国际版，也会误在 cn 分片复用已限流账号。
   //
-  // 只在「该分片里这个供应商**一个账号都没有**」时回退 ——
-  // 否则会把「有账号但都在冷却」误判成「该换分片」，掩盖真实原因。
+  // 规则：
+  // · 请求 `workbuddy` 时，只要 global 分片有可用/存在的账号，优先走 global 分片；
+  // · 其余供应商先看当前 realm，若该分片完全无此供应商账号再回退到另一个 realm。
   let activeRealm = realm
-  {
+  if (providerId === 'workbuddy') {
+    const probeGlobal = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('global'))
+    const hasGlobal = (await probeGlobal.listAccounts('global', Date.now())).some(
+      (a) => a.provider === 'workbuddy' || (a.provider ?? DEFAULT_PROVIDER) === 'workbuddy',
+    )
+    if (hasGlobal) {
+      activeRealm = 'global'
+    }
+  } else {
     const probe = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
     const hasHere = (await probe.listAccounts(realm, Date.now())).some(
       (a) => (a.provider ?? DEFAULT_PROVIDER) === providerId,
@@ -1315,17 +1470,51 @@ async function handleProviderChat(input: {
             + `（自动续期也失败了：${refreshFailure.slice(0, 200)}）`
           : text.slice(0, 300) || `http=${upstream.status}`,
       }
+
+      // 请求失败立刻解绑当前会话，避免下次请求死锁在坏账号上
+      clearSessionBinding(pool, sessionKey, ctx)
+
       if (!rotate) break
       continue
     }
 
     if (upstream.body === null) {
+      clearSessionBinding(pool, sessionKey, ctx)
       lastError = { status: 502, message: '上游返回空 body' }
       continue
     }
 
+    // 预检首块数据：若上游以 HTTP 200 返回 6004 限流或错误帧，立即拦截并换号重试
+    const peeked = await peekStreamForError(upstream.body)
+    if (peeked.error !== undefined) {
+      const errText = peeked.rawText ?? peeked.error
+      const refined = refineModelScoped('rate_limited', errText)
+      const retryAfterMs = refined.resetAt === undefined ? parseRetryAfterMs(upstream.headers) : undefined
+      const resolvedResetAt = refined.resetAt ?? (retryAfterMs === undefined ? undefined : Date.now() + retryAfterMs)
+
+      await pool
+        .applyFailure({
+          uid: picked.uid,
+          kind: refined.dimension,
+          now: Date.now(),
+          ...(model !== '' ? { model } : {}),
+          ...(resolvedResetAt !== undefined ? { resetAt: resolvedResetAt } : {}),
+          reason: `${providerId} sse: ${errText.slice(0, 160)}`,
+        })
+        .catch(() => {})
+
+      clearSessionBinding(pool, sessionKey, ctx)
+
+      lastError = {
+        status: clientStatusFor(200, 'rate_limited'),
+        message: `${providerId} sse: ${errText.slice(0, 160)}`,
+      }
+
+      continue // 换号重试！
+    }
+
     return {
-      response: await streamResponse(upstream.body, {
+      response: await streamResponse(peeked.stream, {
         // ⚠️ 诊断 + 记账分界：客户端断开**不得**记成账号失败
         //（否则用户的取消动作会熔断健康账号，见 `nonStreamingResponse` 的说明）。
         clientGone: () => request.signal.aborted,

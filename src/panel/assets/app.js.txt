@@ -2547,7 +2547,10 @@ async function loadConfig() {
     const row = document.createElement('div')
     row.className = 'config-field-row'
     const code = document.createElement('code')
+    code.className = 'copyable-code'
+    code.title = '轻触即可全选复制'
     code.textContent = val
+    code.onclick = () => copyText(val, '已复制 ' + label)
     const copy = document.createElement('button')
     copy.className = 'ghost small'
     copy.textContent = '复制'

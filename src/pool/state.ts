@@ -205,8 +205,8 @@ export function normalizeAccountState(raw: unknown): AccountState | undefined {
     uid,
     nickname: typeof o.nickname === 'string' ? o.nickname : '',
     realm: typeof o.realm === 'string' ? o.realm : 'cn',
-    // ⚠️ 升级前存的账号只可能是 WorkBuddy，故缺省值就是它
-    provider: typeof o.provider === 'string' && o.provider !== '' ? o.provider : 'workbuddy',
+    // ⚠️ 缺省供应商为国内版默认供应商 buddy
+    provider: typeof o.provider === 'string' && o.provider !== '' ? o.provider : 'buddy',
   })
 
   // 逐字段合并（只认类型正确的值，其余保留默认）
