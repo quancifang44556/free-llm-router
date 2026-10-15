@@ -388,6 +388,31 @@ export function parseSseFrame(raw: string): SseFrame | undefined {
 }
 
 /**
+ * 判定一个 SSE 帧是否为 Anthropic 的**终止帧**（`message_stop`）。
+ *
+ * ⚠️ 判据**优先认 `event:` 行**，其次才解析 `data:` 的 `type` 字段。
+ * 早期实现用 `frame.data.includes('"message_stop"')` 扫字符串 ——
+ * 若某帧**正文内容**恰好复述了 `"message_stop"` 这个词，会被误判为终止帧：
+ * 正常路径下真正终止帧随后会到来（无害），但**若该流此后被截断**
+ * （未收到真正的 `message_stop`），`flush` 会因 `finished===true` 而
+ * 跳过收尾 ⇒ 既无 `finish_reason` 也无 `[DONE]`，客户端永久等待。
+ *
+ * 两处（`transform` 与 `flush`）必须共用本函数 —— 判据分叉会产生
+ * 「transform 认了、flush 不认」这类自相矛盾的组合。
+ */
+function isAnthropicTerminalFrame(frame: SseFrame): boolean {
+  if (frame.event === 'message_stop') return true
+  const trimmed = frame.data.trim()
+  if (trimmed === '') return false
+  try {
+    const parsed = JSON.parse(trimmed) as { type?: unknown }
+    return parsed.type === 'message_stop'
+  } catch {
+    return false
+  }
+}
+
+/**
  * 找到**最早**的空行分隔符（兼容 CRLF）。
  *
  * ⚠️ **不能先查 `\n\n` 再查 `\r\n\r\n`**：在 CRLF 流里 `\r\n\r\n` 同时包含一个
@@ -827,7 +852,7 @@ export function anthropicSseToOpenAiSse(
           buffer = buffer.slice(boundary.end)
           const frame = parseSseFrame(raw)
           if (frame === undefined) continue
-          if (frame.event === 'message_stop' || (frame.data.includes('"message_stop"'))) finished = true
+          if (isAnthropicTerminalFrame(frame)) finished = true
           emit(controller, translateAnthropicFrame(state, frame))
         }
       },
@@ -835,6 +860,14 @@ export function anthropicSseToOpenAiSse(
         // 尾帧（没有以空行结束的最后一帧）
         const tail = parseSseFrame(buffer)
         if (tail !== undefined) {
+          // ⚠️ 若尾帧**本身就是终止帧**（`message_stop`），`translateAnthropicFrame`
+          // 已经在内部发过 finish/usage/`[DONE]`。必须在这里把 `finished` 置位，
+          // 否则下面第 843 行的 `!finished` 仍为真 ⇒ **再发一遍** finish/usage/`[DONE]`，
+          // 客户端收到两条 finish_reason 与两个 `data: [DONE]`。
+          //
+          // 触发条件（真实存在）：上游省略末尾空行、或流在 `message_stop` 后被截断，
+          // 使终止帧落在 flush 的 buffer 里。影响 zcode / minimax 两家（走本转换器）。
+          if (isAnthropicTerminalFrame(tail)) finished = true
           emit(controller, translateAnthropicFrame(state, tail))
         }
         // ⚠️ 上游**总是**要收尾：见过 `message_stop` 时

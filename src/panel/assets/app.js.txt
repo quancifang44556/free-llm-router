@@ -528,9 +528,10 @@ function renderLoginPrompt(el, body, providerId) {
     const url = typeof body.verificationUriComplete === 'string' && body.verificationUriComplete !== ''
       ? body.verificationUriComplete
       : (typeof body.verificationUri === 'string' ? body.verificationUri : '')
-    if (url !== '') {
+    const safe = safeHref(url)
+    if (safe !== '') {
       const a = document.createElement('a')
-      a.href = url; a.target = '_blank'; a.rel = 'noreferrer noopener'
+      a.href = safe; a.target = '_blank'; a.rel = 'noreferrer noopener'
       a.textContent = '打开授权页面'
       el.appendChild(a)
       const hint = document.createElement('div')
@@ -602,11 +603,14 @@ function renderLoginPrompt(el, body, providerId) {
     el._loginStatus = status
 
     if (typeof body.qrUrl === 'string' && body.qrUrl !== '') {
-      const a = document.createElement('a')
-      a.href = body.qrUrl; a.target = '_blank'; a.rel = 'noreferrer noopener'
-      a.textContent = '（打不开二维码时点此）'
-      el.appendChild(document.createElement('br'))
-      el.appendChild(a)
+      const safeQr = safeHref(body.qrUrl)
+      if (safeQr !== '') {
+        const a = document.createElement('a')
+        a.href = safeQr; a.target = '_blank'; a.rel = 'noreferrer noopener'
+        a.textContent = '（打不开二维码时点此）'
+        el.appendChild(document.createElement('br'))
+        el.appendChild(a)
+      }
     }
     return
   }
@@ -619,11 +623,16 @@ function renderLoginPrompt(el, body, providerId) {
     return
   }
   el.textContent = '请在浏览器打开以下链接完成授权：\n' + authUrl + '\n\n等待授权中…' + loginWaitHint(providerId)
-  const a = document.createElement('a')
-  a.href = authUrl; a.target = '_blank'; a.rel = 'noreferrer noopener'
-  a.textContent = '打开授权页面'
-  el.appendChild(document.createElement('br'))
-  el.appendChild(a)
+  // ⚠️ 只在 scheme 安全时才渲染成可点链接；否则仅保留上面的纯文本
+  //（textContent 已是安全的，不会执行脚本）。防的是 `javascript:` 被赋进 href。
+  const safeAuth = safeHref(authUrl)
+  if (safeAuth !== '') {
+    const a = document.createElement('a')
+    a.href = safeAuth; a.target = '_blank'; a.rel = 'noreferrer noopener'
+    a.textContent = '打开授权页面'
+    el.appendChild(document.createElement('br'))
+    el.appendChild(a)
+  }
 }
 
 // ─────────────────────────── 任务中心 ───────────────────────────
@@ -1124,8 +1133,13 @@ async function loadUsage() {
   const byHourMap = new Map()
   for (const p of parts) {
     for (const h of (p.byHour || [])) {
-      const cur = byHourMap.get(h.hour) || { hour: h.hour, count: 0, failed: 0 }
+      // ⚠️ 必须**连 input/output 一起累加**：后端 `UsageHour` 携带这两个字段
+      //（`store/usage.ts:90-92`），而旧版这里只累加 count/failed ⇒
+      // 界面上「按小时」的 token 列恒为 0（`renderUsageHours` 读 `h.input`/`h.output`）。
+      // 这是「同一数据在两个视图口径不一致」型缺陷，且完全静默（不报错、只显示 0）。
+      const cur = byHourMap.get(h.hour) || { hour: h.hour, count: 0, failed: 0, input: 0, output: 0 }
       cur.count += h.count; cur.failed += h.failed
+      cur.input += (h.input ?? 0); cur.output += (h.output ?? 0)
       byHourMap.set(h.hour, cur)
     }
   }
@@ -1196,7 +1210,7 @@ async function loadUsage() {
   //   它能回答「这段时间有多少天真的用过」，正是说明里唯一有用的那部分。）
 
   renderUsageTrend([...byDayMap.values()].sort((a, b) => String(b.day).localeCompare(String(a.day))), windowDays)
-  renderUsageHours([...byHourMap.values()].sort((a, b) => (Number(a.hour) || 0) - (Number(b.hour) || 0)), windowDays)
+  renderUsageHours([...byHourMap.values()].sort((a, b) => String(a.hour).localeCompare(String(b.hour))), windowDays)
 
   // ── 排名列表（照参考项目：序号 + 占比条 + 行内指标）──
   //
@@ -3067,6 +3081,33 @@ const THEME_ICON = {
  * 且本仓库有不变量测试禁止 `innerHTML` 赋值。
  * 也不要用 `textContent` —— 那会把标记当纯文本显示出来。
  */
+/**
+ * 只放行 `https://`（以及 `http://` 本机开发）的链接，其余 scheme 一律拒绝。
+ *
+ * ## 为什么必须校验（安全）
+ *
+ * 授权 URL / 二维码 URL 均**来自上游 provider 响应**。代码全程用 DOM API 构造
+ *（不用 `innerHTML`），但若把上游返回的 `javascript:` 直接赋给 `a.href`，
+ * 用户点击时可在**面板源**上执行脚本 —— 而 API Key 就在同源的 localStorage 里。
+ *
+ * 注意：必须**白名单**放行已知安全的 scheme，而不是「黑名单拒绝危险 scheme」——
+ * 否则 `data:` / `blob:` / `vbscript:` 等仍可能被利用。
+ */
+function safeHref(raw) {
+  if (typeof raw !== 'string' || raw === '') return ''
+  try {
+    const u = new URL(raw, location.origin)
+    if (u.protocol === 'https:') return u.href
+    // 本机开发（wrangler dev / VPS 直连）允许 http
+    if (u.protocol === 'http:' && (u.hostname === 'localhost' || u.hostname === '127.0.0.1')) {
+      return u.href
+    }
+    return ''
+  } catch {
+    return ''
+  }
+}
+
 function setSvg(el, svg) {
   clear(el)
   try {
@@ -3199,9 +3240,19 @@ async function bootstrap() {
   // 真正的数据加载在 switchView 里，那里会查两个 realm。
   const res = await api('/admin/pool?realm=cn')
   if (!res.ok) {
-    // 密钥失效 → 也回登录页（避免停在一个空面板上）
-    localStorage.removeItem('wb_api_key')
-    location.href = '/login'
+    // ⚠️ **只在明确 401（密钥真失效）时才清密钥**，不要用 `!res.ok` 一概而论。
+    //
+    // 实测缺陷：`api()` 在网络错误时返回 `{status:0, ok:false}`（见其 catch 分支）。
+    // 旧写法 `if (!res.ok)` 会把**一次瞬时断网**（手机切换网络、服务端冷启动超时）
+    // 当成「密钥失效」⇒ 删掉 localStorage 里保存的密钥并强制跳登录页，
+    // 用户必须重新手输长密钥。破坏性动作不能建立在不可靠的判据上。
+    if (res.status === 401) {
+      localStorage.removeItem('wb_api_key')
+      location.href = '/login'
+      return
+    }
+    // 非 401（网络错误 / 5xx / 429 等）：**保留密钥**，只提示，不强制登出。
+    setAuth('无法连接服务：' + (res.body ? String(res.body).slice(0, 80) : '请稍后重试'), false)
     return
   }
 

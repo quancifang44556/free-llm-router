@@ -67,7 +67,13 @@ export const CSP =
   "script-src 'self'; " +
   "style-src 'self' 'unsafe-inline'; " +
   "connect-src 'self'; " +
-  "img-src 'self' data:; " +
+  // ⚠️ 必须放开 `https://open.weixin.qq.com`：Loomy（讯飞）微信扫码登录的二维码
+  // 是**微信官方图片端点**（`https://open.weixin.qq.com/connect/qrcode/<uuid>`），
+  // 由面板 `<img src>` 直接加载。只写 `'self' data:` 会让该图被 CSP 拦截
+  // ⇒ 二维码显示为破碎图标、且不报「我们的」错误（只有浏览器控制台一条 CSP 违规），
+  // 用户完全无从排查。
+  // ❗ 仅放开**这一个** HTTPS 域名（微信官方、可信）；不要用通配 `https:`。
+  "img-src 'self' data: https://open.weixin.qq.com; " +
   "form-action 'none'; " +
   "frame-ancestors 'none'; " +
   "base-uri 'none'"
@@ -89,7 +95,8 @@ export const CSP_LOGIN =
   "script-src 'self'; " +
   "style-src 'self' 'unsafe-inline'; " +
   "connect-src 'self'; " +
-  "img-src 'self' data:; " +
+  // 与 `CSP` 同理：登录页若渲染 Loomy 微信二维码，需允许微信官方图片域名。
+  "img-src 'self' data: https://open.weixin.qq.com; " +
   "form-action 'self'; " +
   "frame-ancestors 'none'; " +
   "base-uri 'none'"

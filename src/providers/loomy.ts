@@ -511,6 +511,14 @@ export function looksLikeLoomyCredential(input: unknown): boolean {
   if (accessToken === '') return false
   const userid = pickString(source, 'userid', 'user_id', 'userId')
   const phone = pickString(source, 'phone', 'mobile', 'phone_number')
+  // ⚠️ **先排除 Raccoon**（双向防护，实测确认的重叠）
+  //
+  // Raccoon 的凭据也带 11 位 `phone`（下面第三条判据会命中），但它的
+  // token 是**三段式 JWT**（`aaa.bbb.ccc`），而讯飞 session 是 **32 位 hex**、
+  // **从不**是 JWT。若不排除，`matchesShape` 会同时认领 raccoon 凭据 ——
+  // 虽然注册表里 raccoon 在前会先认走，但判据**依赖顺序**是脆弱的
+  //（顺序一变就出错），必须靠凭据本身的形态分家。
+  if (accessToken.split('.').length >= 3) return false
   return LOOMY_SESSION_HINT.test(accessToken)
     || LOOMY_USERID_HINT.test(userid)
     || LOOMY_PHONE_HINT.test(phone)

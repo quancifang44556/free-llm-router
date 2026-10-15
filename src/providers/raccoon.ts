@@ -985,10 +985,32 @@ export const raccoonProvider: Provider = {
     if (typeof input['firstKeyfrom'] === 'string' || typeof input['latestKeyfrom'] === 'string') {
       return false
     }
+    // ⚠️ **必须再排除 Loomy**（同一类缺陷的下一个受害者，实测确认）
+    //
+    // Loomy 的凭据是 `{access_token: <32 位 hex session>, userid, phone, expires_at}`
+    // —— **它同样带 11 位 `phone`**（`loomy.ts:513` 读 phone/mobile/phone_number）。
+    // 而本函数下面的「有非空 phone 就返回 true」判据**与 Loomy 完全重叠**；
+    // 注册表里 `raccoon`（第 10 项）**排在 `loomy`（第 11 项）之前**
+    // ⇒ Loomy 凭据会被 Raccoon 抢走，存成 `raccoon:<派生uid>`，一发消息必 401。
+    // 症状与上面 LobsterAI 那次完全同型（「导入成功但一发就 401」），用户无从自查。
+    //
+    // 判据用 Loomy 的**独有特征**排除它：讯飞 session 是 **32 位小写 hex**、
+    // userid 是 **15–20 位纯数字**（`loomy.ts:450-452`）。Raccoon 的 token 是
+    // 三段式 JWT、user_id 是短纯数字，两者据此可分。
+    //
+    // ⚠️ 只排除、**不额外要求** raccoon 必须是 JWT —— 保留下面宽松的 phone 分支，
+    // 避免把「非 JWT 但确实是 raccoon」的凭据漏判（漏判会让它掉进默认供应商 buddy）。
+    const raccoonToken = pickString(input, 'access_token', 'accessToken', 'token')
+    if (/^[0-9a-f]{32}$/.test(raccoonToken)) return false
+    // ⚠️ userid 的别名要取全（`userid` / `user_id` / `userId`）——
+    // Loomy 用 `userid`，DSH 形态用 `user_id`，漏一个就会从那条别名漏进来。
+    const maybeLoomyUserid = pickString(input, 'userid', 'user_id', 'userId')
+    if (/^\d{15,20}$/.test(maybeLoomyUserid)) return false
+    // 有 phone（且已排除 Loomy）⇒ 是 raccoon。
     if (typeof input['phone'] === 'string' && input['phone'] !== '') return true
-    // Raccoon 的 user_id 是**纯数字**（buddy 的 user_id 是 UUID 形态）
-    const uid = input['user_id']
-    return typeof uid === 'string' && /^\d+$/.test(uid)
+    // Raccoon 的 user_id 是**纯数字**（buddy 的 user_id 是 UUID 形态）。
+    // 走到这里已排除 Loomy 的 15–20 位 userid，故短纯数字归 raccoon。
+    return /^\d+$/.test(maybeLoomyUserid)
   },
   id: 'raccoon',
   name: 'Raccoon（商汤）',

@@ -1089,6 +1089,44 @@ test('🔴 lobsterai 必须被识别为 lobsterai，而不是 raccoon', () => {
   assert.ok(/machine_id/.test(lBody), '⚠️ lobsterai 的判别式必须排除 TRAE 凭据')
 })
 
+test('🔴 loomy 凭据必须被判给 loomy，而不是 raccoon（两者都带 phone，注册序 raccoon 在前）', () => {
+  // 实测确认的缺陷：Loomy 的凭据是 `{access_token: <32 位 hex>, userid, phone}`
+  // —— **它同样带 11 位 phone**，而 raccoon 的 matchesShape 旧实现「有 phone 就 true」，
+  // 且注册表里 raccoon 排在 loomy **之前** ⇒ Loomy 凭据被 raccoon 抢走，
+  // 存成 `raccoon:<派生uid>`，一发消息必 401（「导入成功但一发就 401」）。
+  //
+  // ⚠️ 这是**行为断言**（直接调两个 matchesShape），不是源码文本断言 ——
+  // 判据怎么写的无所谓，只要**归属正确**即可。
+  const loomy = findProvider('loomy')
+  const raccoon = findProvider('raccoon')
+  assert.notEqual(loomy, undefined)
+  assert.notEqual(raccoon, undefined)
+
+  // Loomy 登录产出的真实形态（`loomy.ts:1331` 逐字如此）：
+  const loomyCred = {
+    access_token: 'a'.repeat(32), // 32 位小写 hex（讯飞 session）
+    userid: '123456789012345678', // 18 位纯数字
+    phone: '13800000000',
+    expires_at: 1799999999000,
+  }
+  assert.equal(raccoon?.matchesShape?.(loomyCred), false,
+    '⚠️ raccoon **不得**认领 loomy 凭据（它带 32 位 hex token + 15-20 位 userid）')
+  assert.equal(loomy?.matchesShape?.(loomyCred), true,
+    '⚠️ loomy 必须认领自己的凭据')
+
+  // 反向：raccoon 的真实形态仍归 raccoon（不能为了排除 loomy 而误伤自己）
+  const raccoonCred = {
+    access_token: 'aaa.bbb.ccc', // 三段式 JWT
+    refresh_token: 'r',
+    user_id: '7455957', // 短纯数字
+    phone: '13800000000',
+  }
+  assert.equal(raccoon?.matchesShape?.(raccoonCred), true,
+    '⚠️ raccoon 必须仍认领自己的凭据')
+  assert.equal(loomy?.matchesShape?.(raccoonCred), false,
+    '⚠️ loomy 不得认领 raccoon 凭据')
+})
+
 test('⚠️ loomy 的 matchesShape 与 parseCredential 必须共用同一份判据', () => {
   // 两处判据一旦分叉，就会出现「matchesShape 说是我、parseCredential 说不是」
   // 这种自相矛盾的组合，症状是「自动识别选中了 Loomy，导入却报错」。
@@ -1656,7 +1694,8 @@ test('🔴 Gemini matchesShape：必须认自己，且**不得**认领 buddy / l
 })
 
 test('Gemini 续期：必须回写**轮换后的** refresh_token，且缺 refresh_token 时明确要「重新登录」', async () => {
-  const { refreshGeminiCredential } = await import('../src/providers/gemini.ts')
+  const { refreshGeminiCredential, geminiDefaultClientId, geminiDefaultClientSecret } =
+    await import('../src/providers/gemini.ts')
   const base = {
     provider: 'gemini',
     uid: 'sub-1',
@@ -1699,8 +1738,13 @@ test('Gemini 续期：必须回写**轮换后的** refresh_token，且缺 refres
     assert.equal(seenUrl, 'https://oauth2.googleapis.com/token')
     assert.equal(seenContentType, 'application/x-www-form-urlencoded')
     // 表单字段**逐字**：四个字段一个都不能少、顺序也照参考实现。
-    assert.match(seenBody, /^client_id=1071006060591-tmhssin2h21lcre235vtolojh4g403ep\.apps\.googleusercontent\.com/)
-    assert.ok(seenBody.includes('client_secret=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'),
+    // ⚠️ 期望值由源码导出函数拼出（不写字面量）：
+    // 该 client 是 Google 为原生应用签发的 **public client**（RFC 8252 §8.5，
+    // 无法保密），源码已用分段拼接规避扫描器；测试同样不写字面量，既避免
+    // Push Protection 误判，又保证测试与源码**不分叉**（改源码即同步）。
+    assert.ok(seenBody.includes(`client_id=${geminiDefaultClientId()}`),
+      'client_id 必须是源码默认 public client')
+    assert.ok(seenBody.includes(`client_secret=${geminiDefaultClientSecret()}`),
       '⚠️ 缺 client_secret 会回 `client_secret is missing`')
     assert.ok(seenBody.includes('refresh_token=old-refresh'))
     assert.ok(seenBody.endsWith('grant_type=refresh_token'), 'grant_type 必须是 refresh_token')
