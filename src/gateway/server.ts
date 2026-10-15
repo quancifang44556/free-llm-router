@@ -334,9 +334,15 @@ async function deriveSessionKey(rawBody: unknown): Promise<string> {
   const body = rawBody as Record<string, unknown>
 
   // ① `user` 字段（最可靠，规范里就是干这个的）
+  // ⚠️ 排除通用客户端静态占位值：ChatBox、NextChat 等客户端经常全局硬编码
+  // 固定的通用名字，若把它们当会话，会把不同对话甚至不同时间的所有流量焊死在同一个账号上。
   const user = body.user
   if (typeof user === 'string' && user.trim() !== '') {
-    return `u:${(await sha256Hex(user.trim())).slice(0, 32)}`
+    const norm = user.trim().toLowerCase()
+    const isGeneric = ['default', 'default-user', 'default_user', 'user', 'chatbox', 'nextchat', 'admin', 'root', 'anonymous', '1'].includes(norm)
+    if (!isGeneric) {
+      return `u:${(await sha256Hex(user.trim())).slice(0, 32)}`
+    }
   }
 
   // ② 部分客户端显式带的会话 id（snake_case 与 camelCase 都认）
@@ -583,6 +589,7 @@ export async function handleChatCompletions(
       }
     }
     tried.push(candidate.uid)
+    console.log(`[pick:buddy] 选中账号 uid=${candidate.uid} nickname=${candidate.credential.nickname || ''} tried=${tried.length}`)
 
     // ② 构造出站请求
     const machineId = await deriveDeviceId(candidate.uid, 'machine')
@@ -1189,6 +1196,7 @@ async function handleProviderChat(input: {
     const picked = await pool.pick({ realm: activeRealm, provider: providerId, model, exclude: tried, now, ...(preferred !== undefined && preferred !== '' ? { preferred } : {}) })
     if (picked === undefined) break
     tried.push(picked.uid)
+    console.log(`[pick:${providerId}] 选中账号 uid=${picked.uid} realm=${activeRealm} tried=${tried.length}`)
 
     const credential = (await pool.getCredential(picked.uid)) as ProviderCredential | undefined
     if (credential === undefined) {

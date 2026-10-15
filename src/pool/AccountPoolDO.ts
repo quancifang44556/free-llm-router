@@ -358,16 +358,27 @@ export class AccountPoolDO extends DurableObject<Env> {
     const fresh = candidates.filter((s) => now - this.notePickedAt(s.uid) >= SPREAD_WINDOW_MS)
     const pool = fresh.length > 0 ? fresh : candidates
 
+    // ⚠️ 真实 Round-Robin 轮换与负载均衡：
+    // 优先选择「最久没有被调用过的健康账号」（notePickedAt 升序排序），
+    // 确保请求严格在池中多个账号之间均匀交替轮转，
+    // 单账号 RPM 严格压低至 1/N，避免单个账号连续承载高频流量导致上游频次瞬间超限。
+    const sorted = [...pool].sort((a, b) => this.notePickedAt(a.uid) - this.notePickedAt(b.uid))
+    const chosen = sorted[0]
+    if (chosen !== undefined) {
+      this.notePicked(chosen.uid, now)
+      return { uid: chosen.uid, state: chosen }
+    }
+
     const weights = pool.map((s) => 1 + Math.max(0, s.credits) / 100)
     const total = weights.reduce((a, b) => a + b, 0)
     let roll = Math.random() * total
     for (let i = 0; i < pool.length; i += 1) {
       roll -= weights[i] ?? 0
       if (roll <= 0) {
-        const chosen = pool[i]
-        if (chosen !== undefined) {
-          this.notePicked(chosen.uid, now)
-          return { uid: chosen.uid, state: chosen }
+        const pickedFallback = pool[i]
+        if (pickedFallback !== undefined) {
+          this.notePicked(pickedFallback.uid, now)
+          return { uid: pickedFallback.uid, state: pickedFallback }
         }
       }
     }
