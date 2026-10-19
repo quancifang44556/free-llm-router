@@ -441,6 +441,44 @@ test('⚠️ 每个真实对话动作都必须已注册（否则入队了却执�
 
 // ───── Qoder 中国版（qodercn）：与 qoder 同实现、不同产品配置 ─────
 
+test('🔴 自动识别必须把「带 CN 旁证的凭据」归到 qodercn（蓝队实测发现的真缺陷）', () => {
+  // ## 缺陷
+  //
+  // \`parseCredentialAnywhere\` 按 **PROVIDERS 数组顺序**逐个问 \`matchesShape\`，
+  // 而 \`qoder\` 排在 \`qodercn\` 之前。
+  //
+  // 我第一版让国际版「对任何 Qoder 形状都返回 true」（当兜底用），
+  // 于是**中国版永远轮不到** —— 导出中国版凭据会被静默归到国际版名下，
+  // 推理时打到错误 host，用户看到的是 401 / 莫名其妙的失败。
+  //
+  // 这与 buddy/workbuddy 的处境完全相同（那边靠「默认变体不声明 matchesShape」
+  // 规避）。Qoder 两侧都声明了判据，故改为「**国际版显式排除 CN 旁证**」。
+  //
+  // ⚠️ 也考虑过「把 qodercn 排到 qoder 前面」—— 但那是**依赖数组顺序**的
+  //    隐式约束，将来加一个新变体就会复发。显式排除更稳。
+  const bare = { security_oauth_token: 'tok', machine_id: 'mid', uid: 'u1' }
+
+  // ① 裸形状 ⇒ 国际版（兜底语义：没被别家认领的 Qoder 凭据就是国际版）
+  assert.equal(
+    parseCredentialAnywhere(bare).provider.id,
+    'qoder',
+    '裸 Qoder 形状必须归国际版',
+  )
+
+  // ② 带 CN 旁证 ⇒ 中国版（三种旁证都测）
+  for (const [name, cred] of [
+    ['qoder.cn 域名', { ...bare, domain: 'https://qoder.cn' }],
+    ['CN openapi host', { ...bare, openApi: 'https://openapi.qoder.com.cn' }],
+    ['显式 variant=cn', { ...bare, variant: 'cn' }],
+  ] as const) {
+    assert.equal(
+      parseCredentialAnywhere(cred).provider.id,
+      'qodercn',
+      `带「${name}」的凭据必须归中国版（否则会静默错归属）`,
+    )
+  }
+})
+
 test('🔴 qodercn 必须已注册，且与 qoder 是**两个独立 provider**', () => {
   // 中国版与国际版协议同一份（\`buildQoderProduct\` 参数化），但它们是
   // **两个独立的账号体系**：不同 clientId、不同 openApi host。

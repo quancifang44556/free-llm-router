@@ -1536,25 +1536,41 @@ export function buildQoderProvider(product: QoderProduct): Provider {
       const pick = (key: string): unknown => input[key] ?? auth?.[key]
 
       const hasQoderFields = typeof pick('security_oauth_token') === 'string'
-      // 国际版（默认变体）：只要形状像 Qoder 就接受 —— 它是兜底，不做额外排除。
-      if (product.id !== 'qodercn') return hasQoderFields
 
-      // ── 中国版：必须在「形状像 Qoder」的基础上**另有旁证** ──
-      if (!hasQoderFields) return false
-
-      // ① 显式变体标记（导入时手写，或登录落库时写入）
+      // ── 先算「中国版旁证」，两个变体都要用 ──
+      let cnEvidence = false
       for (const key of ['variant', 'region', 'realm']) {
         const raw = pick(key)
         if (typeof raw !== 'string') continue
         const v = raw.toLowerCase()
-        if (v === 'cn' || v === 'china' || v === 'qodercn') return true
+        if (v === 'cn' || v === 'china' || v === 'qodercn') { cnEvidence = true; break }
+      }
+      if (!cnEvidence) {
+        // CN 的 host 可能出现在任意嵌套字段（domain / openApi / auth.*），
+        // 故用序列化快扫 —— 比逐个字段名穷举更不容易漏。
+        const flat = JSON.stringify(input)
+        if (flat.includes('qoder.com.cn') || flat.includes('qoder.cn')) cnEvidence = true
       }
 
-      // ② 域名旁证：凭据里任何位置出现 CN 的 host 即判定
-      //    ⚠️ 用 `qoder.com.cn` 与 `qoder.cn` 两个都能覆盖
-      //    （openapi 是 `openapi.qoder.com.cn`，网站是 `qoder.cn`）。
-      const flat = JSON.stringify(input)
-      return flat.includes('qoder.com.cn') || flat.includes('qoder.cn')
+      if (product.id !== 'qodercn') {
+        // ⚠️⚠️ **国际版必须排除带 CN 旁证的凭据**（2026-10-19 蓝队实测发现）。
+        //
+        // 根因：parseCredentialAnywhere 按 **PROVIDERS 数组顺序**逐个问
+        // matchesShape，而 qoder 排在 qodercn 之前。若国际版对**任何**
+        // Qoder 形状都返回 true，中国版**永远轮不到** ——
+        // 导出中国版凭据会被**静默归到国际版名下**，推理时打到错误 host。
+        //
+        // 这与 buddy/workbuddy 的处境完全相同，那边的解法是「默认变体
+        // **不声明** matchesShape」（buddy.ts:182）。Qoder 两侧都声明了，
+        // 故这里用「国际版显式排除 CN 旁证」达成同样效果。
+        //
+        // ⚠️ 若改成「让 qodercn 排到 qoder 前面」，也能修好 —— 但那是
+        // **依赖数组顺序**的隐式约束，加一个新变体就会复发。显式排除更稳。
+        return hasQoderFields && !cnEvidence
+      }
+
+      // ── 中国版：形状像 Qoder **且**另有 CN 旁证 ──
+      return hasQoderFields && cnEvidence
     },
     parseCredential,
     async listModels(_credential, _signal) {
