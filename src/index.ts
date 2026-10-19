@@ -1420,13 +1420,27 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
     const loginRealm = body.realm ?? (providerId === WORKBUDDY_INTL.id ? 'global' : 'cn')
     const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(loginRealm))
 
-    if (providerId === 'qoder') {
+    // ── Qoder（国际版 / 中国版：协议同一份，仅产品配置不同）──
+    //
+    // ⚠️ 两个变体走**同一段**处理逻辑，只把 variant 传下去 ——
+    // 参考实现明确记录「不存在『CN 要另写一份协议』的情况」
+    //（\`qoder-product.ts:176-180\`），复制一份实现会让每个已记录的缺陷修两遍。
+    //
+    // ⚠️ 会话里必须记下 variant（\`session.productId\`）：轮询时
+    // \`pollQoderLogin\` 靠它重建产品配置（token 端点与 clientId 都不同），
+    // 丢了就会拿中国版的票去国际版换令牌 —— 那是必然失败且报错难懂。
+    if (providerId === 'qoder' || providerId === 'qodercn') {
       const { startQoderLogin } = await import('./providers/qoder.js')
-      const session = await startQoderLogin('qoder')
+      const variant = providerId === 'qodercn' ? 'qodercn' : 'qoder'
+      const session = await startQoderLogin(variant)
       const state = crypto.randomUUID()
       // 会话存 DO（**不返回 verifier 给前端**：那是换取令牌的秘密）
-      await pool.saveLoginSession(state, { provider: 'qoder', kind: 'qoder', session }, Date.now() + 15 * 60 * 1000)
-      return json({ ok: true, provider: 'qoder', state, authUrl: session.loginUrl })
+      await pool.saveLoginSession(
+        state,
+        { provider: variant, kind: 'qoder', session },
+        Date.now() + 15 * 60 * 1000,
+      )
+      return json({ ok: true, provider: variant, state, authUrl: session.loginUrl })
     }
     if (providerId === 'zcode') {
       const { startZcodeLogin } = await import('./providers/zcode.js')

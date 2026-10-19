@@ -36,6 +36,7 @@ import assert from 'node:assert/strict'
 import {
   DEFAULT_PROVIDER,
   findProvider,
+  getBuiltinModels,
   PROVIDERS,
   parseCredentialAnywhere,
   providerCatalog,
@@ -437,6 +438,70 @@ test('⚠️ 每个真实对话动作都必须已注册（否则入队了却执�
 })
 
 // ─────────────────── 凭据判别（本地 10 个真实账号暴露的问题） ───────────────────
+
+// ───── Qoder 中国版（qodercn）：与 qoder 同实现、不同产品配置 ─────
+
+test('🔴 qodercn 必须已注册，且与 qoder 是**两个独立 provider**', () => {
+  // 中国版与国际版协议同一份（\`buildQoderProduct\` 参数化），但它们是
+  // **两个独立的账号体系**：不同 clientId、不同 openApi host。
+  // 没注册就等于「中国版用户完全无法登录」。
+  const cn = findProvider('qodercn')
+  assert.notEqual(cn, undefined, 'qodercn 必须已注册进 PROVIDERS')
+  assert.notEqual(cn, findProvider('qoder'), 'qodercn 不能和 qoder 是同一个对象')
+
+  // 产物里必须有真实 CN 模型键（不是照抄国际版那套杜撰值）
+  const ids = getBuiltinModels().filter((m) => m.provider === 'qodercn').map((m) => m.id)
+  assert.ok(ids.length > 0, 'qodercn 必须有内置模型')
+  assert.ok(
+    ids.some((id) => id.includes('qmodel') || id.includes('dfmodel')),
+    '必须用真实 CN 目录键（qmodel*/dfmodel），不能是 claude/gpt 那套杜撰值',
+  )
+})
+
+test('🔴 qodercn 与 qoder 的 matchesShape 必须能**区分**（否则自动识别恒定选错）', () => {
+  // ## 为什么这条必须有
+  //
+  // 两个变体的凭据字段**完全相同**（都只有 security_oauth_token + machine_id），
+  // 而 \`parseCredentialAnywhere\` 是按 PROVIDERS 数组顺序逐个问 matchesShape 的。
+  // 若两者判据一样 ⇒ **永远命中排在前面的那个** ⇒ 中国版账号被挂到国际版名下，
+  // 发推理时打到错误 host。
+  //
+  // 本项目对 buddy/workbuddy 已有同一套纪律（默认变体兜底、非默认变体带旁证），
+  // 本测试锁死 qodercn 照做。
+  const qoder = findProvider('qoder')
+  const cn = findProvider('qodercn')
+  assert.notEqual(qoder?.matchesShape, undefined)
+  assert.notEqual(cn?.matchesShape, undefined, 'qodercn 必须有 matchesShape（否则永远轮不到它）')
+
+  // ① 纯 Qoder 形状（无任何 CN 旁证）⇒ 只有国际版认
+  const bare = { security_oauth_token: 'tok', machine_id: 'mid' }
+  assert.equal(qoder!.matchesShape!(bare), true, '国际版应认领裸形状')
+  assert.equal(
+    cn!.matchesShape!(bare),
+    false,
+    '⚠️ 中国版**不得**认领裸形状 —— 否则会把国际版凭据抢走',
+  )
+
+  // ② 带 CN 域名旁证 ⇒ 中国版认领
+  assert.equal(
+    cn!.matchesShape!({ ...bare, domain: 'https://qoder.cn' }),
+    true,
+    '出现 qoder.cn 时必须判为中国版',
+  )
+  assert.equal(
+    cn!.matchesShape!({ ...bare, openApi: 'https://openapi.qoder.com.cn' }),
+    true,
+    '出现 openapi.qoder.com.cn 时必须判为中国版',
+  )
+
+  // ③ 显式变体标记
+  assert.equal(cn!.matchesShape!({ ...bare, variant: 'cn' }), true, '显式 variant=cn 必须认')
+  assert.equal(cn!.matchesShape!({ auth: { ...bare, realm: 'cn' } }), true, '嵌套 auth.realm=cn 必须认')
+
+  // ④ 反向守卫：非 Qoder 形状两边都不认
+  assert.equal(cn!.matchesShape!({ access_token: 'x', uid: 'u' }), false)
+  assert.equal(qoder!.matchesShape!({ access_token: 'x', uid: 'u' }), false)
+})
 
 test('⚠️ qoder/trae/raccoon/codearts 必须有 matchesShape（否则被 buddy 兜底抢走）', () => {
   // 实测：拿本地真实凭据跑 parseCredentialAnywhere，

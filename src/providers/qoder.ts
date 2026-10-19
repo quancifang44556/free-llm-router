@@ -1505,11 +1505,56 @@ export function buildQoderProvider(product: QoderProduct): Provider {
      * （实测：本地 QODER 凭据被判成 buddy）。
      * Qoder 独有：`security_oauth_token` / `machine_id`（成对出现）。
      */
+    /**
+     * 对象判别式：Qoder 凭据的**独有**字段。
+     *
+     * ⚠️ 不认 `access_token` / `uid` 这些通用字段 ——
+     * 它们和 buddy 等家重叠，拿来判别会让 Qoder 凭据被 buddy 兜底抢走
+     * （实测：本地 QODER 凭据被判成 buddy）。
+     * Qoder 独有：`security_oauth_token` / `machine_id`（成对出现）。
+     *
+     * ## ⚠️⚠️ 中国版与国际版**凭据形态完全相同**，必须靠旁证区分
+     *
+     * 两个变体的凭据字段一模一样（都只有 `security_oauth_token` + `machine_id`），
+     * 而它们是**两个独立的账号体系**（不同 clientId、不同 openApi host）。
+     * 若判别式不做区分，自动识别会**恒定选中数组里排在前面的那个**
+     * ⇒ 中国版账号被挂到国际版名下，发推理时打到错误的 host。
+     *
+     * ⇒ 沿用本项目 `buddy` / `workbuddy` 的**同一套纪律**
+     *（`src/providers/buddy.ts:431-457`）：
+     *   - **默认变体（国际版 `qoder`）不声明额外判据** —— 它是兜底；
+     *   - **非默认变体（中国版）**声明旁证：域名 / 显式 variant 标记。
+     *
+     * 认的旁证（任一成立即判为中国版）：
+     *   - 任意字符串字段（含嵌套 `auth`）里出现 `qoder.cn` 或 `qoder.com.cn`
+     *   - 显式 `variant` / `region` / `realm` 为 `cn` / `china` / `qodercn`
+     */
     matchesShape(input) {
-      return (
-        typeof input['security_oauth_token'] === 'string'
-        || (typeof input['machine_id'] === 'string' && typeof input['security_oauth_token'] === 'string')
-      )
+      // ⚠️ 字段可能在**顶层**，也可能被包在 auth 里（两种导入形态都实测存在，
+      // 与 buddy 的 domain 读取同款处理）。只读顶层会漏认嵌套形态。
+      const auth = input['auth'] as Record<string, unknown> | undefined
+      const pick = (key: string): unknown => input[key] ?? auth?.[key]
+
+      const hasQoderFields = typeof pick('security_oauth_token') === 'string'
+      // 国际版（默认变体）：只要形状像 Qoder 就接受 —— 它是兜底，不做额外排除。
+      if (product.id !== 'qodercn') return hasQoderFields
+
+      // ── 中国版：必须在「形状像 Qoder」的基础上**另有旁证** ──
+      if (!hasQoderFields) return false
+
+      // ① 显式变体标记（导入时手写，或登录落库时写入）
+      for (const key of ['variant', 'region', 'realm']) {
+        const raw = pick(key)
+        if (typeof raw !== 'string') continue
+        const v = raw.toLowerCase()
+        if (v === 'cn' || v === 'china' || v === 'qodercn') return true
+      }
+
+      // ② 域名旁证：凭据里任何位置出现 CN 的 host 即判定
+      //    ⚠️ 用 `qoder.com.cn` 与 `qoder.cn` 两个都能覆盖
+      //    （openapi 是 `openapi.qoder.com.cn`，网站是 `qoder.cn`）。
+      const flat = JSON.stringify(input)
+      return flat.includes('qoder.com.cn') || flat.includes('qoder.cn')
     },
     parseCredential,
     async listModels(_credential, _signal) {

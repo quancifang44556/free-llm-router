@@ -23,7 +23,7 @@ import { lobsteraiProvider } from './lobsterai.js'
 import { loomyProvider } from './loomy.js'
 import { geminiProvider } from './gemini.js'
 import { traeProvider } from './trae.js'
-import { qoderProvider } from './qoder.js'
+import { qoderProvider, qodercnProvider } from './qoder.js'
 import { opencodeProvider } from './opencode.js'
 import { raccoonProvider } from './raccoon.js'
 import { zcodeProvider } from './zcode.js'
@@ -48,6 +48,9 @@ export const PROVIDERS: readonly Provider[] = [
   lobsteraiProvider,
   traeProvider,
   qoderProvider,
+  // ⚠️ 中国版与国际版**共用同一份实现**（`buildQoderProduct` 参数化），
+  // 差异全在配置字段（authBase / openApiBase / clientId）。
+  qodercnProvider,
   opencodeProvider,
   raccoonProvider,
   zcodeProvider,
@@ -254,6 +257,21 @@ export function getBuiltinModels(): BuiltinModelInfo[] {
     { id: 'qoder/deepseek-v3', name: 'DeepSeek V3', provider: 'qoder', providerName: 'Qoder (通义灵码)', isFree: true, isBuiltin: true },
     { id: 'qoder/deepseek-coder', name: 'DeepSeek Coder', provider: 'qoder', providerName: 'Qoder (通义灵码)', isFree: true, isBuiltin: true },
     { id: 'qoder/qwen-2.5-coder-32b', name: 'Qwen 2.5 Coder 32B', provider: 'qoder', providerName: 'Qoder (通义灵码)', isFree: true, isBuiltin: true },
+
+    // Qoder 中国版
+    //
+    // ⚠️ 模型 id 用**真实的 CN 目录键**（\`QODER_CN_FALLBACK_MODELS\`），
+    // 不要照抄上面国际版那几条 —— 那些（\`claude-3-5-sonnet\` / \`gpt-4o\`）
+    // 与实证目录完全不符，是早期杜撰的占位值；中国版的实际键是
+    // \`qmodel_38max\` / \`dfmodel\` / \`gmodel\` 这一套。
+    { id: 'qodercn/auto', name: 'Auto（自动选模型）', provider: 'qodercn', providerName: 'Qoder (中国版)', isFree: false, isBuiltin: true },
+    { id: 'qodercn/qfmodel', name: 'Qwen3.8-Flash', provider: 'qodercn', providerName: 'Qoder (中国版)', isFree: true, isBuiltin: true },
+    { id: 'qodercn/qmodel_38max', name: 'Qwen3.8-Max', provider: 'qodercn', providerName: 'Qoder (中国版)', isFree: true, isBuiltin: true },
+    { id: 'qodercn/dfmodel', name: 'DeepSeek-Flash', provider: 'qodercn', providerName: 'Qoder (中国版)', isFree: false, isBuiltin: true },
+    { id: 'qodercn/dmodel', name: 'DeepSeek-V4-Pro', provider: 'qodercn', providerName: 'Qoder (中国版)', isFree: false, isBuiltin: true },
+    { id: 'qodercn/gfmodel', name: 'GLM-5.3-Flash', provider: 'qodercn', providerName: 'Qoder (中国版)', isFree: false, isBuiltin: true },
+    { id: 'qodercn/gmodel', name: 'GLM-5.3', provider: 'qodercn', providerName: 'Qoder (中国版)', isFree: false, isBuiltin: true },
+    { id: 'qodercn/kmodel_latest', name: 'Kimi-K3', provider: 'qodercn', providerName: 'Qoder (中国版)', isFree: false, isBuiltin: true },
 
     // MiniMax
     { id: 'minimax/MiniMax-Text-01', name: 'MiniMax-Text-01 (大模型推理)', provider: 'minimax', providerName: 'MiniMax', isFree: true, isBuiltin: true },
