@@ -410,6 +410,18 @@ async function pickCandidate(
     realm, provider, model, exclude, now,
     ...(preferred !== undefined && preferred !== '' ? { preferred } : {}),
   })
+  // ── 永久积分锁：把「锁了」翻译成**用户可见的明确错误** ──
+  //
+  // ⚠️ 这条分支是 §7.2「失败必须显式」的落地：若静默返回 undefined，
+  // 上层会报含糊的「无可用账号」—— 用户会误判服务故障、甚至解锁
+  // 烧掉不可撤回的永久积分（那正是锁要防的事）。
+  if (result !== undefined && (result as { lockedByPermanent?: true }).lockedByPermanent === true) {
+    const skipped = (result as { lockedSkipped?: number }).lockedSkipped ?? 0
+    throw new Error(
+      `该供应商的 ${skipped} 个账号只剩永久积分且已被「永久积分锁」保护，` +
+        '不参与选号。若确认要消耗永久积分，请在面板里关闭该锁。',
+    )
+  }
   if (result === undefined) return undefined
   const credential = (await pool.getCredential(result.uid)) as LoginCredential | undefined
   if (credential === undefined || credential.accessToken === '') return undefined
@@ -1413,6 +1425,15 @@ export async function handleProviderChat(input: {
     // ⚠️ 只在**首轮**（`tried` 为空）用粘性：已经在换号了还粘回去会死循环。
     const preferred = tried.length === 0 ? (sessionKey === '' ? '' : await pool.getSession(sessionKey, now)) : ''
     const picked = await pool.pick({ realm: activeRealm, provider: providerId, model, exclude: tried, now, ...(preferred !== undefined && preferred !== '' ? { preferred } : {}) })
+    // ── 永久积分锁：同第一消费点，锁定必须显式报错（不许静默 break）──
+    if (picked !== undefined && (picked as { lockedByPermanent?: true }).lockedByPermanent === true) {
+      const skipped = (picked as { lockedSkipped?: number }).lockedSkipped ?? 0
+      lastError = {
+        status: 429,
+        message: `该供应商的 ${skipped} 个账号只剩永久积分且已被「永久积分锁」保护，不参与选号。若确认要消耗永久积分，请在面板里关闭该锁。`,
+      }
+      break
+    }
     if (picked === undefined) break
     tried.push(picked.uid)
     console.log(`[pick:${providerId}] 选中账号 uid=${picked.uid} realm=${activeRealm} tried=${tried.length}`)

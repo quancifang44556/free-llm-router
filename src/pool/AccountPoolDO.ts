@@ -100,6 +100,25 @@ const API_KEYS_KEY = 'apiKeys'
 const API_KEY_USAGE_KEY = 'apiKeyUsage'
 
 /**
+ * **永久积分锁**开关表的存储键（per-provider，如 `{ buddy: true }`）。
+ *
+ * ## ⚠️⚠️ 为什么必须是**独立的 storage key**（真实事故，参考实现记录）
+ *
+ * 账号池主状态是**整体替换**语义（读全量 → 改 → 写全量）。若把开关放在
+ * 主状态里，任何一次「读改写」都可能抹掉它 —— 参考实现记录过完整事故链：
+ *
+ * | 步骤 | 发生了什么 |
+ * |---|---|
+ * | 1 | 新代码写入 `permanentLocks: { buddy: true }` |
+ * | 2 | 旧代码（不认识该字段）触发任意一次整体写入 |
+ * | 3 | 旧代码只写它认识的键 ⇒ 锁**被静默抹掉** |
+ * | 4 | 选号继续消耗永久积分 —— **烧掉不可撤回** |
+ *
+ * ⇒ 独立 key = 旧代码**从不读写**它，两条代码路径互不干扰。
+ */
+const PERMANENT_LOCKS_KEY = 'permanentLocks'
+
+/**
  * 规范化一条用量记录（读库时用）。
  *
  * ⚠️ 字段缺失不能抛错、也不能算出 `NaN`：`NaN` 会让面板显示 `NaN`
@@ -222,6 +241,16 @@ export interface PickRequest {
 export interface PickResult {
   uid: string
   state: AccountState
+  /**
+   * **永久积分锁**把全部候选滤空时为 `true`（uid 为空、state 缺省）。
+   *
+   * ⚠️ 网关必须把这种情况翻译成**用户可见的明确错误**：
+   * 「账号正常，只是永久积分已上锁」—— 绝不能静默回落换号或报含糊的
+   * 「无可用账号」，否则用户会误判服务故障、甚至解锁烧掉不可撤回的永久积分。
+   */
+  lockedByPermanent?: true
+  /** 因锁被滤掉的候选数（仅供错误信息展示）。 */
+  lockedSkipped?: number
 }
 
 /** 账号池的对外 RPC 面（Worker 通过 stub 调用）。 */
@@ -355,6 +384,16 @@ export class AccountPoolDO extends DurableObject<Env> {
     if (await this.wafGateActive(now)) return undefined
 
     const raws = listAccounts(this.ctx.storage.sql, realm)
+    // ── 永久积分锁（per-provider）──
+    //
+    // ⚠️ 锁的语义是「**只剩永久额度**的账号不参与选号」，不是「provider 停用」。
+    // 有临期额度的账号照常可选 —— 这正是锁的意义：让临期额度先烧，永久的不动。
+    //
+    // ⚠️ 锁定且**全部**候选都被滤掉时，**不许静默回落**到「无可用账号」之外的行为
+    //（参考实现的纪律：回落会绕过锁、照样烧永久积分，使锁形同虚设）。
+    const permLocks = await this.getPermanentLocks()
+    let permLockSkipped = 0
+
     const candidates: AccountState[] = []
     for (const raw of raws) {
       const state = normalizeAccountState(JSON.parse(raw))
@@ -365,10 +404,35 @@ export class AccountPoolDO extends DurableObject<Env> {
       if (excludeSet.has(state.uid)) continue
       pruneExpired(state, now, MODEL_COST_TTL_MS)
       if (!healthyForModel(state, now, model)) continue
+
+      // ── 永久积分锁过滤 ──
+      //
+      // 判定「只剩永久额度」用**快照三元组**（AccountState 已有，无需再打上游）：
+      //   creditsExpiring === 0 且 credits > 0
+      //   ⇒ 没有任何临期/赠送额度，剩下的全是永久积分。
+      //
+      // ⚠️ credits === 0 时**不滤**：那是「没钱了」，走的是 402 硬冷却路径，
+      // 不是「只剩永久」—— 混淆会把真正的额度耗尽误报成锁。
+      if (permLocks[state.provider ?? 'buddy'] === true && state.credits > 0 && state.creditsExpiring === 0) {
+        permLockSkipped += 1
+        continue
+      }
+
       candidates.push(state)
     }
 
-    if (candidates.length === 0) return undefined
+    if (candidates.length === 0) {
+      // ⚠️ 因永久锁被滤空时，返回值里带上**可读的原因**（而不是 undefined）。
+      // 调用方（网关）把它翻译成用户可见错误 —— 这正是 §7.2「失败必须显式」：
+      // 用户必须知道「账号是好的，只是永久积分锁住了」，否则会误以为服务故障。
+      if (permLockSkipped > 0) {
+        // ⚠️ 刻意用独立类型（不塞进 PickResult）：state 是必填字段，
+        // 把它置 undefined 会骗过类型系统、让所有调用方都要判空 ——
+        // 独立判别联合让「锁了」与「选到号」在类型层就分开。
+        return { lockedByPermanent: true, lockedSkipped: permLockSkipped } as PickResult
+      }
+      return undefined
+    }
 
     // 权重：积分越多越优先（温和偏好，不是硬门槛）。
     // ⚠️ 刻意**不**用 `Math.random()` 之外的全局状态：DO 单线程，无需防并发。
@@ -1282,6 +1346,38 @@ export class AccountPoolDO extends DurableObject<Env> {
    * 子密钥描述的是「谁能调 `/v1/*`」，与 realm 无关；按 realm 各存一份
    * 会让同一个 Key 在不同分片下鉴权结果不一致。
    */
+  // ─────────────────────── 永久积分锁 ───────────────────────
+
+  /**
+   * 读永久积分锁开关表（per-provider）。
+   *
+   * @returns 形如 `{ buddy: true }`；未配置过返回空对象（**缺省 = 不锁**）。
+   */
+  async getPermanentLocks(): Promise<Record<string, boolean>> {
+    const raw = await this.ctx.storage.get<unknown>(PERMANENT_LOCKS_KEY)
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return {}
+    const out: Record<string, boolean> = {}
+    for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+      // 只认 boolean true；损坏条目跳过而不是让整个表失效
+      if (v === true) out[k] = true
+    }
+    return out
+  }
+
+  /**
+   * 设置某供应商的永久积分锁。
+   *
+   * ⚠️ ``permanentLocks` 的语义是「该 provider 下、**只剩永久额度**的账号
+   * 不参与选号」。**不**是「该 provider 完全停用」—— 有临期额度的账号照常可用。
+   */
+  async setPermanentLock(provider: string, locked: boolean): Promise<Record<string, boolean>> {
+    const locks = await this.getPermanentLocks()
+    if (locked) locks[provider] = true
+    else delete locks[provider]
+    await this.ctx.storage.put(PERMANENT_LOCKS_KEY, locks)
+    return locks
+  }
+
   async listApiKeys(): Promise<ApiKeyRecord[]> {
     const raw = await this.ctx.storage.get<unknown>(API_KEYS_KEY)
     if (!Array.isArray(raw)) return []

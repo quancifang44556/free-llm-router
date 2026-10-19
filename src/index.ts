@@ -2343,6 +2343,26 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
   //
   // 只对**声明了 checkin: true** 的供应商执行 —— 其余家显式跳过并说明原因，
   // 不静默忽略（用户需要知道「为什么这家没签」）。
+  // ── 永久积分锁（防止临期额度烧完后静默消耗花钱买的永久积分） ──
+  //
+  // ⚠️ per-provider 开关，**锁的不是 provider 本身**：有临期额度的账号照常可选，
+  // 被滤掉的只是「**只剩**永久额度」的那些。
+  if (path === '/admin/permanent-locks' && request.method === 'GET') {
+    // ⚠️ 锁表存在 cn 分片（与供应商设置同一纪律：这是全局开关，与 realm 无关）
+    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn'))
+    return json({ locks: await pool.getPermanentLocks() })
+  }
+
+  if (path === '/admin/permanent-locks' && request.method === 'POST') {
+    const body = (await request.json().catch(() => ({}))) as { provider?: unknown; locked?: unknown }
+    const provider = typeof body.provider === 'string' ? body.provider : ''
+    if (provider === '') return jsonError(400, 'provider 必填', 'invalid_request_error')
+    if (typeof body.locked !== 'boolean') return jsonError(400, 'locked 必须是 boolean', 'invalid_request_error')
+    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn'))
+    const locks = await pool.setPermanentLock(provider, body.locked)
+    return json({ ok: true, provider, locked: body.locked, locks })
+  }
+
   // ── 限时补偿积分（wb 面板上那个「立即领取」按钮） ──
   //
   // ⚠️ 这是**一次性写操作**，故刻意**不**接进自动签到 / cron：

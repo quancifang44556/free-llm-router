@@ -3456,6 +3456,99 @@ async function loadConfig() {
 
   statusCard.appendChild(wrapTable(buildTable(['项', '值'], pairs)))
   box.appendChild(statusCard)
+
+  await loadPermanentLocks()
+}
+
+// ─────────────────────────── 永久积分锁 ───────────────────────────
+
+/**
+ * 加载并渲染永久积分锁开关列表。
+ *
+ * ⚠️ 永久积分锁的语义是「该供应商下只剩永久额度的账号不参与选号」，
+ * 防止免费额度用完后静默烧掉真金白银买的永久积分。
+ */
+async function loadPermanentLocks() {
+  const box = $('perm-locks-list')
+  if (!box) return
+  clear(box)
+
+  const [locksRes, provRes] = await Promise.all([
+    api('/admin/permanent-locks'),
+    api('/admin/providers'),
+  ])
+
+  const locks = (locksRes.ok && locksRes.body && locksRes.body.locks) || {}
+  const providers = (provRes.ok && provRes.body && provRes.body.providers) || providerCache || []
+
+  if (providers.length === 0) {
+    const empty = document.createElement('div')
+    empty.className = 'hint'
+    empty.textContent = '暂无可用供应商'
+    box.appendChild(empty)
+    return
+  }
+
+  for (const p of providers) {
+    const isLocked = Boolean(locks[p.id])
+    const card = document.createElement('div')
+    card.className = 'key-card' + (isLocked ? '' : ' off')
+
+    const head = document.createElement('div')
+    head.className = 'key-head'
+
+    const name = document.createElement('div')
+    name.className = 'key-name'
+    name.textContent = p.name || p.id
+    head.appendChild(name)
+
+    const tag = document.createElement('span')
+    tag.className = 'tag ' + (isLocked ? 'warn' : 'ok')
+    tag.textContent = isLocked ? '已开启保护（锁定）' : '未加锁（允许消耗）'
+    head.appendChild(tag)
+    card.appendChild(head)
+
+    const pid = document.createElement('code')
+    pid.className = 'key-prefix'
+    pid.textContent = p.id
+    card.appendChild(pid)
+
+    const desc = document.createElement('p')
+    desc.className = 'hint'
+    desc.style.margin = '4px 0'
+    desc.textContent = isLocked
+      ? '该供应商下「只剩永久积分」的账号已退出选号，永久积分被保护。'
+      : '该供应商下所有账号正常参与选号，免费额度用完后将消耗永久积分。'
+    card.appendChild(desc)
+
+    const actions = document.createElement('div')
+    actions.className = 'key-head'
+    actions.style.marginTop = '6px'
+
+    const btn = document.createElement('button')
+    btn.className = isLocked ? 'ghost small' : 'primary-btn small'
+    btn.textContent = isLocked ? '解除保护（允许消耗）' : '开启保护（锁定永久额度）'
+    btn.onclick = async () => {
+      btn.disabled = true
+      const nextLocked = !isLocked
+      const res = await api('/admin/permanent-locks', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ provider: p.id, locked: nextLocked }),
+      })
+      btn.disabled = false
+      if (res.ok) {
+        showToast(`${p.name || p.id} 永久积分锁已${nextLocked ? '开启' : '解除'}`, 'ok')
+        await loadPermanentLocks()
+      } else {
+        showToast('设置失败：' + (res.body?.message || res.body || '未知错误'), 'err')
+      }
+    }
+    actions.appendChild(btn)
+    card.appendChild(actions)
+
+    box.appendChild(card)
+  }
 }
 
 // ─────────────────────────── 日志 ───────────────────────────

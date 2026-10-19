@@ -227,9 +227,10 @@ export function startServer(options: ServerOptions = {}) {
 
 // 直接运行入口（node src/server/index.js 或打包后的 node dist/server.mjs）
 const isDirectRun =
-  import.meta.url === `file://${process.argv[1]?.replace(/\\/g, '/')}` ||
-  process.argv[1]?.endsWith('server.mjs') ||
-  process.argv[1]?.endsWith('server.js')
+  !process.argv[1]?.includes('.test.') &&
+  (import.meta.url === `file://${process.argv[1]?.replace(/\\/g, '/')}` ||
+    process.argv[1]?.endsWith('server.mjs') ||
+    process.argv[1]?.endsWith('server.js'))
 
 if (isDirectRun) {
   startServer()

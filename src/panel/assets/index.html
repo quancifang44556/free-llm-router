@@ -232,7 +232,15 @@
   <!-- ───────── 配置 ───────── -->
   <section class="view" id="view-config" hidden>
     <div class="page-head"><h2>配置与接入指南</h2></div>
-    <section class="panel"><div id="config"></div></section>
+    <section class="panel"><div id="config"></div>
+    <div class="panel" id="perm-lock-panel" style="margin-top:12px">
+      <h3>永久积分锁</h3>
+      <p class="hint">开启后：该供应商下「<b>只剩永久积分</b>」的账号不再参与选号 ——
+      防止免费额度烧完后，静默消耗你花钱买的永久积分（烧掉不可撤回）。
+      有临期额度的账号照常可用。</p>
+      <div class="key-grid" id="perm-locks-list"></div>
+    </div>
+</section>
   </section>
 
   <!-- ───────── 日志 ───────── -->
