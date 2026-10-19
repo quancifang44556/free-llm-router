@@ -27,6 +27,7 @@ import { qoderProvider, qodercnProvider } from './qoder.js'
 import { opencodeProvider } from './opencode.js'
 import { raccoonProvider } from './raccoon.js'
 import { zcodeProvider } from './zcode.js'
+import { meooProvider } from './meoo.js'
 import { parseJsonLenient } from '../upstream/import.js'
 
 /**
@@ -57,6 +58,7 @@ export const PROVIDERS: readonly Provider[] = [
   // ⚠️ **放在最后**：数组第 0 项是默认供应商，不能被新加的挤动。
   loomyProvider,
   geminiProvider,
+  meooProvider,
 ]
 
 /** 默认供应商 id（裸模型名回落到它）。 */
@@ -318,5 +320,12 @@ export function getBuiltinModels(): BuiltinModelInfo[] {
     // Loomy
     { id: 'loomy/DeepSeek-V4.1-Flash', name: 'DeepSeek V4.1 Flash', provider: 'loomy', providerName: '讯飞 Loomy', isFree: true, isBuiltin: true },
     { id: 'loomy/MiniMax-M3', name: 'MiniMax M3', provider: 'loomy', providerName: '讯飞 Loomy', isFree: true, isBuiltin: true },
+
+    // Meoo 秒悟
+    { id: 'meoo/qwen3.6-plus', name: 'Qwen 3.6 Plus (默认)', provider: 'meoo', providerName: 'Meoo (秒悟)', isFree: true, isBuiltin: true },
+    { id: 'meoo/deepseek-v3.2', name: 'DeepSeek V3.2', provider: 'meoo', providerName: 'Meoo (秒悟)', isFree: true, isBuiltin: true },
+    { id: 'meoo/kimi-k2.5', name: 'Kimi K2.5', provider: 'meoo', providerName: 'Meoo (秒悟)', isFree: true, isBuiltin: true },
+    { id: 'meoo/glm-5', name: 'GLM-5', provider: 'meoo', providerName: 'Meoo (秒悟)', isFree: true, isBuiltin: true },
+    { id: 'meoo/MiniMax-M2.5', name: 'MiniMax M2.5', provider: 'meoo', providerName: 'Meoo (秒悟)', isFree: true, isBuiltin: true },
   ]
 }

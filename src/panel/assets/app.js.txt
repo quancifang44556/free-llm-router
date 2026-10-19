@@ -460,7 +460,23 @@ async function fetchPoolCounts() {
 const PACKAGES_CACHE_TTL_MS = 60_000
 let packagesCache = null
 
+/**
+ * 失效积分包短时缓存。
+ * 在账号变更事件（登录成功、删除账号、切换状态、导入账号、用户点击刷新等）时调用，
+ * 保证后续拉取的积分是最新的，避免新账号落入旧缓存而显示「—」。
+ */
+function invalidatePackagesCache() {
+  packagesCache = null
+}
+if (typeof window !== 'undefined') {
+  window.invalidatePackagesCache = invalidatePackagesCache
+}
+if (typeof globalThis !== 'undefined') {
+  globalThis.invalidatePackagesCache = invalidatePackagesCache
+}
+
 async function fetchPackages(force) {
+  if (force === true) packagesCache = null
   const now = Date.now()
   if (force !== true && packagesCache !== null && now - packagesCache.at < PACKAGES_CACHE_TTL_MS) {
     return packagesCache.rows
@@ -718,6 +734,7 @@ async function loadTaskUids() {
  * 故凡是**会改积分的操作**（签到、每日任务）跑完都要调这里。
  */
 function invalidateCredits() {
+  invalidatePackagesCache()
   creditsLoaded = false
   void loadProviderCredits()
 }
@@ -782,6 +799,7 @@ async function claimCompensationAll() {
     parts.push(who + '：' + (row.detail || '完成'))
   }
   out.textContent = parts.length > 0 ? parts.join('；') : '没有可领取的账号。'
+  invalidatePackagesCache()
   await loadAccounts()
 }
 
@@ -1806,7 +1824,7 @@ async function loadProviderCredits() {
   const byProvider = {}
   for (const a of res.body.accounts) {
     if (a.error || typeof a.total !== 'number') continue
-    const pid = a.provider || 'buddy'
+    const pid = a.provider || (a.uid && a.uid.includes(':') ? a.uid.slice(0, a.uid.indexOf(':')) : 'buddy')
     byProvider[pid] = (byProvider[pid] || 0) + a.total
   }
   creditCache = byProvider
@@ -2253,6 +2271,7 @@ async function loadModalAccounts() {
         body: JSON.stringify({ uid: a.uid, realm: a.realm || 'cn', disabled: !a.disabled }),
       })
       if (!r.ok) { alert('操作失败：' + JSON.stringify(r.body)); return }
+      invalidatePackagesCache()
       loadModalAccounts(); loadAccounts(); loadPool()
     }
     card.appendChild(tog)
@@ -2265,6 +2284,7 @@ async function loadModalAccounts() {
         body: JSON.stringify({ uid: a.uid, realm: 'cn', confirm: true }),
       })
       if (!r.ok) alert('删除失败：' + JSON.stringify(r.body))
+      invalidatePackagesCache()
       loadModalAccounts(); loadAccounts(); loadPool()
     }
     card.appendChild(del)
@@ -2285,15 +2305,57 @@ async function loadModalAccounts() {
     }
     // ⚠️ 轮次校验：不是同一轮就丢弃（用户已切换供应商/已重载）
     if (loadSeq !== modalAccountsSeq) return
-    const byUid = new Map()
-    for (const p of packages) {
-      if (p && typeof p.uid === 'string') byUid.set(p.uid, p)
+
+    // 建立 uid 映射：同时索引原始 uid、去除供应商前缀的裸 uid、以及加上供应商前缀的 uid，
+    // 保证各供应商（如 qodercn:xxx 与 xxx）双向都能稳定命中。
+    const indexPackages = (rows) => {
+      const map = new Map()
+      for (const p of rows) {
+        if (!p || typeof p.uid !== 'string') continue
+        map.set(p.uid, p)
+        const colon = p.uid.indexOf(':')
+        if (colon > 0) {
+          const stripped = p.uid.slice(colon + 1)
+          if (!map.has(stripped)) map.set(stripped, p)
+        }
+      }
+      return map
     }
+
+    const findPackage = (accountUid, map) => {
+      let p = map.get(accountUid)
+      if (p !== undefined) return p
+      const colon = accountUid.indexOf(':')
+      if (colon > 0) {
+        p = map.get(accountUid.slice(colon + 1))
+        if (p !== undefined) return p
+      }
+      if (modalProviderId && !accountUid.includes(':')) {
+        p = map.get(`${modalProviderId}:${accountUid}`)
+        if (p !== undefined) return p
+      }
+      return undefined
+    }
+
+    let byUid = indexPackages(packages)
+
+    // ⚠️ 若当前弹窗账号 mine 中有账号在 packages 中不存在（例如刚登录/导入而旧缓存尚未失效），
+    // 自动穿透取一次 fetchPackages(true)，刷新缓存并补齐积分
+    if (!mine.every((a) => findPackage(a.uid, byUid) !== undefined)) {
+      try {
+        packages = await fetchPackages(true)
+        if (loadSeq !== modalAccountsSeq) return
+        byUid = indexPackages(packages)
+      } catch {
+        // 穿透刷新失败时保持现有结果，不阻塞列表
+      }
+    }
+
     for (const [uid, el] of creditSlots) {
       // ⚠️ 元素可能已被下一次重载移除（`clear(box)`）—— 那就跳过，
       // 对一个已脱离文档的元素写文字是静默无效果的。
       if (!el.isConnected) continue
-      const p = byUid.get(uid)
+      const p = findPackage(uid, byUid)
       const total = p === undefined ? undefined : p.total
       const err = p === undefined ? undefined : p.error
       // ── 额度分级（把「没钱」与「查不到」分开）──
@@ -2483,7 +2545,13 @@ function renderModalAdd() {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload),
     })
     alert(r.ok ? '导入成功' : '导入失败：' + JSON.stringify(r.body))
-    if (r.ok) { ta.value = ''; loadModalAccounts(); loadAccounts(); loadPool() }
+    if (r.ok) {
+      invalidatePackagesCache()
+      ta.value = ''
+      loadModalAccounts()
+      loadAccounts()
+      loadPool()
+    }
   }
   box.appendChild(imp)
 }
