@@ -22,15 +22,54 @@ function apiKey() {
  * 统一的鉴权请求封装。
  * 401 时不抛错，而是返回 `{status:401}` 让调用方决定怎么提示。
  */
+/**
+ * 请求的默认超时（毫秒）。
+ *
+ * ## ⚠️ 为什么必须有（蓝队实测发现）
+ *
+ * 原先 `api()` 用**裸 fetch、无超时**。而 `/admin/packages` 是
+ * **逐账号串行打上游**，实测耗时在 **1.4 ~ 41 秒**之间波动（账号越多越久）。
+ *
+ * 没有超时的后果不是「慢」，而是**永久挂住**：
+ * 浏览器/移动网络半断（TCP 没断但收不到数据）时，fetch 会一直 pending，
+ * 面板就永远停在「查询中…」，用户以为程序死了，只能刷新页面。
+ *
+ * ⚠️ 取 **45 秒**而不是更短：`/admin/packages` 实测最慢 41 秒，
+ * 设 20 秒会把**正常的慢请求**误判成超时 —— 那是假故障，比不设超时更糟
+ *（用户会看到「超时」但他其实只需再等几秒）。
+ */
+const API_TIMEOUT_MS = 45_000
+
 async function api(path, options) {
   const opts = Object.assign({}, options)
   opts.headers = Object.assign({}, opts.headers, { authorization: 'Bearer ' + apiKey() })
+
+  // ⚠️ 用 AbortController 而不是 `Promise.race`：race 只是**不再等**，
+  // 底层请求仍在跑、连接不释放；abort 才是真的取消（还能省上游额度）。
+  // ⚠️ 尊重调用方自带的 signal：已有就叠加，不要覆盖掉。
+  const ctrl = new AbortController()
+  const timer = setTimeout(() => ctrl.abort(), API_TIMEOUT_MS)
+  const outer = opts.signal
+  if (outer !== undefined) {
+    if (outer.aborted) ctrl.abort()
+    else outer.addEventListener('abort', () => ctrl.abort(), { once: true })
+  }
+  opts.signal = ctrl.signal
+
   let res
   try {
     res = await fetch(path, opts)
   } catch (e) {
+    clearTimeout(timer)
+    // ⚠️ **超时与网络错误必须分开报**：处置完全不同 ——
+    // 超时 = 服务端慢（等一下/减少账号数），网络错误 = 连不上（查网络/密钥）。
+    // 混成一句「网络错误」会让用户在错误的方向上排查。
+    if (e && e.name === 'AbortError') {
+      return { status: 0, ok: false, body: '请求超时（超过 ' + (API_TIMEOUT_MS / 1000) + ' 秒未响应）。该接口需逐账号查询上游，账号较多时会较慢。' }
+    }
     return { status: 0, ok: false, body: '网络错误：' + e.message }
   }
+  clearTimeout(timer)
   const text = await res.text()
   let body
   try { body = JSON.parse(text) } catch { body = text }
