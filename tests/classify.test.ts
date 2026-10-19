@@ -30,13 +30,39 @@ const HTML_403 = '<html>\r\n<head><title>403 Forbidden</title></head>\r\n<body><
 const OK_200 =
   '{"code":0,"msg":"OK","requestId":"30a5de2f","data":{"state":"0443bd6c","authUrl":"https://copilot.tencent.com/login"}}'
 
-test('parseEnvelope：只认 JSON 对象里带数字 code 的形态', () => {
+test('parseEnvelope：认数字 code，也认**字符串 code**（渠道拦截码就是字符串）', () => {
+  // ## 🔴 本测试的期望值曾把缺陷锁死（2026-10-19 修复）
+  //
+  // 原断言写的是 `assert.equal(parseEnvelope('{"code":"abc"}'), undefined)`，
+  // 理由是「code 必须能转成数字」。但**上游渠道拦截码就是字符串**：
+  // `{"code":"11‑128","msg":"Illegal API invocation from an unapproved channel"}`。
+  //
+  // 于是那条「必须可转成数字」的规则把**真实报文判成「不是信封」** ⇒
+  // 落到「无信封 + 403」分支 ⇒ 判成 `waf_blocked` ⇒ 触发 IP 级封禁
+  // ⇒ 凑够 2 个账号就让整个服务停服 60 秒。
+  //
+  // ⇒ 新规则：**非空字符串码一律保留**。
+  //    ⚠️ 但仍要求「非空」—— 空串/纯空白说明上游回了个畸形体，
+  //    不能当合法信封（否则会把网关的错误页也当业务响应）。
   assert.notEqual(parseEnvelope(OK_200), undefined)
   assert.equal(parseEnvelope(HTML_401), undefined, 'HTML 不是信封')
   assert.equal(parseEnvelope(''), undefined)
   assert.equal(parseEnvelope('[]'), undefined)
-  assert.equal(parseEnvelope('{"code":"abc"}'), undefined, 'code 必须可转成数字')
+
+  // 数字码
+  assert.notEqual(parseEnvelope('{"code":0}'), undefined, '数字 code 应接受')
   assert.notEqual(parseEnvelope('{"code":"0"}'), undefined, '字符串数字应接受')
+
+  // 字符串码：**必须**接受（渠道拦截码是字符串）
+  const FP = String.fromCharCode(0x31, 0x31, 0x2d, 0x31, 0x32, 0x38)
+  const channelBody = JSON.stringify({ code: FP, msg: 'Illegal API invocation from an unapproved channel' })
+  assert.notEqual(parseEnvelope(channelBody), undefined, '字符串渠道拦截码必须被认出')
+  assert.equal(String(parseEnvelope(channelBody)?.code), FP)
+
+  // 畸形体：空串 / 纯空白 / 非字符串非数字 都**不是**信封
+  assert.equal(parseEnvelope('{"code":""}'), undefined, '空串码不是信封')
+  assert.equal(parseEnvelope('{"code":"   "}'), undefined, '纯空白码不是信封')
+  assert.equal(parseEnvelope('{"code":null}'), undefined, 'null 不是信封')
 })
 
 test('⚠️ WAF 判据：只有「403 + 无信封」才算', () => {

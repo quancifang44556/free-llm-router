@@ -1093,6 +1093,60 @@ test('⚠️ 摊开必须让位于显式会话粘性（有 user 字段时优先 
   assert.ok(prefIdx < spreadIdx, '⚠️ 粘性判断必须在摊开**之前**')
 })
 
+// ───── WorkBuddy 国际版 14003「模型繁忙」被误判为账号级限流 ─────
+
+test('🔴 14003（WorkBuddy 国际版模型繁忙）必须判为**模型级**冷却，不是账号级', () => {
+  // ## 真实报文（2026-10-19，wb 国际版实测）
+  //
+  // `{"code":14003,"msg":"too many requests","displayMsg":{"en":
+  //   "Model busy. Please switch models or retry later"}}`
+  //
+  // 「switch models」明确是**模型级**：换个模型立刻能用。
+  //
+  // ⚠️ 判成账号级的后果比 6004 更严重：**池内所有账号**会被逐个拉黑，
+  // 且连续 3 次失败触发 **30 分钟账号熔断** ⇒ 整个服务突然全挂，
+  // 而真实原因只是「某个模型繁忙」。
+  const body = JSON.stringify({
+    code: 14003,
+    msg: 'too many requests',
+    displayMsg: { en: 'Model busy. Please switch models or retry later' },
+  })
+
+  // ① 业务码必须先被识别成 rate_limited（否则 refine 根本不会被调用）
+  assert.equal(classify(429, body).kind, 'rate_limited', '14003 必须归类为 rate_limited')
+
+  // ② 维度必须是 model（关键）
+  assert.equal(
+    refineModelScoped('rate_limited', body).dimension,
+    'model',
+    '14003 必须是模型级冷却',
+  )
+
+  // ③ 文案兜底：即使上游换了码值，只要文案说「模型繁忙/换模型」也必须模型级
+  //    （这是**第二道腿** —— 只靠数字会再次误判）
+  const noCode = JSON.stringify({ msg: 'Model busy. Please switch models or retry later' })
+  assert.equal(
+    refineModelScoped('rate_limited', noCode).dimension,
+    'model',
+    '文案含 model busy / switch models 时必须模型级（码值兜底）',
+  )
+  assert.equal(
+    refineModelScoped('rate_limited', JSON.stringify({ msg: 'switch to the other model' })).dimension,
+    'model',
+    'switch to the other 也必须模型级',
+  )
+
+  // ④ 回归守卫：6004 仍必须是模型级
+  assert.equal(refineModelScoped('rate_limited', JSON.stringify({ code: 6004 })).dimension, 'model')
+
+  // ⑤ 回归守卫：真正无关的 429 仍是账号级（不能因为加宽判定而把普通限流也放过）
+  assert.equal(
+    refineModelScoped('rate_limited', JSON.stringify({ code: 14017 })).dimension,
+    'soft',
+    '14017 是账号级，不得被误判成模型级',
+  )
+})
+
 // ───── 「账号是好的但就是用不了」：11128 渠道拦截被误判为账号故障 ─────
 
 test('🔴 11128 必须判为渠道拦截（waf_blocked），不是 request_illegal', () => {

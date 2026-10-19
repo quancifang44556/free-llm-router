@@ -120,6 +120,8 @@ function numericCode(code: number | string): number | undefined {
 const CODE_KIND: Record<number, ErrorKind> = {
   6004: 'rate_limited',
   11102: 'model_unavailable',
+  // 14003 = WorkBuddy 国际版「模型繁忙」（实测原文见 server.ts 的 refineModelScoped）
+  14003: 'rate_limited',
   14018: 'credit_exhausted',
   14017: 'rate_limited',
   11140: 'request_illegal',
@@ -189,7 +191,12 @@ export function parseEnvelope(text: string): Envelope | undefined {
     //
     // 故：**保留原始值**（number 或 string 都认），只在需要数字的地方用 numericCode()。
     const code = typeof raw === 'number' || typeof raw === 'string' ? raw : undefined
+    // ⚠️ 非数字/非字符串 ⇒ 不是信封（上游回了个没有业务码的体）。
+    // ⚠️ **空串与纯空白也不算**：那说明上游回了个畸形体（或网关错误页套了 JSON 壳），
+    //    把它当业务信封会让下游用 code='' 去匹配，永远匹配不上且不报错 ——
+    //    正是 §7.2 禁止的「静默失败」形态。
     if (code === undefined) return undefined
+    if (typeof code === 'string' && code.trim() === '') return undefined
     return {
       code,
       msg: typeof obj.msg === 'string' ? obj.msg : '',

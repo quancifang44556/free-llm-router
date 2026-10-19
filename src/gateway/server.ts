@@ -30,6 +30,11 @@ import { deriveDeviceId, referenceChatHeaders } from '../upstream/headers.js'
 import { prepareChatBody, sanitizeChatBody } from './payload.js'
 import { ERROR_CHECK_FRAMES, ERROR_HINT_PATTERN, aggregateSse, createFrameTranslator, detectErrorFrame, doneFrame, errorFrame, mayHaveUsage, parseSseLine, sseHeaders, translateFrame } from './stream.js'
 import { jsonError, parseRetryAfterMs } from './http.js'
+import {
+  ZERO_OUTPUT_COOLDOWN_MS,
+  describeZeroOutputHit,
+  screenZeroOutputStream,
+} from './zero-output.js'
 import { DEFAULT_PROVIDER, findProvider, providerIds } from '../providers/index.js'
 import { bindBuddy } from '../providers/buddy.js'
 import {
@@ -768,8 +773,59 @@ export async function handleChatCompletions(
     }
 
     const startedAt = Date.now()
+
+    // **零输出越墙熔断**（buddy 路径，与 provider 路径同一份判据 ——
+    // 见 `zero-output.ts` 文件头：同一语义不得两套实现）。
+    //
+    // ⚠️ buddy/workbuddy 是**默认供应商**，绝大多数流量走这里；若只在
+    // provider 路径接守卫，越墙熔断对主力渠道等于不存在。
+    const screenedBuddy = await screenZeroOutputStream(peeked.stream, {
+      // 客户端主动取消 ⇒ 一律不改道（本项目的既有纪律）
+      isCancelled: () => request.signal.aborted,
+    })
+    if (screenedBuddy.hit) {
+      // ⚠️ 罚**模型维度**（`kind:'model'`）：越墙是「这个目标此刻的输入被拒」，
+      // 不是账号坏了。绝不能升成 `breaker`（3 次熔断账号 30 分钟，误杀健康号）。
+      await pool
+        .applyFailure({
+          uid: candidate.uid,
+          kind: 'model',
+          now: Date.now(),
+          ...(model !== '' ? { model } : {}),
+          // 显式给 `resetAt`：不走「11102 无此模型」那条 6h 指数退避
+          resetAt: Date.now() + ZERO_OUTPUT_COOLDOWN_MS,
+          reason: `buddy/${model} zero-output (finish_reason=length, ${screenedBuddy.probe.frames}f)`,
+        })
+        .catch(() => {})
+
+      // ⚠️ §7.2「失败必须显式」：改道必须留痕（日志 + 面板日志双写）
+      console.warn(`[zero-output] ${describeZeroOutputHit(DEFAULT_PROVIDER, model, screenedBuddy.probe)} uid=${candidate.uid}`)
+      recordLog(
+        pool,
+        {
+          type: 'error',
+          model: `buddy/${model}`,
+          provider: 'buddy',
+          uid: candidate.uid,
+          status: 502,
+          durationMs: Date.now() - startedAt,
+          error: `零输出越墙，已冷却该目标并改道（finish_reason=length，0 输出，${screenedBuddy.probe.frames} 帧）`,
+          stream: wantsStream,
+        },
+        ctx,
+      )
+
+      clearSessionBinding(pool, sessionKey, ctx)
+      lastError = {
+        status: 502,
+        message: describeZeroOutputHit(DEFAULT_PROVIDER, model, screenedBuddy.probe),
+        kind: 'upstream_error',
+      }
+      continue // 改道下一个候选重发（什么都没产出，没有内容可丢）
+    }
+
     return {
-      response: await streamResponse(peeked.stream, {
+      response: await streamResponse(screenedBuddy.stream, {
         // ⚠️ 诊断 + 记账分界：客户端断开**不得**记成账号失败
         //（否则用户的取消动作会熔断健康账号，见 `nonStreamingResponse` 的说明）。
         clientGone: () => request.signal.aborted,
@@ -1257,7 +1313,7 @@ async function peekStreamForError(body: ReadableStream<Uint8Array>): Promise<{
  * ⇒ 供应商差异**全部**收敛到 `Provider` 接口（见 `src/providers/types.ts`），
  * 这里只做「选号 → 调接口 → 记账 → 换号」这件与供应商无关的事。
  */
-async function handleProviderChat(input: {
+export async function handleProviderChat(input: {
   providerId: string
   model: string
   /** 客户端是否要流式（false ⇒ 聚合成非流式 JSON）。 */
@@ -1276,8 +1332,7 @@ async function handleProviderChat(input: {
    * ⚠️ ≥1 时**不再触发**反向容灾，避免与 buddy 路径形成无限相互递归。
    */
   failoverDepth?: number
-}): Promise<GatewayResult> {
-  const { providerId, model, wantsStream, rawBody, request, env, realm, ctx, sessionKey } = input
+}): Promise<GatewayResult> {  const { providerId, model, wantsStream, rawBody, request, env, realm, ctx, sessionKey } = input
   const failoverDepth = input.failoverDepth ?? 0
 
   const provider = findProvider(providerId)
@@ -1672,8 +1727,63 @@ async function handleProviderChat(input: {
       break
     }
 
+    // ②b **零输出越墙熔断**（见 `zero-output.ts` 文件头）。
+    //
+    // ⚠️ 必须在**把响应交给客户端之前**判定：一旦 `finish_reason=length` 的
+    // 终止帧被转发出去，客户端就把这一轮当结束了，改道也晚了。
+    // 故这里预读「首帧可见内容之前」的字节（正常只有 1~3 帧），判定完再原样放行。
+    const screened = await screenZeroOutputStream(peeked.stream, {
+      // 客户端主动取消 ⇒ 一律不改道（本项目的既有纪律）
+      isCancelled: () => request.signal.aborted,
+    })
+    if (screened.hit) {
+      // ⚠️ 罚**模型维度**（`kind:'model'`），不罚账号：
+      // 越墙是「这个目标（账号+模型）此刻的输入被拒」，与账号好坏无关，
+      // 换账号可能有用（不同号挂不同后端），故仍需改道；但绝不能升成
+      // `breaker`（3 次就熔断账号 30 分钟，会误杀健康账号）。
+      const reason = `${providerId}/${model} zero-output (finish_reason=length, ${screened.probe.frames}f)`
+      await pool
+        .applyFailure({
+          uid: picked.uid,
+          kind: 'model',
+          now: Date.now(),
+          ...(model !== '' ? { model } : {}),
+          // ⚠️ 显式给 `resetAt`：不走「11102 无此模型」那条 6h 指数退避
+          //（越墙不是「上游没有这个模型」，6h 惩罚过重）。
+          resetAt: Date.now() + ZERO_OUTPUT_COOLDOWN_MS,
+          reason,
+        })
+        .catch(() => {})
+
+      // ⚠️ §7.2「失败必须显式」：改道**必须留痕**，不能静默。
+      // 日志 + 面板日志双写，否则用户/排查者无法把这次改道与网络故障区分开
+      //（两者在 chunk 层完全同形，见 `zero-output.ts` 文件头）。
+      console.warn(`[zero-output] ${describeZeroOutputHit(providerId, model, screened.probe)} uid=${picked.uid}`)
+      recordLog(
+        pool,
+        {
+          type: 'error',
+          model: `${providerId}/${model}`,
+          provider: providerId,
+          uid: picked.uid,
+          status: 502,
+          durationMs: Date.now() - startedAt,
+          error: `零输出越墙，已冷却该目标并改道（finish_reason=length，0 输出，${screened.probe.frames} 帧）`,
+          stream: wantsStream,
+        },
+        ctx,
+      )
+
+      clearSessionBinding(pool, sessionKey, ctx)
+      lastError = {
+        status: 502,
+        message: describeZeroOutputHit(providerId, model, screened.probe),
+      }
+      continue // 改道下一个候选重发（什么都没产出，没有内容可丢）
+    }
+
     return {
-      response: await streamResponse(peeked.stream, {
+      response: await streamResponse(screened.stream, {
         // ⚠️ 诊断 + 记账分界：客户端断开**不得**记成账号失败
         //（否则用户的取消动作会熔断健康账号，见 `nonStreamingResponse` 的说明）。
         clientGone: () => request.signal.aborted,
