@@ -30,6 +30,43 @@ const HTML_403 = '<html>\r\n<head><title>403 Forbidden</title></head>\r\n<body><
 const OK_200 =
   '{"code":0,"msg":"OK","requestId":"30a5de2f","data":{"state":"0443bd6c","authUrl":"https://copilot.tencent.com/login"}}'
 
+test('🔴 畸形字符串码**不得**被当成业务信封（否则会把 WAF 误判成 auth_error）', () => {
+  // ## 这条是红队实测发现的真缺陷（2026-10-19）
+  //
+  // 为了让渠道拦截码 "11-128" 被认出，\`parseEnvelope\` 一度放宽成
+  // 「任何字符串都算 code」⇒ 任意畸形体（\`{"code":"abc"}\`）都变成合法信封。
+  //
+  // 后果链（实测）：
+  //   403 + {"code":"abc"}
+  //     改动前：Number("abc")=NaN → 不是信封 → **waf_blocked**（正确）
+  //     放宽后：算信封 → 落进 401/403 分支 → **auth_error**
+  //   而 auth_error 的 shouldRotate = true ⇒ **白换号**，还触发不必要的凭据续期。
+  //
+  // ⇒ 收紧为「数字」或「形如错误码的字符串」（\`11-128\` / \`6004\`），其余一律当没有码。
+  const REAL = String.fromCharCode(0x31, 0x31, 0x2d, 0x31, 0x32, 0x38)
+
+  // ① 真码必须仍被认出（否则修过头，渠道拦截又修不回来了）
+  assert.equal(classify(403, JSON.stringify({ code: REAL, msg: 'x' })).kind, 'channel_blocked')
+  assert.equal(classify(429, JSON.stringify({ code: '6004', msg: 'x' })).kind, 'rate_limited')
+
+  // ② 畸形字符串码一律**不算信封** ⇒ 403 应落回 waf_blocked
+  for (const bad of ['abc', 'xyz-1', '1-2-3', 'code', '{}']) {
+    const body = JSON.stringify({ code: bad, msg: 'x' })
+    assert.equal(
+      classify(403, body).kind,
+      'waf_blocked',
+      `畸形码 "${bad}" 不得被当成信封（403 应落回 WAF，而不是 auth_error）`,
+    )
+    assert.equal(parseEnvelope(body), undefined, `畸形码 "${bad}" 必须返回 undefined`)
+  }
+
+  // ③ 空串 / 纯空白 / null 同样不算
+  for (const empty of ['', '   ']) {
+    assert.equal(parseEnvelope(JSON.stringify({ code: empty })), undefined)
+  }
+  assert.equal(parseEnvelope(JSON.stringify({ code: null })), undefined)
+})
+
 test('parseEnvelope：认数字 code，也认**字符串 code**（渠道拦截码就是字符串）', () => {
   // ## 🔴 本测试的期望值曾把缺陷锁死（2026-10-19 修复）
   //

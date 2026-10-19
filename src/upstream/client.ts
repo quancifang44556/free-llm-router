@@ -190,13 +190,28 @@ export function parseEnvelope(text: string): Envelope | undefined {
     //   停服 60 秒。这正是用户看到的「有的软件能用、有的不能」。
     //
     // 故：**保留原始值**（number 或 string 都认），只在需要数字的地方用 numericCode()。
-    const code = typeof raw === 'number' || typeof raw === 'string' ? raw : undefined
-    // ⚠️ 非数字/非字符串 ⇒ 不是信封（上游回了个没有业务码的体）。
-    // ⚠️ **空串与纯空白也不算**：那说明上游回了个畸形体（或网关错误页套了 JSON 壳），
-    //    把它当业务信封会让下游用 code='' 去匹配，永远匹配不上且不报错 ——
-    //    正是 §7.2 禁止的「静默失败」形态。
+    // ⚠️⚠️ **不能接受任意字符串**（2026-10-19 红队实测发现）。
+    //
+    // 最初为了让渠道拦截码 `"11-128"` 能被认出，这里放宽成了「任何字符串都算」。
+    // 但那会带来一个真实缺陷：**任意畸形字符串**（如 `{"code":"abc"}`）
+    // 都会被当成合法业务信封 ⇒ 落进后面的分类分支。
+    //
+    // 实测后果：`403 + {"code":"abc"}` 原先（Number() 得 NaN）判 `waf_blocked`，
+    // 放宽后变成 `auth_error` —— 而 `auth_error` 的 `shouldRotate = true`，
+    // 会**白换号**，还可能触发不必要的凭据续期。而真实语义是「这不是信封」。
+    //
+    // ⇒ 收紧为：**数字**，或**形如错误码的字符串**（含连字符/为纯数字串）。
+    //   真实存在的字符串码只有 `11-128` 这一类（形如 `NN-NNN`），
+    //   纯数字串（如 `"6004"`）也照旧接受。别的形态一律当「没有业务码」。
+    const code = (() => {
+      if (typeof raw === 'number') return raw
+      if (typeof raw !== 'string') return undefined
+      const t = raw.trim()
+      if (t === '') return undefined
+      // 形如 11-128（错误码）或纯数字串
+      return /^\d+(-\d+)?$/.test(t) ? t : undefined
+    })()
     if (code === undefined) return undefined
-    if (typeof code === 'string' && code.trim() === '') return undefined
     return {
       code,
       msg: typeof obj.msg === 'string' ? obj.msg : '',
