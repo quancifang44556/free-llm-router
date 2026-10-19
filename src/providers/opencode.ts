@@ -292,6 +292,21 @@ async function loadCapabilities(): Promise<readonly OpencodeModelCapability[]> {
       // 缓存读失败不影响功能（会退回兜底表）。
     }
   }
+  // ## 🔴 冷启动必须**主动拉一次**（这是本文件此前的一个真缺陷）
+  //
+  // ⚠️ 实测（2026-10-11）：内存空 + 缓存未命中时，原实现**直接返回空数组**，
+  // 而 `refreshCapabilities()` **只被自己内部的 stale 分支调用** ——
+  // **没有任何外部调用点** ⇒ 能力表**永远不会被拉取**。
+  //
+  // 症状：opencode 的 `contextWindow` 恒为兜底表的 262144（models.dev 里
+  // 明明是 1048576）、`maxOutput` 恒为 0、`capability.isFree` 恒为 false
+  // ⇒ 面板上「免费」标不出来（用户报「OpenCode 有的不显示」）。
+  //
+  // ⚠️ 这里**等它完成**（而不是 `void` 后台跑）：调用方需要能力表才能
+  // 渲染正确的目录，先返回空表会让用户看到**错的**上下文窗口。
+  // ⚠️ 拉取失败**不抛错**：目录不是主流程，退回兜底表即可
+  //（`refreshCapabilities` 自身吞异常，这里只等它）。
+  await refreshCapabilities()
   return capabilityMemory
 }
 
@@ -752,9 +767,23 @@ async function listModels(_credential: ProviderCredential, _signal: AbortSignal)
       // （参考实现 `opencode-adapter.ts` 的 `inputModalitiesOf` 同款约定）。
       // 本轮**不**拉取能力表时也没有本地兜底 —— 故这里如实给 false。
       supportsImage: capability?.supportsImage === true,
-      // ⚠️ 免费判定用**兜底表的实测值**（匿名通道能否使用），
-      // 不是 models.dev 的 cost —— 两者的语义不同（见兜底表注释）。
-      isFree: m.isFree,
+      // ## 🔴 两个「免费」含义不同，这里取**并集**（用户报「OpenCode 有的不显示」）
+      //
+      // | 来源 | 含义 |
+      // |---|---|
+      // | 兜底表 `m.isFree` | **匿名通道**能否使用（实测，非定价） |
+      // | `models.dev` 的 `capability.isFree` | `cost.input===0 && cost.output===0`，**真实定价免费** |
+      //
+      // ⚠️ 实测矛盾：`mimo-v2.6-flash-free` / `big-pickle` 在 models.dev 里
+      // **cost 全 0（真免费）**，但兜底表给 `isFree: false`
+      //（它们不能匿名用，但**定价确实是 0**）⇒ 面板显示空白。
+      //
+      // ⇒ 取并集：**任一来源说是免费，就是免费**。两者都是「对用户有价值的事实」，
+      // 任一为真都意味着「调它不花钱」，而面板那列回答的正是这个问题。
+      //
+      // ⚠️ 不要只取 models.dev：能力表是**异步拉取**的，拿不到时会全 false
+      //（见上方 supportsImage 的保守回退），那时会把真免费的说成计费。
+      isFree: m.isFree || capability?.isFree === true,
     }
   })
 }

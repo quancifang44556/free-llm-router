@@ -407,9 +407,19 @@ test('⚠️ /v1/models 目录里不得出现裸名（一律带 provider/ 前缀
   //（buddy / codearts / trae 都有 `deepseek-v4.1-flash`）——
   // 裸名根本分不清是哪一家。
   const src = readFileSync('src/index.ts', 'utf8')
+  // ⚠️ 断言锁**事实**（id 由 providerId 与 m.id 拼成、且真的进入 data），
+  // 不锁**写法**（是否被 `annotateModelEntry(...)` 包了一层）。
+  //
+  // 原写法要求逐字匹配 `data.push({ ...base, id: ... })`，于是给它加一层
+  // 包装（补渠道前缀与倍率）就会**误报失败**，而实际行为完全没变。
+  // 本项目已多次吃过「源码文本断言锁死写法」的亏。
   assert.ok(
-    /data\.push\(\{ \.\.\.base, id: `\$\{providerId\}\/\$\{m\.id\}` \}\)/.test(src),
-    '目录项必须带 provider/ 前缀',
+    /id: `\$\{providerId\}\/\$\{m\.id\}`/.test(src),
+    '目录项的 id 必须由 providerId/m.id 拼成（带 provider/ 前缀）',
+  )
+  assert.ok(
+    /data\.push\([\s\S]{0,160}id: `\$\{providerId\}\/\$\{m\.id\}`/.test(src),
+    '该拼接必须真的进入 data（不能只定义在别处）',
   )
   // 不能再有针对默认供应商的裸名分支
   assert.ok(
@@ -1932,4 +1942,61 @@ test('🔴 一体化顶栏必须合并且采用 macOS 原生分段控制器结�
   assert.ok(/\.nav-segmented/.test(css), 'CSS 中应有 .nav-segmented 规则')
   // 不得画假的 macOS 红黄绿窗口按钮
   assert.ok(!/traffic-lights|window-controls|macos-dots/.test(html), '严禁在网页内画假的 macOS 窗口圆点')
+})
+
+// ─────────────────── 弹窗收口（真机实测缺陷） ───────────────────
+
+test('🔴 closeModal 必须**真的被定义**并能恢复被藏起来的标签条（真机实测崩溃）', () => {
+  // ## 缺陷现场（2026-10-19，无头浏览器点击取证）
+  //
+  // 「创建 API Key」在服务端**成功**之后，前端抛：
+  //   ReferenceError: closeModal is not defined
+  // ⇒ 明文密钥不显示、弹窗不关、列表不刷新。用户看到的是「点了没反应」。
+  //
+  // 根因：`closeModal()` 被调用 2 次，但**全文没有定义**（移植上游代码时漏了）。
+  //
+  // ⚠️ 这条缺陷**静态渲染测试完全抓不到**：页面能正常画出来，
+  //   初始加载时控制台也没有报错 —— 只有真实点击那条路径才会炸。
+  //   所以这条断言既要有「定义存在」的静态检查，也要有「真能跑」的行为检查。
+  const js = stripJsComments(panelAsset('/panel/app.js')?.body ?? '')
+
+  // ① 静态：调用了就必须有定义（防止「只写调用、忘了实现」重现）
+  const calls = (js.match(/\bcloseModal\s*\(/g) ?? []).length
+  assert.ok(calls > 0, '应至少有一处调用 closeModal')
+  assert.ok(
+    /function\s+closeModal\s*\(/.test(js),
+    `🔴 closeModal 被调用 ${calls} 次却**没有定义** —— 运行时会抛 ReferenceError`,
+  )
+
+  // ② 行为：真跑一次，验证它确实恢复了被 openKeyEditor 藏掉的状态
+  const rt = runPanelJs('closeModal')
+  assert.equal(typeof rt.closeModal, 'function', 'closeModal 应可取出')
+  assert.doesNotThrow(() => rt.closeModal(), 'closeModal 不得抛错')
+
+  // ⚠️ 桩里的 `document.querySelector` 恒返回 null，故 `.modal-tabs`
+  // 那条分支走不到 —— 这里只验证「不抛错」。真正的标签条恢复由
+  // 下面那条「三个面板必须被复位」的断言覆盖。
+})
+
+test('🔴 closeModal 必须复位三个供应商标签页（否则密钥编辑器关掉后弹窗是坏的）', () => {
+  // `openKeyEditor` 会把 modal-accounts/models/add 按密钥编辑的需要设成
+  // hidden=true/true/false。若不复位，下次打开**供应商**弹窗时状态是错的。
+  //
+  // ⚠️ 实测连带后果：供应商弹窗的 `.modal-tabs` 标签条永久消失（直到刷新），
+  //   因为 `#modal-close` 原先只做 `modal.hidden = true`。
+  const js = stripJsComments(panelAsset('/panel/app.js')?.body ?? '')
+  const body = js.slice(js.indexOf('function closeModal('))
+  assert.ok(body.length > 0, 'closeModal 必须存在')
+  const fnBody = body.slice(0, body.indexOf('\n}') + 2)
+
+  for (const id of ['modal-accounts', 'modal-models', 'modal-add']) {
+    assert.ok(
+      fnBody.includes(id),
+      `closeModal 必须复位 ${id}（否则复用弹窗后状态错乱）`,
+    )
+  }
+  assert.ok(
+    /modal-tabs/.test(fnBody),
+    'closeModal 必须恢复 .modal-tabs 的 display（否则标签条永久消失）',
+  )
 })

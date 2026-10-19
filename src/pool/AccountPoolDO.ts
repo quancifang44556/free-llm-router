@@ -67,6 +67,18 @@ import {
   type UsageState,
   type UsageSummary,
 } from '../store/usage.js'
+import {
+  type ApiKeyLimits,
+  type ApiKeyRecord,
+  type ApiKeyUsage,
+  defaultApiKeyLimits,
+  emptyApiKeyUsage,
+  isWindowExpired,
+  newApiKeyId,
+  normalizeApiKeyLimits,
+  normalizeApiKeyRecord,
+  resetUsageWindow,
+} from '../store/apikeys.js'
 
 /**
  * 用量状态的存储键（**一个 key 装明细环 + 按天聚合**）。
@@ -74,6 +86,47 @@ import {
  * ⚠️ 为什么合并成一个 key：`recordUsage` 在推理的关键路径上，每次都是一次
  * 读 + 一次写。拆成两个 key 会让每笔请求写两次 —— 在 Free 计划下白白
  * 翻倍 DO 行写入配额消耗，换不到任何好处。
+ */
+/**
+ * 子密钥记录的存储键。
+ *
+ * ⚠️ 与用量计数**分开两个 key**：记录只在增删改时写（低频），
+ * 而用量计数在**每个** `/v1/*` 请求后都要写（高频）。合并成一个 key 会让
+ * 每次请求都重写整个记录数组 —— 白白放大 DO 写入量与冲突面。
+ */
+const API_KEYS_KEY = 'apiKeys'
+
+/** 子密钥用量计数的存储键（按 id 索引）。 */
+const API_KEY_USAGE_KEY = 'apiKeyUsage'
+
+/**
+ * 规范化一条用量记录（读库时用）。
+ *
+ * ⚠️ 字段缺失不能抛错、也不能算出 `NaN`：`NaN` 会让面板显示 `NaN`
+ * 且**所有配额比较都为 false**（于是「超限」永远判不出来）。
+ */
+function normalizeApiKeyUsage(raw: unknown): ApiKeyUsage | undefined {
+  if (raw === null || typeof raw !== 'object') return undefined
+  const o = raw as Record<string, unknown>
+  const num = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : 0)
+  return {
+    windowStart: num(o.windowStart),
+    requests: num(o.requests),
+    inputTokens: num(o.inputTokens),
+    outputTokens: num(o.outputTokens),
+    rejected: num(o.rejected),
+    lastAt: num(o.lastAt),
+    lastIp: typeof o.lastIp === 'string' ? o.lastIp : '',
+    lastModel: typeof o.lastModel === 'string' ? o.lastModel : '',
+  }
+}
+
+/**
+ * 用量状态的存储键（**一个 key 装明细环 + 按天聚合**）。
+ *
+ * ⚠️ 两份数据放同一个 key 是**刻意的**：`recordUsage` 在推理关键路径上
+ *（`ctx.waitUntil`），必须保持「一次读 + 一次写」。拆成两个 key 会让每笔请求
+ * 写两次 —— 在 Free 计划下白白翻倍 DO 行写入配额消耗，换不到任何好处。
  */
 const USAGE_STATE_KEY = 'usage:state'
 
@@ -1218,6 +1271,238 @@ export class AccountPoolDO extends DurableObject<Env> {
   /** 写 gate 状态（**必须持久化**：DO 随时可能被回收）。 */
   private async saveWafGate(gate: { until: number; hits: Record<string, number> }): Promise<void> {
     await this.ctx.storage.put('wafGate', gate)
+  }
+
+  // ─────────────────────── 自定义 API Key ───────────────────────
+
+  /**
+   * 列出全部子密钥记录（**不含明文**，只有哈希）。
+   *
+   * ⚠️ 与「供应商设置」一样存在 `cn` 分片的 DO 里当**全局**设置用 ——
+   * 子密钥描述的是「谁能调 `/v1/*`」，与 realm 无关；按 realm 各存一份
+   * 会让同一个 Key 在不同分片下鉴权结果不一致。
+   */
+  async listApiKeys(): Promise<ApiKeyRecord[]> {
+    const raw = await this.ctx.storage.get<unknown>(API_KEYS_KEY)
+    if (!Array.isArray(raw)) return []
+    const out: ApiKeyRecord[] = []
+    for (const item of raw) {
+      const rec = normalizeApiKeyRecord(item)
+      // 跳过损坏条目，而不是让整个列表 500
+      if (rec !== undefined) out.push(rec)
+    }
+    return out
+  }
+
+  /** 整体覆盖子密钥列表（调用方负责传完整值）。 */
+  private async saveApiKeys(records: ApiKeyRecord[]): Promise<void> {
+    await this.ctx.storage.put(API_KEYS_KEY, records)
+  }
+
+  /**
+   * 新增一把子密钥。
+   *
+   * ⚠️ **必须做哈希唯一性检查**：哈希碰撞意味着两把不同的 Key 会互相鉴权通过。
+   * 概率极低，但一旦发生就是「钥能当另钥用」—— 而这里的代价只是多查一次。
+   */
+  async addApiKey(input: { name: string; hash: string; prefix: string }): Promise<ApiKeyRecord> {
+    const records = await this.listApiKeys()
+    if (records.some((r) => r.hash === input.hash)) {
+      throw new Error('哈希冲突：请重试（极小概率事件）')
+    }
+    const record: ApiKeyRecord = {
+      id: newApiKeyId(),
+      name: input.name,
+      hash: input.hash,
+      prefix: input.prefix,
+      createdAt: Date.now(),
+      lastUsedAt: 0,
+      enabled: true,
+      limits: defaultApiKeyLimits(),
+    }
+    records.push(record)
+    await this.saveApiKeys(records)
+    return record
+  }
+
+  /**
+   * 改一把子密钥（名称 / 启用 / 限制）。
+   *
+   * @returns 改后的记录；找不到时 `undefined`。
+   */
+  async updateApiKey(id: string, patch: {
+    name?: string
+    enabled?: boolean
+    limits?: ApiKeyLimits
+    hash?: string
+    prefix?: string
+  }): Promise<ApiKeyRecord | undefined> {
+    const records = await this.listApiKeys()
+    const idx = records.findIndex((r) => r.id === id)
+    if (idx < 0) return undefined
+    const cur = records[idx]!
+    const next: ApiKeyRecord = {
+      ...cur,
+      ...(patch.name === undefined ? {} : { name: patch.name }),
+      ...(patch.enabled === undefined ? {} : { enabled: patch.enabled }),
+      ...(patch.limits === undefined ? {} : { limits: normalizeApiKeyLimits(patch.limits) }),
+      ...(patch.hash === undefined ? {} : { hash: patch.hash }),
+      ...(patch.prefix === undefined ? {} : { prefix: patch.prefix }),
+    }
+    records[idx] = next
+    await this.saveApiKeys(records)
+    return next
+  }
+
+  /** 删除一把子密钥（连带清掉它的用量计数）。 */
+  async removeApiKey(id: string): Promise<boolean> {
+    const records = await this.listApiKeys()
+    const next = records.filter((r) => r.id !== id)
+    if (next.length === records.length) return false
+    await this.saveApiKeys(next)
+    const usages = await this.loadApiKeyUsages()
+    if (usages[id] !== undefined) { delete usages[id]; await this.ctx.storage.put(API_KEY_USAGE_KEY, usages) }
+    return true
+  }
+
+  /** 读全部用量计数（按 id 索引）。 */
+  private async loadApiKeyUsages(): Promise<Record<string, ApiKeyUsage>> {
+    const raw = await this.ctx.storage.get<Record<string, unknown>>(API_KEY_USAGE_KEY)
+    const out: Record<string, ApiKeyUsage> = {}
+    if (raw === null || typeof raw !== 'object') return out
+    for (const [k, v] of Object.entries(raw)) {
+      const u = normalizeApiKeyUsage(v)
+      if (u !== undefined) out[k] = u
+    }
+    return out
+  }
+
+  /** 读一把子密钥的用量计数（不存在时返回空）。 */
+  async getApiKeyUsage(id: string): Promise<ApiKeyUsage> {
+    const usages = await this.loadApiKeyUsages()
+    return usages[id] ?? emptyApiKeyUsage()
+  }
+
+  /** 读全部用量（面板一次拉完，避免 N 次往返）。 */
+  async listApiKeyUsages(): Promise<Record<string, ApiKeyUsage>> {
+    return await this.loadApiKeyUsages()
+  }
+
+  /**
+   * 记一次子密钥用量（**在 `/v1/*` 的关键路径上**）。
+   *
+   * ## ⚠️ 为什么把「重置窗口 + 计数」放在**同一个方法**里
+   *
+   * 分成「先读、判断、再写」三步会有一个真实的竞态：同一把 Key 的两个
+   * 并发请求都读到旧计数、都判定「没超」，然后都放行 —— 配额被突破。
+   * DO 的串行保证让这个方法内部成为原子操作，把窗口重置与累加收口在一处，
+   * 就只剩「鉴权时的读」与「记账时的写」之间那一小段
+   *（那一段的偏差最多多放行并发中的几个请求，可接受且无法完全避免）。
+   */
+  async recordApiKeyUse(input: {
+    id: string
+    ip: string
+    model: string
+    input: number
+    output: number
+    rejected?: boolean
+  }): Promise<void> {
+    const records = await this.listApiKeys()
+    const rec = records.find((r) => r.id === input.id)
+    if (rec === undefined) return
+
+    const usages = await this.loadApiKeyUsages()
+    const now = Date.now()
+    let usage = usages[input.id] ?? emptyApiKeyUsage()
+    // ⚠️ 窗口过期时**先在本地重置再累加**，且必须把新起点写回去 ——
+    // 只清零不写起点会让下一次判定又认为「窗口没过期」而永久失效。
+    if (isWindowExpired(usage, rec.limits, now)) usage = resetUsageWindow(usage, now)
+    if (usage.windowStart === 0) usage = { ...usage, windowStart: now }
+
+    if (input.rejected === true) {
+      usage.rejected += 1
+    } else {
+      usage.requests += 1
+      usage.inputTokens += input.input
+      usage.outputTokens += input.output
+    }
+    usage.lastAt = now
+    usage.lastIp = input.ip
+    usage.lastModel = input.model
+    usages[input.id] = usage
+
+    await this.ctx.storage.put(API_KEY_USAGE_KEY, usages)
+    // 记录上的 `lastUsedAt` 也要更新（面板列表直接展示它，不必再读用量表）
+    const idx = records.findIndex((r) => r.id === input.id)
+    if (idx >= 0) {
+      records[idx] = { ...records[idx]!, lastUsedAt: now }
+      await this.saveApiKeys(records)
+    }
+  }
+
+  /**
+   * 只补录 token（**不动请求数**）。
+   *
+   * ⚠️ 与 `recordApiKeyUse` 分开是必要的：请求结束补 token 时若复用
+   * `recordApiKeyUse`，`requests` 会被**再加一次**（放行时已加过），
+   * 于是「请求数」直接翻倍 —— 面板上会看到「用了 100 次」而实际只有 50 次。
+   * 配额判定也会因此提前触发。
+   */
+  async adjustApiKeyTokens(input: {
+    id: string
+    ip: string
+    model: string
+    input: number
+    output: number
+  }): Promise<void> {
+    const records = await this.listApiKeys()
+    const rec = records.find((r) => r.id === input.id)
+    if (rec === undefined) return
+    const usages = await this.loadApiKeyUsages()
+    let usage = usages[input.id] ?? emptyApiKeyUsage()
+    const now = Date.now()
+    if (isWindowExpired(usage, rec.limits, now)) usage = resetUsageWindow(usage, now)
+    if (usage.windowStart === 0) usage = { ...usage, windowStart: now }
+    usage.inputTokens += input.input
+    usage.outputTokens += input.output
+    usage.lastAt = now
+    if (input.ip !== '') usage.lastIp = input.ip
+    if (input.model !== '') usage.lastModel = input.model
+    usages[input.id] = usage
+    await this.ctx.storage.put(API_KEY_USAGE_KEY, usages)
+  }
+
+  /**
+   * 按哈希查找一把子密钥。
+   *
+   * ## ⚠️ 为什么用哈希而不是明文比较
+   *
+   * 库里根本没有明文（只存哈希），所以「比较」天然就是查表。
+   * 这样**不需要**再写恒定时间比较 —— 哈希是单向的，攻击者从哈希反推
+   * 不出明文；而查表的命中/不命中耗时差异不构成时序侧信道
+   *（它不能揭示**明文**，只能揭示「这个哈希在不在表里」，而哈希由攻击者自己提供）。
+   */
+  async findApiKeyByHash(hash: string): Promise<ApiKeyRecord | undefined> {
+    const records = await this.listApiKeys()
+    return records.find((r) => r.hash === hash)
+  }
+
+  /**
+   * 清空一把 Key 的用量计数（面板「重置用量」用）。
+   *
+   * @returns 该 Key **是否存在**。
+   *
+   * ⚠️ 返回值语义是「密钥存在与否」，**不是**「用量条目存在与否」：
+   * 一把从未用过的密钥没有用量条目，但重置它**完全合理**（用户就想把它
+   * 归零），返回 404 会让面板报「找不到 API Key」—— 而它明明就在列表里。
+   */
+  async resetApiKeyUsage(id: string): Promise<boolean> {
+    const records = await this.listApiKeys()
+    if (!records.some((r) => r.id === id)) return false
+    const usages = await this.loadApiKeyUsages()
+    usages[id] = emptyApiKeyUsage()
+    await this.ctx.storage.put(API_KEY_USAGE_KEY, usages)
+    return true
   }
 }
 

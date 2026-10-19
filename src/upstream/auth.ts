@@ -301,7 +301,7 @@ export async function refreshCredential(input: {
     throw new UpstreamError({
       kind: 'auth_error',
       httpStatus: res.httpStatus,
-      code,
+      code: typeof code === 'number' ? code : undefined,
       message: `refreshToken 已失效，需要重新登录：${msg || res.raw.slice(0, 120)}`,
       detail: res.raw.slice(0, 400),
     })

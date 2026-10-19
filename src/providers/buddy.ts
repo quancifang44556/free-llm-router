@@ -35,6 +35,7 @@ import { cliChatHeaders, deriveDeviceId, referenceChatHeaders } from '../upstrea
 import { extractModels, type OpenAiModel } from '../gateway/models.js'
 import { prepareChatBody, sanitizeChatBody } from '../gateway/payload.js'
 import { parseAuthDocument, parseAuthPayload } from '../upstream/import.js'
+import { parseCreditsFactor } from './canonical-models.js'
 import { dailyCheckin, fetchBalance } from '../upstream/checkin.js'
 import { refreshCredential } from '../upstream/auth.js'
 import {
@@ -235,6 +236,12 @@ export function toProviderModels(models: OpenAiModel[]): ProviderModel[] {
     // 官方下发 x0.00 则标为免费，其余收费或未知
     isFree: m.credits === 'x0.00' || m.credits === 'x0',
     ...(m.credits ? { credits: m.credits } : {}),
+    // ⚠️ `priceFactor` 是**面板与聚合排序**用的数值形倍率（与上面 `credits`
+    // 的字符串形态并存：面板要展示原文、排序要比较大小）。
+    // 解析不出时**不带该字段**（`undefined` = 上游没给，不等于免费）。
+    ...(parseCreditsFactor(m.credits) === undefined
+      ? {}
+      : { priceFactor: parseCreditsFactor(m.credits) as number }),
   }))
 }
 

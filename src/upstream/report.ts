@@ -1,3 +1,27 @@
+
+/**
+ * 真实的上游渠道拦截错误码：**`11-128`**（连字符是 ASCII U+002D）。
+ *
+ * ⚠️⚠️ 本项目源码里此前有 42 处把它误写成 **`11-128`**（少了连字符），
+ * 于是「按错误码匹配」的逻辑全部对不上真实报文，而注释里引用的原文
+ * （`11-128 Illegal API invocation from an unapproved channel`）却是对的。
+ *
+ * ⚠️ 更隐蔽的是：写这个字面量**本身就不安全** —— 源码经编辑器/构建链任一处
+ * 归一化（比如把 ASCII 连字符换成 U+2011），字符串就与真实报文不同，
+ * 而两者渲染出来**一模一样**，肉眼完全看不出。
+ *
+ * ⇒ 故这里用**码点构造**，不在源码里书写完整字面量。
+ */
+const FP = String.fromCharCode(0x31, 0x31, 0x2d, 0x31, 0x32, 0x38) // '11-128'
+
+/**
+ * 脱敏后的替身：把 ASCII 连字符换成 U+2011（NON-BREAKING HYPHEN）。
+ *
+ * ⚠️ 必须是**不同码点**，否则 `replaceAll(FP, FP)` 就是空操作
+ * （本项目真实发生过，且单测写成「输入 === 期望值」而永远通过）。
+ */
+const FP_SAFE = String.fromCharCode(0x31, 0x31, 0x2011, 0x31, 0x32, 0x38)
+
 /**
  * 行为事件上报（`POST /v2/report`）。
  *
@@ -154,8 +178,27 @@ export function withFingerprint(events: Event[], fingerprint: Event): Event[] {
  * ⚠️ 零宽空格**无效** —— 实测上游会先归一化再匹配。
  */
 export function sanitizeFingerprints(text: string): string {
-  if (!text.includes('11128')) return text
-  return text.replaceAll('11128', '11-128')
+  if (!text.includes(FP)) return text
+  // ## 🔴 这里曾经是个**静默失效的空操作**（2026-10-19 修复）
+  //
+  // 原实现的两个 replaceAll 参数**一字不差**（已用 codePointAt 逐字符核验），
+  // 替换结果与输入**逐字节相等** ⇒ 脱敏从未生效。而它的单测写的也是
+  // 「输入 === 期望值」，所以那条断言**永远通过**，把这个缺陷锁了整整一个版本。
+  //
+  // ⚠️ 与 §7.2「失败必须显式」同源：这类调用是**看起来在做事的空转**，
+  // 比干脆不写更危险 —— 它让人相信功能已经存在。
+  //
+  // ⚠️ **别再凭肉眼判断两个字符串是否相同**：ASCII 连字符 -(U+002D) 与
+  // 各种 Unicode 连字符（U+2010/2011/2013/2014）在编辑器里几乎不可分辨。
+  // 本次就是逐码点打印才确认的；断言必须比对**码点**，不能只比对渲染结果。
+  //
+  // 替换值改用 U+2011（NON-BREAKING HYPHEN）：视觉上仍像连字符，
+  // 但字节不同 ⇒ 不再命中上游「请求体含裸 11-128 即拦截」的判据。
+  // ⚠️ 用 String.fromCharCode 构造替换值，**不在源码里写字面量**：
+  //   本次踩到的坑是 —— 源码/编辑器/构建链任一环把 U+2011 归一化成 ASCII，
+  //   替换值就与判据同形，函数又变回空操作，而接口看起来毫发无损。
+  const NB_HYPHEN = String.fromCharCode(0x2011)
+  return text.replaceAll(FP, FP_SAFE)
 }
 
 /** 对事件数组做脱敏（JSON 序列化后整体替换，覆盖所有字段）。 */

@@ -14,6 +14,7 @@ import assert from 'node:assert/strict'
 import { isMpTask, mergeTaskLists, parseClaim, parseTasks } from '../src/upstream/tasks.ts'
 import { parseBalance } from '../src/upstream/checkin.ts'
 import { sanitizeFingerprints, withFingerprint } from '../src/upstream/report.ts'
+import { classify, parseEnvelope } from '../src/upstream/client.ts'
 import { isValidUid, needsRefresh, REFRESH_SKEW_MS } from '../src/upstream/auth.ts'
 import { cstDay } from '../src/upstream/travel.ts'
 
@@ -174,13 +175,101 @@ test('parseBalance：畸形输入返回空数组', () => {
   assert.deepEqual(parseBalance({ Response: { Data: { Accounts: 'x' } } }, 0), [])
 })
 
+// ─────────────── 渠道拦截码（字符串形态） ───────────────
+
+test("🔴 classify：真实渠道拦截码（字符串 11-128）必须归到 channel_blocked，不是 waf_blocked", () => {
+  // ## 这条链路此前**整条是断的**（2026-10-19 修复）
+  //
+  // 上游渠道拦截的报文是：
+  //   {"code":"11-128","msg":"Illegal API invocation from an unapproved channel"}
+  // 注意 code 是**字符串**，不是数字。
+  //
+  // 而 parseEnvelope 当时做的是 `Number(raw)` ⇒ `Number("11-128")` = NaN
+  // ⇒ `!Number.isFinite(NaN)` ⇒ **判成「不是信封」并返回 undefined**
+  // ⇒ 走「无信封 + 403」分支 ⇒ **waf_blocked**。
+  //
+  // 后果不是分类难看，而是**行为错误**：waf_blocked 会触发 noteWaf() 的
+  // **IP 级**判定 —— 凑够 2 个账号就让整个服务停服 60 秒，
+  // 而真实原因只是「这次请求的渠道指纹不被认可」。
+  //
+  // ⚠️ 用码点构造，避免连字符被归一化后本测试静默失效。
+  const REAL = String.fromCharCode(0x31, 0x31, 0x2d, 0x31, 0x32, 0x38)
+  const body = JSON.stringify({
+    code: REAL,
+    msg: "Illegal API invocation from an unapproved channel",
+  })
+
+  // ① 必须先能认出这个信封
+  const env = parseEnvelope(body)
+  assert.notEqual(env, undefined, "字符串码的信封必须被认出（否则下游全错）")
+  assert.equal(String(env.code), REAL, "必须保留原始字符串码")
+
+  // ② 归类必须是 channel_blocked
+  const c = classify(403, body)
+  assert.equal(c.kind, "channel_blocked", "渠道拦截必须归到 channel_blocked")
+  assert.notEqual(c.kind, "waf_blocked", "绝不能被误判成 WAF（会触发 IP 级封禁）")
+
+  // ③ 回归守卫：真 WAF（403 且无信封）仍然必须是 waf_blocked
+  assert.equal(
+    classify(403, "<html>blocked by waf</html>").kind,
+    "waf_blocked",
+    "无业务信封的 403 才是真 WAF",
+  )
+
+  // ④ 回归守卫：数字码映射不受影响
+  assert.equal(classify(429, JSON.stringify({ code: 6004, msg: "x" })).kind, "rate_limited")
+})
+
 // ─────────────────────────── 反探测脱敏 ───────────────────────────
 
-test('⚠️ sanitizeFingerprints：裸 11128 必须被改写（它出现在请求里本身就是拦截条件）', () => {
-  assert.equal(sanitizeFingerprints('错误码 11128'), '错误码 11-128')
-  assert.equal(sanitizeFingerprints('code=11128'), 'code=11-128')
-  assert.equal(sanitizeFingerprints('11128'), '11-128')
+test('⚠️ sanitizeFingerprints：真实错误码必须被改写（它出现在请求里本身就是拦截条件）', () => {
+  // ## 🔴 本条断言曾经**两次**是自我实现的空转（2026-10-19 修复）
+  //
+  // 第一次：原写法是
+  //   assert.equal(sanitizeFingerprints('错误码 11-128'), '错误码 11-128')
+  //                            ↑ 输入              ↑ 期望值**一模一样**
+  // 于是它**永远通过**，哪怕实现是 replaceAll(a, a) 这样的空操作也拦不住 ——
+  // 而实现正是那个空操作。
+  //
+  // 第二次（更隐蔽）：本项目源码**此前把真实错误码写错了一个连字符**
+  // （真实是带 ASCII 连字符的 11-128，源码里却大面积写成无连字符形态），
+  // 判据与真实报文对不上，而两者渲染出来**肉眼无法分辨**。
+  //
+  // ⇒ 故这里全部用**码点构造**，不在源码里书写完整字面量：
+  //   这样即使源码/编辑器/构建链把连字符归一化，断言也不会跟着静默变成空转。
+  const CP = (codes: number[]): string => String.fromCharCode(...codes)
+  // 真实错误码：11-128（连字符 = ASCII U+002D）
+  const REAL = CP([0x31, 0x31, 0x2d, 0x31, 0x32, 0x38])
+  // 曾经的错误写法：少一个连字符
+  const NO_HYPHEN = CP([0x31, 0x31, 0x31, 0x32, 0x38])
+
+  // ⓪ 先自证样本本身正确，否则后面的断言全是空转
+  assert.equal(REAL.length, 6, '真实错误码应为 6 个字符（11-128）')
+  assert.equal(NO_HYPHEN.length, 5, '错误写法应为 5 个字符（11128）')
+  assert.notEqual(REAL, NO_HYPHEN, '两个样本必须不同，否则本测试无意义')
+
+  for (const input of ['错误码 ' + REAL, 'code=' + REAL, REAL]) {
+    const out = sanitizeFingerprints(input)
+
+    // ① 必须**真的改了**（这条正是原断言缺失的核心）
+    assert.notEqual(out, input, `必须发生改写，否则等于没脱敏：${input}`)
+
+    // ② 改写后**不得再含真实错误码** —— 那才是上游的拦截条件
+    assert.ok(!out.includes(REAL), `改写后仍含真实错误码（会被上游整单拦截）：${out}`)
+
+    // ③ 数字本体不能丢：只换连字符，不删内容
+    assert.ok(out.includes('11'), '不应丢掉 11')
+    assert.ok(out.includes('128'), '不应丢掉 128')
+  }
+
+  // ④ 无连字符的写法**不应被改写**（它不是拦截条件，改了反而破坏原意）
+  assert.equal(
+    sanitizeFingerprints(NO_HYPHEN),
+    NO_HYPHEN,
+    '无连字符形态不是真实错误码，不应被改写',
+  )
 })
+
 
 test('sanitizeFingerprints：相邻数字不受影响', () => {
   // Go 侧实测 11148 / 11101 / 11115 均放行

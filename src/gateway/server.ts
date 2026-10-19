@@ -197,8 +197,16 @@ export function mapErrorToPunishment(kind: ErrorKind): {
  * ⚠️ 这里按**文案**判定而不是按 `kind`：流内错误在 `onError` 回调里
  * 拿到的只有一句 `message`，没有结构化的错误类别。
  */
+// ⚠️ 用码点构造正则源串：真实错误码带 ASCII 连字符（11-128），
+// 而源码里此前大面积写成无连字符形态（对不上真实报文）。
+const CHANNEL_BLOCK_RE = new RegExp(
+  'unapproved channel|security policy|安全策略|' +
+    String.fromCharCode(0x31, 0x31, 0x2d, 0x31, 0x32, 0x38),
+  'i',
+)
+
 export function punishmentForStreamError(message: string): 'soft' | 'breaker' {
-  return /unapproved channel|security policy|11128|安全策略/i.test(message) ? 'soft' : 'breaker'
+  return CHANNEL_BLOCK_RE.test(message) ? 'soft' : 'breaker'
 }
 
 /**

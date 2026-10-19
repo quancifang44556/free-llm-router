@@ -533,11 +533,33 @@ function unwrapCredentialRoot(input: unknown): Record<string, unknown> {
   return merged
 }
 
-/** 按候选键名顺序取第一个非空字符串。 */
+/**
+ * 按候选键名顺序取第一个非空值，**数字也接受**（统一转成字符串）。
+ *
+ * ## 🔴 为什么必须接受数字（实测缺陷，2026-10-18）
+ *
+ * 原实现只认 `typeof value === 'string'`。而桌面端导出的 TRAE 凭据里
+ * `expires_at` 通常是**数字**（Unix 秒，如 `1792300000`），不是字符串 ——
+ * 于是被这一层静默丢弃 ⇒ `pickExpiresAt` 拿到 `''` ⇒ 返回 `0`（= 未知）。
+ *
+ * ⚠️ 后果是**静默**的：凭据能导入、也能用，但 `expiresAt` 永远是 0，
+ * 主动续期那条逻辑会把它当「未知」而跳过（`AccountPoolDO` 的续期判据里
+ * `expiresAt === 0` 明确不续期）⇒ 用户只能等令牌真的过期、请求 401 之后
+ * 才被动续期。这与「提前 1 小时续期」的设计目标完全相反，且没有任何报错。
+ *
+ * ⚠️ 这也是**同型缺陷**：`codearts.ts:343`、`lobsterai.ts:197`、`cline.ts:244`
+ * 都显式处理了数字，只有 TRAE 漏了。
+ *
+ * ⚠️ 只接受**有限数字**：`typeof NaN === 'number'`，而 `String(NaN)` 得到
+ * `'NaN'`，会被 `pickExpiresAt` 当成日期字符串去 `Date.parse` ⇒ 得到 NaN
+ * 后再被 `Number.isNaN` 兜成 0。虽然最终结果也是 0，但多绕一圈且丢掉可读性，
+ * 故这里直接排除非有限值。
+ */
 function pickString(source: Record<string, unknown>, keys: readonly string[]): string {
   for (const key of keys) {
     const value = source[key]
     if (typeof value === 'string' && value.length > 0) return value
+    if (typeof value === 'number' && Number.isFinite(value)) return String(value)
   }
   return ''
 }
@@ -1158,6 +1180,10 @@ async function listModels(credential: ProviderCredential, signal: AbortSignal): 
     // （`trae.ts` 的 `TraeRemoteModel.multimodal` 注释记录了实测：
     // `multimodal: false` 的模型收到图后的回答与不带图完全一致）。
     supportsImage: model.multimodal === true,
+    // ⚠️ 倍率来自 `display_contact_config`（**字符串化 JSON**）里的
+    // `consumption_rate.data.rate` —— 实测 `0.06` / `0.39`。
+    // 解析不出时**不带上该字段**（`undefined` = 上游没给，不等于免费）。
+    ...(model.priceFactor === undefined ? {} : { priceFactor: model.priceFactor }),
     // TRAE 没有「免费额度模型」标记字段，如实为 false。
     isFree: false,
   }))
@@ -1191,6 +1217,13 @@ interface TraeRemoteModel {
   isEnabled?: boolean
   isHidden?: boolean
   usage?: string
+  /**
+   * **计费倍率**（上游 `display_contact_config.consumption_rate.data.rate`，实测 `0.06`）。
+   *
+   * ⚠️ 上游把这块信息塞在**一个 JSON 字符串**里（`display_contact_config`），
+   * 不是对象 —— 必须 `JSON.parse` 才拿得到（实测见诊断 dump）。
+   */
+  priceFactor?: number
   hasReasoningOptions: boolean
 }
 
@@ -1290,6 +1323,7 @@ function parseConfigEntry(
 
   const contextWindow = readContextWindow(entry)
   const maxOutputTokens = readDetailMaxTokens(entry)
+  const priceFactor = readConsumptionRate(entry)
 
   return {
     id,
@@ -1308,8 +1342,51 @@ function parseConfigEntry(
       ? {}
       : { isHidden: readBoolean(entry, 'is_invisible_to_user') }),
     ...(readString(entry, 'usage').length > 0 ? { usage: readString(entry, 'usage') } : {}),
+    // ⚠️ 只在**真的解析出正数**时才带上（0/缺失 = 上游没提供，
+    // 不是「免费」）——`undefined` 与 `0` 在面板上是两种完全不同的展示。
+    ...(priceFactor === undefined ? {} : { priceFactor }),
     hasReasoningOptions,
   }
+}
+
+/**
+ * 读上游的**计费倍率**。
+ *
+ * ## ⚠️ 它藏在一个 JSON **字符串**里
+ *
+ * 实测（只读诊断 dump，2026-10-11）：上游条目有个
+ * `display_contact_config`，值是**字符串化的 JSON**：
+ *
+ * ```json
+ * {"access":{"data":{...}},"consumption_rate":{"enable":true,"data":{"rate":0.06}}}
+ * ```
+ *
+ * ⚠️ 必须 `JSON.parse` 才能读到 `rate` —— 直接当对象取会得到 `undefined`，
+ * 表现就是「倍率列一直空着」。
+ *
+ * ⚠️ `enable !== true` 时**不采信** `rate`：那是「这条计费规则未启用」，
+ * 用它的数值会凭空造出一个不该存在的倍率。
+ */
+function readConsumptionRate(entry: Record<string, unknown>): number | undefined {
+  const raw = entry['display_contact_config']
+  if (typeof raw !== 'string' || raw.trim() === '') return undefined
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    // ⚠️ 解析失败**不抛错**：目录不是主流程，一条脏数据不该让整家目录失败。
+    return undefined
+  }
+  if (parsed === null || typeof parsed !== 'object') return undefined
+  const cr = (parsed as Record<string, unknown>)['consumption_rate']
+  if (cr === null || typeof cr !== 'object') return undefined
+  const rec = cr as Record<string, unknown>
+  if (rec['enable'] !== true) return undefined
+  const data = rec['data']
+  if (data === null || typeof data !== 'object') return undefined
+  const rate = (data as Record<string, unknown>)['rate']
+  if (typeof rate !== 'number' || !Number.isFinite(rate) || rate <= 0) return undefined
+  return rate
 }
 
 /**
@@ -2347,32 +2424,69 @@ export const traeProvider: Provider = {
   name: 'TRAE（字节跳动）',
   capabilities: {
     /**
-     * ❌ **不可用**：TRAE **强制回调 `127.0.0.1`**，Worker 接不住。
+     * ❌ **当前不可用**：授权页对回调地址有**硬编码正则校验**（2026-10-19 定位）
      *
-     * ## 实测结论（用户报障「TRAE 登录显示网络错误，请刷新页面重试」）
+     * ## 真凶：不是「网络错误」，是参数没通过页面内的一条正则
      *
-     * 我一度以为 `auth_callback_url` 是通用参数、可以指向本服务的 URL
-     *（codearts 就是这么做的，且能通）。**对 TRAE 不成立**：
+     * 页面 chunk（`page.*.js`，已逐字节核对）里有：
      *
-     * 1. 参考实现的文件头明写 **「TRAE 强制回调 `127.0.0.1`」**
-     *    （`trae-oauth.ts:4-11`），端口固定 18080；
-     * 2. 它的登录流程是 `startCallbackServer(18080)` +
-     *    `auth_callback_url = 'http://127.0.0.1:<port>/authorize'`
-     *    （`trae-oauth.ts:555-566`）—— 回调是**浏览器直连用户本机端口**；
-     * 3. 登录 URL 里的 `auth_type=local` 也在字面上说明这一点
-     *    （`local` = 本机回调）。
+     * ```js
+     * if (W) V(!1), eA();                       // W = parseInt(redirect)
+     * else {
+     *   if (!$ || !Z || !/^http:\/\/127\.0\.0\.1:(\d+)\/authorize$/.test(Z)) {
+     *     V(!1), ew("invalidUrl"), ep(3); return;   // ← 远程回调必然命中这里
+     *   }
+     *   eT()
+     * }
+     * ```
      *
-     * 故用户看到的是 **TRAE 页面自己报的「网络错误」**（它去连
-     * `127.0.0.1:18080` 但那里没有服务在监听），
-     * 而不是我们的回调页 —— 这也解释了为什么那条文案在本仓库里搜不到。
+     * `Z = auth_callback_url`。**只认 `http://127.0.0.1:<端口>/authorize`
+     * 这个精确形态** —— 我们的 HTTPS 域名必然不匹配 ⇒ 直接 `invalidUrl`
+     * ⇒ 显示那句硬编码兜底文案「网络错误，请刷新页面重试。」。
      *
-     * ⚠️ **不要靠「把地址换成本服务 URL」来修**：这条路在架构上不成立。
-     * 除非 TRAE 将来支持设备码或远程回调，否则只能「粘贴凭据导入」。
+     * ⚠️ 页面自己的埋点也自证了这一点：`module_id: "solo.auth.invalidUrl"`
+     *（从 `mcs.zijieapi.com` 上报体里抓到）。**那不是网络错误。**
+     *
+     * ## 六组对照实验（同一套参数，只改一处）
+     *
+     * | # | `auth_callback_url` | `redirect` | 结果 |
+     * |---|---|---|---|
+     * | A | 我们的 HTTPS 域名 | 0 | 登录失败/网络错误 |
+     * | B | `http://127.0.0.1:18080/authorize` | 0 | 正常登录页 |
+     * | C | `http://127.0.0.1:63521/authorize` | 0 | 正常登录页 |
+     * | D | `http://127.0.0.1:18080/authorize-other` | 0 | 失败（卡在 `\/authorize$`） |
+     * | E | 我们的 HTTPS 域名 | **1** | **登录成功/此窗口可关闭** |
+     * | F | 我们的 HTTPS 域名 | 0 | 失败（同 A） |
+     *
+     * ⇒ A vs E/F 同 URL 仅 `redirect` 不同 → 与域名/可达性**无关**；
+     *   D vs B 仅尾路径不同 → 判定精确卡在 `\/authorize$`。
+     *
+     * ⚠️ **另一个反直觉事实**：即使给合法回环地址，页面**也不会真的去请求它**
+     *（实测 0 条回环请求）—— 它只拿来做正则校验，真正投递由
+     * `u(Z, {isRedirect:!0, …})` + `location.href = …` 完成。
+     *
+     * ## 为什么仍然关掉（`redirect=1` 这条路的未验证项）
+     *
+     * `redirect=1` 能让页面显示「登录成功」，但**凭证是否真的送达我们的
+     * 回调 URL 尚未验证**。上一个子代理测的是**未登录态**
+     *（`CheckLogin` 返回 `IsLogin:false`），那种情况下根本走不到取 token
+     * 那一步，故「0 请求到回调域名」**不能**作为投递不通的证据。
+     *
+     * ⇒ 保留 `login: false`。等「已登录账号 + redirect=1」的投递被真机验证
+     *   之后再考虑打开；那时只需改这一个开关，URL 构造无需改动。
+     *
+     * ## 登录原语全部保留
+     *
+     * `buildTraeLoginURL` / `parseTraeCallback` / `pollTraeLogin` 都是对的
+     * （回调地址由调用方传入、我们如实使用）。它们是**将来**接回这条路的
+     * 基础，且 `parseTraeCallback` 的解析逻辑与「粘贴导入」共用同一套。
      */
     login: false,
     loginBlockedReason:
-      'TRAE 强制回调 127.0.0.1（本机端口），Worker 收不到 —— 这是上游的协议限制，'
-      + '不是本服务的缺失。请从 TRAE 客户端导出凭据后粘贴导入。',
+      'TRAE 授权页对 auth_callback_url 有**硬编码正则**（只认 '
+      + '`http://127.0.0.1:<端口>/authorize`），远程回调必须改用 '
+      + '`redirect=1` 绕过该校验 —— 而那条路的凭证投递尚未验证。'
+      + '请先用「粘贴凭据导入」（machine_id / device_id 也在那份凭据里）。',
     listModels: true,
     chat: true,
     balance: true,

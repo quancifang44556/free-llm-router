@@ -3087,3 +3087,143 @@ Workers CPU 超限是两类故障，必须分开判断。
 | Workers 限额 | https://developers.cloudflare.com/workers/platform/limits/ |
 | DO 限额 | https://developers.cloudflare.com/durable-objects/platform/limits/ |
 | Node 兼容性 | https://developers.cloudflare.com/workers/runtime-apis/nodejs/ |
+
+---
+
+## §10 渠道拦截码 11‑128 的三层静默失效（2026-10-19 实测修复）
+
+这一条**比它看起来严重得多**：它让「渠道指纹不被认可」被误判成「出口 IP 被封」，
+进而触发 IP 级全局停服。三层缺陷**叠在一起**，每层单独都能让功能失效。
+
+### 层 1：`replaceAll(a, a)` 是空操作，而单测写成「输入 === 期望值」
+
+`upstream/report.ts` 与 `gateway/payload.ts` 各有一份脱敏函数，实现都是：
+
+```ts
+return body.replaceAll('11‑128', '11‑128')   // 两个参数**一字不差**
+```
+
+替换结果与输入**逐字节相等** ⇒ 脱敏从未生效。而单测写的是
+`assert.equal(sanitize('错误码 11‑128'), '错误码 11‑128')` ——
+**输入与期望值一样**，所以它**永远通过**，把这个缺陷锁了整整一个版本。
+
+⚠️ **断言必须验证「确实发生了变化」**（`assert.notEqual(out, input)`），
+而不是「输出等于某个字面量」。当输入与期望值相同时，断言的信息量是零。
+
+### 层 2：源码里 42 处把真实错误码写错了
+
+真实错误码是 **`11‑128`**（带 ASCII 连字符 U+002D），而源码里**大面积**写成
+**`11‑128`**（少一个连字符）。两者渲染出来**肉眼无法分辨**。
+
+⚠️ 更糟的是 `code: 11‑128` 这种写法在 JS 里是**算术表达式**（`11 - 128 = -117`），
+而不是字符串 —— 它从来就不是那个错误码。
+
+### 层 3（最深）：`parseEnvelope` 用 `Number()` 吞掉了字符串码
+
+上游真实报文：`{"code":"11‑128","msg":"Illegal API invocation from an unapproved channel"}`
+—— 注意 `code` 是**字符串**。
+
+而 `parseEnvelope` 当时做的是 `Number(raw)` ⇒ `Number("11‑128")` = **`NaN`**
+⇒ `!Number.isFinite(NaN)` ⇒ **判成「不是信封」并返回 `undefined`**
+⇒ 走「无信封 + 403」分支 ⇒ **`waf_blocked`**（而不是 `channel_blocked`）。
+
+后果链：`waf_blocked` → `noteWaf()` 的 **IP 级**判定 → 凑够 2 个账号
+→ **整个服务停服 60 秒**。这正是用户报的「有的软件能用、有的不能」。
+
+### 修法与纪律
+
+1. `Envelope.code` 改为 `number | string`；`parseEnvelope` **保留原始值**；
+2. 需要数字的地方统一走 `numericCode()`（非数字码返回 `undefined`，
+   **绝不** `Number()` 硬转 —— `NaN` 参与任何比较都是 false，会制造静默缺陷）；
+3. `classify()` **先判字符串形态的渠道拦截码**，再查 `CODE_NUMBER_KIND` 数字表；
+4. 脱敏用**不同码点**：判据是 ASCII `11‑128`，替换值是 U+2011；
+5. **所有涉及该码的地方都用码点构造**：
+   ```ts
+   String.fromCharCode(0x31, 0x31, 0x2d, 0x31, 0x32, 0x38)   // '11‑128'
+   ```
+   ⚠️ 不在源码里书写完整字面量 —— 编辑器/构建链任一环归一化就会静默失效，
+   而两者**渲染几乎一致**，无法靠肉眼发现。
+
+### 方法论教训（最重要）
+
+**不要在断言里锁源码文本。** 本次有两处测试是
+`assert.ok(/11‑128: 'channel_blocked'/.test(src))` —— 它锁的是**写法**，
+而真实缺陷藏在**行为**里（`parseEnvelope` 把码吞了）。锁文本会让
+「代码看起来对、行为其实是错的」照样通过。已全部改为调 `classify()` 验行为。
+
+⚠️ 且**必须做变异测试**：把修复改回原缺陷，确认断言真的会失败。
+本次三层缺陷各自都做了变异验证。
+
+### 9.20 限时补偿积分（2026-10-19，实测上线）
+
+**新增能力**：WorkBuddy / CodeBuddy 的「限时补偿积分」查询与领取
+（wb 面板上那个**「立即领取」**按钮）。
+
+#### 端点（逆向 + 实测双证据）
+
+| 用途 | 路径 | 要求 `data` |
+|---|---|---|
+| 查状态 | `POST {web}/billing/meter/compensation-status` | **要** |
+| 领取 | `POST {web}/billing/meter/claim-compensation` | **不要** |
+
+⚠️ **没有 `/v2` 前缀**（对比签到是 `/v2/billing/meter/daily-checkin`）——
+这是另一个产品面，按 v2 抄会 404。
+
+⚠️ 走 **`web` base**（`www.workbuddy.cn`）而不是 `billing` / `copilot`：
+参考实现实测三个 host 都能通，但刻意走 webBase —— 网页端发这个请求的站就是它
+（前端 bundle 托管在 `assets.workbuddy.cn`）。把用户中心类请求打到推理站
+没有依据，哪天收窄路由就会静默失效。
+
+#### 🔴 最大的坑：领取成功时**没有 `data` 字段**
+
+真实报文：
+```json
+// 状态：有 data
+{"code":0,"msg":"OK","data":{"claimed":false,"active":true,
+  "credit_num":500,"validity_period":1,"end_time":"2026-10-22 23:59:59"}}
+
+// 领取：**没有 data**
+{"code":0,"msg":"OK","requestId":"…"}
+```
+
+参考实现为此踩过一次并留了记录：5 个账号批量领取、5/5 都是「无 data」形态，
+面板按「缺 data ⇒ 形态不认识」报**「5 个领取失败」**；而随后查 status，
+5/5 都是 `claimed:true, credit_num:500` —— **积分早已到账**。
+
+⇒ **写操作成败只看 `code === 0`**，缺 `data` 不等于失败；
+   但**仍要求有 `code`**（没业务码无法与「网关回了 JSON 错误体」区分，
+   宁可报形态错也不要把未知当成功 —— 一次性写操作尤其不能猜）。
+
+#### 实测结果（本机 3 个国内版账号）
+
+```
+claimed: true, active: true, creditNum: 500,
+validityPeriod: 1, endTime: "2026-10-22 23:59:59"
+```
+
+三个账号**都是 `claimed: true`**（此前已手工领过）。
+调用领取端点时 **3/3 全部跳过并返回「该账号此前已领取」，一次上游写请求都没发** ——
+这正是「领前先查」防护设计的目的。
+
+#### 纪律：**刻意不接进自动任务 / 自动签到**
+
+这是一次性的**限时**活动（过了 `end_time` 就作废），不是每日可领的能力。
+本项目对「一次性 / 有代价动作」的纪律是**默认不自动执行**
+（同 `Expert_Philanthropy` 需真实捐款那类）。
+
+⇒ 只提供 ① 只读状态查询、② 用户**显式点击**的一次领取。
+`cron` 与自动签到链路里**不调用** `claimCompensation`。
+
+#### 面板
+
+任务中心新增「限时补偿积分」卡片，**两个按钮分离**：
+
+- 「查状态」= 只读，可反复点；
+- 「领取」= 一次性写操作，带 `confirm` 二次确认。
+
+⚠️ 两者都**遍历 `cn` + `global` 两个 realm** —— 与 `loadAccounts` 同一纪律：
+只查 `cn` 会让国际版账号静默消失（本项目在账号列表上已吃过一次这个亏）。
+
+⚠️ 面板对「查不到」与「没有补偿」**如实区分**：
+`available: false` 时提示「查不到补偿活动（可能是接口形态变化，不是"没有"）」——
+前者可能是接口变了，后者是业务语义，两者该采取的行动完全不同。

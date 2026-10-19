@@ -35,7 +35,14 @@ export interface OpenAiModel {
   isDefault?: boolean
   /** 厂商（上游 `vendor`）。 */
   vendor?: string
-  /** 上游官方资费/倍率（如 "x0.00", "x0.11", "x0.51"）。 */
+  /**
+   * **计费倍率**（上游 `credits`，如 `"x0.21"`）。
+   *
+   * ⚠️⚠️ 这是**上游真实下发**的字段 —— 我一开始不知道它存在，
+   * 于是从**模型名**里正则抠 `· x0.05` 这种后缀，结果 46 个模型里
+   * **39 个抠不到**（名字里根本没写），面板显示成一片「未标注」。
+   * 数据一直都在，只是没人读它。
+   */
   credits?: string
 }
 
@@ -164,6 +171,8 @@ function mapModels(models: unknown[]): OpenAiModel[] {
       ...(bool('supportsReasoning') === undefined ? {} : { supportsReasoning: bool('supportsReasoning') as boolean }),
       ...(bool('isDefault') === undefined ? {} : { isDefault: bool('isDefault') as boolean }),
       ...(str('vendor') === undefined ? {} : { vendor: str('vendor') as string }),
+      // ⚠️ 上游把它叫 `credits`，值是 `"x0.21"` 这种**带 x 的字符串**
+      //（不是数字）—— 故这里保持字符串，由解析函数统一处理。
       ...(str('credits') === undefined ? {} : { credits: str('credits') as string }),
     })
   }

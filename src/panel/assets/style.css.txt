@@ -1479,3 +1479,111 @@ html[data-theme='light'] button.prov-sw { background: #ffffff; }
   /* KPI 卡片在窄屏单列铺满，数字略小一点以免折行 */
   .kpi-value { font-size: 22px; }
 }
+
+/* ─────────── 自定义 API Key ─────────── */
+/*
+ * 密钥卡片网格。
+ *
+ * ⚠️ 用 `auto-fill + minmax` 而不是固定列数：卡片内含「配额条 + KV 行」
+ * 这种不定宽度内容，固定列数会在窄屏把文字挤成竖排。
+ * `minmax(0, 1fr)` 的 `0` 是必需的 —— 网格项默认不收缩（`auto` 最小尺寸 = 内容），
+ * 一个长 IP 列表就能把整行撑破（本项目在 `.counts` 上踩过同一个坑）。
+ */
+.key-grid {
+  display: grid; gap: 12px;
+  grid-template-columns: repeat(auto-fill, minmax(min(340px, 100%), 1fr));
+}
+.key-card {
+  background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
+  padding: 14px 16px; display: flex; flex-direction: column; gap: 10px;
+  min-width: 0;
+}
+/* 已停用：整卡去饱和 + 降透明度（一眼区分「这把不在跑」） */
+.key-card.off { opacity: .62; }
+.key-card.off .key-name { text-decoration: line-through; }
+
+.key-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.key-name {
+  font-size: 14px; font-weight: 600; min-width: 0;
+  /* ⚠️ 长名称要能断行，且用 `overflow-wrap: anywhere` 而非 `break-all`
+     —— 后者会把正常英文单词从中间截断（本项目单测禁止）。 */
+  overflow-wrap: anywhere;
+}
+.key-prefix {
+  font-family: ui-monospace, monospace; font-size: 12px; color: var(--dim);
+  background: var(--panel2); border: 1px solid var(--line); border-radius: var(--radius-sm);
+  padding: 3px 8px; align-self: flex-start;
+  overflow-wrap: anywhere;
+}
+
+.key-usage { display: flex; flex-direction: column; gap: 11px; }
+/*
+ * ⚠️ 配额块内部用 `gap: 2px`（小）而**外面**用 11px（大）：
+ * 「请求 / 0 / 7」「每 12 小时」「进度条」是**同一个指标的三行**，
+ * 它们必须靠得比不同指标之间更近 —— 否则两块内容的行距一样，
+ * 眼睛分不清「哪个数字属于哪个标签」（实测：截图里看着像一整块）。
+ */
+.key-quota { display: flex; flex-direction: column; gap: 2px; }
+.key-quota-head {
+  display: flex; justify-content: space-between; align-items: baseline;
+  font-size: 11px; color: var(--dim); gap: 8px;
+}
+.key-quota-val { font-variant-numeric: tabular-nums; }
+.key-quota-track {
+  height: 5px; border-radius: 999px; background: var(--panel2);
+  overflow: hidden; margin-top: 3px;
+}
+.key-quota-fill {
+  height: 100%; border-radius: 999px; background: var(--accent);
+  transition: width .18s;
+}
+/* 配额接近 / 达到上限：给一个前置信号，而不是等被拒才知道 */
+.key-quota-fill.warn { background: var(--warn); }
+.key-quota-fill.full { background: var(--err); }
+.key-quota-note { font-size: 10px; color: var(--dim); }
+
+.key-scope {
+  display: flex; flex-direction: column; gap: 3px;
+  border-top: 1px solid var(--line); padding-top: 8px;
+}
+.key-kv { display: flex; gap: 8px; font-size: 11px; align-items: baseline; }
+.key-kv-k { color: var(--dim); flex: none; width: 62px; }
+.key-kv-v {
+  color: var(--text); min-width: 0; overflow-wrap: anywhere;
+  font-variant-numeric: tabular-nums;
+}
+
+.key-actions {
+  display: flex; flex-wrap: wrap; gap: 6px;
+  border-top: 1px solid var(--line); padding-top: 10px;
+}
+.key-actions button { font-size: 12px; padding: 5px 10px; }
+
+/* 一次性明文展示区（新建 / 重置后） */
+.key-reveal {
+  display: flex; gap: 8px; align-items: stretch; flex-wrap: wrap;
+  margin: 8px 0 4px;
+}
+.key-reveal code {
+  flex: 1 1 240px; min-width: 0;
+  font-family: ui-monospace, monospace; font-size: 12px;
+  background: var(--panel2); border: 1px solid var(--line); border-radius: var(--radius-sm);
+  padding: 10px 12px; overflow-wrap: anywhere; user-select: all;
+}
+.key-reveal button { flex: none; }
+
+/* 编辑表单（弹窗内） */
+.key-editor { display: flex; flex-direction: column; gap: 10px; }
+.key-field { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--dim); }
+.key-field input, .key-field textarea { font-family: inherit; }
+.key-field textarea { font-family: ui-monospace, monospace; font-size: 12px; resize: vertical; }
+
+html[data-theme='light'] .key-prefix { background: #f1f3f6; }
+html[data-theme='light'] .key-reveal code { background: #f1f3f6; }
+
+@media (max-width: 720px) {
+  /* 手机：卡片撑满一行（两列会把 KV 行挤到几乎不可读） */
+  .key-grid { grid-template-columns: 1fr; }
+  .key-actions button { flex: 1 1 auto; }
+  .key-kv-k { width: 56px; }
+}

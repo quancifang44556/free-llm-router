@@ -70,7 +70,19 @@ import type { LoginCredential } from './upstream/auth.js'
 import { parseAuthDocument, parseAuthPayload } from './upstream/import.js'
 import { handleResponses } from './gateway/responses.js'
 import { handleChatCompletions } from './gateway/server.js'
+import {
+  emptyApiKeyUsage,
+  generateApiKey,
+  hashApiKey,
+  isWindowExpired,
+  keyPrefix,
+  normalizeApiKeyLimits,
+  resetUsageWindow,
+  toApiKeyView,
+} from './store/apikeys.js'
+import { authenticate, countUse } from './gateway/authz.js'
 import { fetchBalance } from './upstream/checkin.js'
+import { claimCompensation, fetchCompensationStatus } from './upstream/compensation.js'
 import { listTasks } from './upstream/tasks.js'
 import { listModels, pickCredential } from './gateway/models.js'
 /**
@@ -1029,6 +1041,93 @@ async function pollTraeLogin(
  *
  * ⚠️ **只兜异常，不改行为**：正常路径一个字节都不受影响。
  */
+/**
+ * 渠道归属前缀（`/v1/models` 的 `name` 用）。
+ *
+ * ⚠️ 只有这三家需要区分 —— 其余家（cline/qoder/gemini…）的 id 前缀本身
+ * 已是可读的英文名，再套一层中文前缀只是噪音。
+ */
+const CHANNEL_LABEL: Record<string, string> = {
+  buddy: '国内',
+  workbuddy: '国际',
+  aggregate: '聚合',
+}
+
+/**
+ * `/v1/models` 条目的**客户端可读化**补全。
+ *
+ * ## 为什么必须做（用户实测反馈）
+ *
+ * 上游给的字段是 `contextWindow` / `maxOutput` / `supportsImage` / `credits`，
+ * 这些**不是 OpenAI 标准字段**，绝大多数第三方客户端
+ *（Cherry Studio / ChatBox / LobeChat / Open WebUI …）**直接忽略** ⇒
+ * 表现为「多模态没标、上下文空白、看不到倍率、分不清国内/国际」。
+ *
+ * ## 两条补全路径（互补，不是二选一）
+ *
+ * 1. **`name` 承载**（零配置通用）：`name` 是**所有客户端都会显示**的字段，
+ *    故把「国内/国际」与倍率写进去。这是覆盖面最广的一条。
+ * 2. **OpenRouter 风格字段**（自动识别）：`context_length` /
+ *    `top_provider` / `architecture.input_modalities` —— 识别这套约定的
+ *    客户端可**自动**读到上下文与多模态，无需人工配置。
+ *
+ * ⚠️ **原有字段一个都不删**：既有客户端与面板仍按原字段读，
+ *    本次只是**追加**。`credits` 保留（面板的「倍率」列在用）。
+ *
+ * ⚠️ `name` 的改动会影响面板的「名称」列（变长，且倍率与「倍率」列重复）——
+ *    这是为了让**外部客户端**正确显示而付的代价，已与用户确认接受。
+ */
+function annotateModelEntry(
+  entry: Record<string, unknown>,
+  providerId: string,
+): Record<string, unknown> {
+  const ctx =
+    typeof entry.contextWindow === 'number' && entry.contextWindow > 0
+      ? entry.contextWindow
+      : undefined
+  const maxOut =
+    typeof entry.maxOutput === 'number' && entry.maxOutput > 0 ? entry.maxOutput : undefined
+  // ⚠️ 聚合是虚拟路由，上游不给 `supportsImage`；但它承载的模型均支持视觉，
+  //    判成「纯文本」会让用户无法给 `aggregate/*` 发图。
+  const acceptsImage = entry.supportsImage === true || providerId === AGGREGATE_PROVIDER_ID
+  const isFree = entry.isFree === true
+
+  // ── 路径 1：名称承载渠道 + 倍率 ──
+  const label = CHANNEL_LABEL[providerId]
+  const rawName =
+    typeof entry.name === 'string' && entry.name !== ''
+      ? entry.name
+      : String(entry.id).split('/').slice(1).join('/')
+  const parts: string[] = []
+  if (label !== undefined) parts.push(label)
+  parts.push(rawName)
+  if (isFree) {
+    parts.push('免费')
+  } else {
+    // 上游的 credits 形如 `x0.21` 或 `x0.34 credits`，只取数值部分
+    const mu =
+      typeof entry.credits === 'string' ? entry.credits.match(/x\s*([0-9.]+)/i)?.[1] : undefined
+    if (mu !== undefined) parts.push(`×${mu}`)
+  }
+
+  const out: Record<string, unknown> = { ...entry, name: parts.join(' · ') }
+
+  // ── 路径 2：OpenRouter 风格字段 ──
+  if (ctx !== undefined) {
+    out.context_length = ctx
+    out.top_provider = {
+      context_length: ctx,
+      ...(maxOut === undefined ? {} : { max_completion_tokens: maxOut }),
+    }
+  }
+  out.architecture = {
+    modality: acceptsImage ? 'text+image->text' : 'text->text',
+    input_modalities: acceptsImage ? ['text', 'image'] : ['text'],
+    output_modalities: ['text'],
+  }
+  return out
+}
+
 async function handle(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   try {
     return await handleInner(request, env, ctx)
@@ -1121,8 +1220,42 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
   }
 
   // ── 其余一律鉴权 ──
+  //
+  // ## 🔴 两条身份通道（主密钥 vs 子密钥）
+  //
+  // 主密钥（`API_KEY`）能进 `/admin/*` 与 `/v1/*`；**子密钥只能进 `/v1/*`**。
+  //
+  // ⚠️ 为什么必须在这里分流、而不是在 `authorized()` 里一并放行：
+  // 子密钥是"发给外部调用方的受限凭证"，它若能进 `/admin/*`，就能
+  // **自己给自己扩容**（改写自己的 limits）、列出别人的 Key、读账号凭据 ——
+  // 那等于把"受限"两个字作废。
+  //
+  // ⚠️ 判定顺序刻意为「主密钥优先」：子密钥路径要打一次 DO（查哈希），
+  // 主密钥不用。日常运维走的是主密钥，不该为子密钥的选择付代价。
+  const isV1Path = path.startsWith('/v1/')
   if (!(await authorized(request, env))) {
-    return json({ error: { message: 'Missing or invalid API key', type: 'authentication_error' } }, 401)
+    // 不是主密钥 ⇒ 只有在 `/v1/*` 上才尝试子密钥。
+    if (!isV1Path) {
+      return json({ error: { message: 'Missing or invalid API key', type: 'authentication_error' } }, 401)
+    }
+    // ⚠️ 此时还不知道模型，先传空串跳过模型检查；真正的模型校验在
+    // 拿到请求体之后（见下方 `/v1/chat/completions` 分支）。
+    const sub = await authenticate(request, env, '')
+    if (sub.kind === 'none') {
+      return json({ error: { message: 'Missing or invalid API key', type: 'authentication_error' } }, 401)
+    }
+    if (sub.kind === 'subkey-denied') {
+      // ⚠️ 429 用于配额（可重试），403 用于 IP/模型范围（换 Key 才行）——
+      // 两者对调用方的运维含义完全不同，不能合并成一个状态码。
+      return json({ error: { message: sub.reason, type: 'permission_error' } }, sub.status)
+    }
+    // 放行：占住请求数名额（token 在流结束时补）。
+    // ⚠️ 不 await —— 它不该拖慢首字节；失败只记日志。
+    if (sub.kind === 'subkey') {
+      // ⚠️ 模型名此时还未知（在请求体里），传空串占名额即可；
+      // `countUse` 内部的 `recordApiKeyUse` 只累加请求数，不校验模型。
+      ctx.waitUntil(countUse(env, sub.record, request, ''))
+    }
   }
 
   // ── 登录：发起（返回授权 URL 给前端/用户） ──
@@ -2210,6 +2343,134 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
   //
   // 只对**声明了 checkin: true** 的供应商执行 —— 其余家显式跳过并说明原因，
   // 不静默忽略（用户需要知道「为什么这家没签」）。
+  // ── 限时补偿积分（wb 面板上那个「立即领取」按钮） ──
+  //
+  // ⚠️ 这是**一次性写操作**，故刻意**不**接进自动签到 / cron：
+  //   活动是限时的（过了 end_time 就作废），误触没有第二次机会。
+  //   参考实现对此有同样的纪律（详见 upstream/compensation.ts 模块头）。
+  //
+  // 两个端点分开：
+  //   GET  /admin/compensation          → 只查状态（安全，可反复调）
+  //   POST /admin/compensation/claim    → 真的领取（一次性）
+  if (path === '/admin/compensation' && request.method === 'GET') {
+    const realm = url.searchParams.get('realm') ?? 'cn'
+    const only = url.searchParams.get('provider') ?? DEFAULT_PROVIDER
+    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
+    const accounts = await pool.listAccounts(realm, Date.now())
+    const results: Array<Record<string, unknown>> = []
+
+    for (const account of accounts) {
+      const providerId = account.provider ?? DEFAULT_PROVIDER
+      if (providerId !== only) continue
+      if (account.disabled) {
+        results.push({ uid: account.uid, ok: false, detail: '账号已禁用' })
+        continue
+      }
+      const credential = (await pool.getCredential(account.uid)) as ProviderCredential | undefined
+      if (credential === undefined) {
+        results.push({ uid: account.uid, ok: false, detail: '账号缺少凭据' })
+        continue
+      }
+      // ⚠️ 凭据字段是**驼峰** accessToken（ProviderCredential），不是 snake_case。
+      const accessToken = credential.accessToken
+      if (accessToken === undefined || accessToken === '') {
+        results.push({ uid: account.uid, ok: false, detail: '凭据缺少 accessToken' })
+        continue
+      }
+      try {
+        const status = await fetchCompensationStatus({ uid: account.uid, accessToken }, env)
+        results.push({
+          uid: account.uid,
+          nickname: account.nickname,
+          ok: true,
+          // ⚠️ undefined ⇒ 上游**没有这个活动**或形态不认识。
+          // 如实标出来，不要编成 active:false（那是「活动已过期」的语义，不一样）。
+          available: status !== undefined,
+          status: status ?? null,
+        })
+      } catch (error) {
+        results.push({
+          uid: account.uid,
+          ok: false,
+          detail: error instanceof Error ? error.message : String(error),
+        })
+      }
+    }
+    return json({ results, now: Date.now() })
+  }
+
+  if (path === '/admin/compensation/claim' && request.method === 'POST') {
+    const body = (await request.json().catch(() => ({}))) as {
+      realm?: string
+      provider?: string
+      uids?: unknown
+    }
+    const realm = body.realm ?? 'cn'
+    const only = body.provider ?? DEFAULT_PROVIDER
+    // uids 缺省 ⇒ 领**全部可领**的账号；显式传 [] ⇒ 一个都不领
+    const wanted = Array.isArray(body.uids)
+      ? body.uids.filter((x): x is string => typeof x === 'string')
+      : undefined
+    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
+    const accounts = await pool.listAccounts(realm, Date.now())
+    const results: Array<Record<string, unknown>> = []
+
+    for (const account of accounts) {
+      const providerId = account.provider ?? DEFAULT_PROVIDER
+      if (providerId !== only) continue
+      if (wanted !== undefined && !wanted.includes(account.uid)) continue
+      if (account.disabled) {
+        results.push({ uid: account.uid, ok: false, detail: '账号已禁用' })
+        continue
+      }
+      const credential = (await pool.getCredential(account.uid)) as ProviderCredential | undefined
+      if (credential === undefined) {
+        results.push({ uid: account.uid, ok: false, detail: '账号缺少凭据' })
+        continue
+      }
+      // ⚠️ 凭据字段是**驼峰** accessToken（ProviderCredential），不是 snake_case。
+      const accessToken = credential.accessToken
+      if (accessToken === undefined || accessToken === '') {
+        results.push({ uid: account.uid, ok: false, detail: '凭据缺少 accessToken' })
+        continue
+      }
+      try {
+        // ⚠️ 领之前先查一次：已经领过的**不要**白打上游（一次性写操作尤其要克制），
+        // 也避免把「已领取」误报成「领取失败」。
+        const status = await fetchCompensationStatus({ uid: account.uid, accessToken }, env)
+        if (status === undefined) {
+          results.push({ uid: account.uid, ok: false, detail: '查不到补偿状态（上游无此活动或形态已变）' })
+          continue
+        }
+        if (status.claimed) {
+          results.push({ uid: account.uid, ok: true, alreadyClaimed: true, detail: '该账号此前已领取' })
+          continue
+        }
+        if (!status.active) {
+          results.push({ uid: account.uid, ok: false, detail: '补偿活动已结束' })
+          continue
+        }
+        const r = await claimCompensation({ uid: account.uid, accessToken }, env)
+        results.push({
+          uid: account.uid,
+          nickname: account.nickname,
+          ok: true,
+          claimed: r.claimed,
+          alreadyClaimed: r.alreadyClaimed,
+          creditNum: status.creditNum,
+          detail: r.message,
+        })
+      } catch (error) {
+        results.push({
+          uid: account.uid,
+          ok: false,
+          detail: error instanceof Error ? error.message : String(error),
+        })
+      }
+    }
+    return json({ results, now: Date.now() })
+  }
+
   if (path === '/admin/checkin/all' && request.method === 'POST') {
     const body = (await request.json().catch(() => ({}))) as { realm?: string; provider?: string }
     const realm = body.realm ?? 'cn'
@@ -2532,6 +2793,115 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
   if (path === '/admin/models/builtin' && request.method === 'GET') {
     const models = getBuiltinModels()
     return json({ ok: true, data: models, total: models.length })
+  }
+
+  // ═══════════════════ 自定义 API Key（子密钥） ═══════════════════
+  //
+  // ## 为什么子密钥必须只有主密钥能管
+  //
+  // 这几个端点全部在下面的「先过 admin 鉴权」段落之后，故天然只认主密钥 ——
+  // 子密钥连**列列表**都不行。否则一把泄漏的子密钥可以自己给自己扩容。
+  //
+  // ## 明文只在两个地方出现
+  //
+  // ① 创建响应；② 重置响应。之后**永不回显**（库里只有哈希）。
+  // 这是刻意的：若列表能回显明文，那么任何一次面板 XSS / 屏幕截图
+  // 就等于密钥泄漏 —— 而用户本来只需保存一次。
+
+  if (path === '/admin/apikeys' && request.method === 'GET') {
+    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn'))
+    const records = await pool.listApiKeys()
+    const usages = await pool.listApiKeyUsages()
+    const now = Date.now()
+    const keys = records.map((r) => {
+      let u = usages[r.id] ?? emptyApiKeyUsage()
+      // ⚠️ 面板展示要反映**当前窗口**：窗口已过期就展示归零后的值，
+      // 否则用户会看到「上一窗口用满了」而实际新窗口是空的（误判成超额）。
+      if (isWindowExpired(u, r.limits, now)) u = resetUsageWindow(u, now)
+      return toApiKeyView(r, u)
+    })
+    // 最近创建的在前（新加的更容易找到）
+    keys.sort((a, b) => b.createdAt - a.createdAt)
+    return json({ keys, now })
+  }
+
+  if (path === '/admin/apikeys' && request.method === 'POST') {
+    const body = (await request.json().catch(() => ({}))) as Record<string, unknown>
+    const name = typeof body.name === 'string' && body.name.trim() !== '' ? body.name.trim().slice(0, 60) : '未命名'
+    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn'))
+    // ⚠️ 生成→哈希→存库；明文只在本次响应里返回。
+    const plaintext = generateApiKey()
+    const record = await pool.addApiKey({
+      name,
+      hash: await hashApiKey(plaintext),
+      prefix: keyPrefix(plaintext),
+    })
+    // 创建时就可以带上限制（面板的「新建」表单支持一次填完）
+    const limits = normalizeApiKeyLimits(body.limits)
+    const saved = await pool.updateApiKey(record.id, { limits })
+    if (saved === undefined) return jsonError(500, '创建后回读失败', 'internal_error')
+    return json({
+      // ⚠️ **只在这里出现一次**（面板必须提示用户立即复制）
+      key: plaintext,
+      record: toApiKeyView(saved, emptyApiKeyUsage()),
+    })
+  }
+
+  if (path === '/admin/apikeys/update' && request.method === 'POST') {
+    const body = (await request.json().catch(() => ({}))) as Record<string, unknown>
+    const id = typeof body.id === 'string' ? body.id : ''
+    if (id === '') return jsonError(400, 'id 必填', 'invalid_request_error')
+    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn'))
+    const patch: { name?: string; enabled?: boolean; limits?: ReturnType<typeof normalizeApiKeyLimits> } = {}
+    if (typeof body.name === 'string' && body.name.trim() !== '') patch.name = body.name.trim().slice(0, 60)
+    if (typeof body.enabled === 'boolean') patch.enabled = body.enabled
+    if (body.limits !== undefined) patch.limits = normalizeApiKeyLimits(body.limits)
+    const updated = await pool.updateApiKey(id, patch)
+    if (updated === undefined) return jsonError(404, `找不到 id 为「${id}」的 API Key`, 'not_found')
+    const usage = await pool.getApiKeyUsage(id)
+    return json({ ok: true, record: toApiKeyView(updated, usage) })
+  }
+
+  // ⚠️ 重命名端点路径带 `reset` + POST：语义上「生成新的密钥材料」
+  // 是**不可逆**的操作（旧 Key 立刻失效），不能是 GET。
+  if (path === '/admin/apikeys/reset' && request.method === 'POST') {
+    const body = (await request.json().catch(() => ({}))) as { id?: unknown }
+    const id = typeof body.id === 'string' ? body.id : ''
+    if (id === '') return jsonError(400, 'id 必填', 'invalid_request_error')
+    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn'))
+    const plaintext = generateApiKey()
+    const updated = await pool.updateApiKey(id, {
+      hash: await hashApiKey(plaintext),
+      prefix: keyPrefix(plaintext),
+    })
+    if (updated === undefined) return jsonError(404, `找不到 id 为「${id}」的 API Key`, 'not_found')
+    // ⚠️ 重置后同时**清空用量**：新密钥不该继承旧密钥的配额消耗
+    //（否则用户「重置一下」发现还是超限，会以为重置没生效）。
+    await pool.resetApiKeyUsage(id)
+    const usage = await pool.getApiKeyUsage(id)
+    return json({ key: plaintext, record: toApiKeyView(updated, usage) })
+  }
+
+  if (path === '/admin/apikeys/remove' && request.method === 'POST') {
+    const body = (await request.json().catch(() => ({}))) as { id?: unknown }
+    const id = typeof body.id === 'string' ? body.id : ''
+    if (id === '') return jsonError(400, 'id 必填', 'invalid_request_error')
+    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn'))
+    const removed = await pool.removeApiKey(id)
+    // ⚠️ 删除不存在的条目返回 404（而不是静默 ok）——
+    // 静默成功会让用户以为删掉了，刷新后它又回来了。
+    if (!removed) return jsonError(404, `找不到 id 为「${id}」的 API Key`, 'not_found')
+    return json({ ok: true })
+  }
+
+  if (path === '/admin/apikeys/reset-usage' && request.method === 'POST') {
+    const body = (await request.json().catch(() => ({}))) as { id?: unknown }
+    const id = typeof body.id === 'string' ? body.id : ''
+    if (id === '') return jsonError(400, 'id 必填', 'invalid_request_error')
+    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn'))
+    const okReset = await pool.resetApiKeyUsage(id)
+    if (!okReset) return jsonError(404, `找不到 id 为「${id}」的 API Key`, 'not_found')
+    return json({ ok: true })
   }
 
   // ── 按供应商列模特（面板用） ──
@@ -3126,7 +3496,7 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
           // ⚠️ **请求侧仍然接受裸名**（回退到默认供应商，见 `splitModelName`）：
           // 已有的客户端配置不会因为这个改动而失效，只是目录里不再列它。
           // 兼容与无歧义两件事分开处理 —— 目录负责「说清楚」，路由负责「不breaking」。
-          data.push({ ...base, id: `${providerId}/${m.id}` })
+          data.push(annotateModelEntry({ ...base, id: `${providerId}/${m.id}` }, providerId))
         }
       } catch (error) {
         // ⚠️ 逐家兜错：一家失败不该让整个目录 500（用户可能只想用另一家）
@@ -3163,20 +3533,30 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
       // ⚠️ `name` **必须给**：面板「模型」页有「名称」列，
       // 缺了就是**整列空白**（实测反馈：19 个 aggregate 条目名称列全空，
       // 看起来像渲染失败）。`VirtualModel` 本来就有 `name` 字段，只是没往外发。
-      data.push({
-        id: `${AGGREGATE_PROVIDER_ID}/${AGGREGATE_AUTO}`,
-        object: 'model',
-        owned_by: AGGREGATE_PROVIDER_ID,
-        name: '自动选择（临期优先）',
-      })
+      data.push(
+        annotateModelEntry(
+          {
+            id: `${AGGREGATE_PROVIDER_ID}/${AGGREGATE_AUTO}`,
+            object: 'model',
+            owned_by: AGGREGATE_PROVIDER_ID,
+            name: '自动选择（临期优先）',
+          },
+          AGGREGATE_PROVIDER_ID,
+        ),
+      )
       for (const v of virtuals) {
-        data.push({
-          id: `${AGGREGATE_PROVIDER_ID}/${v.key}`,
-          object: 'model',
-          owned_by: AGGREGATE_PROVIDER_ID,
-          // ⚠️ 兜底到 key：万一某条目 name 为空，也不该给一个空单元格
-          name: v.name || v.key,
-        })
+        data.push(
+          annotateModelEntry(
+            {
+              id: `${AGGREGATE_PROVIDER_ID}/${v.key}`,
+              object: 'model',
+              owned_by: AGGREGATE_PROVIDER_ID,
+              // ⚠️ 兜底到 key：万一某条目 name 为空，也不该给一个空单元格
+              name: v.name || v.key,
+            },
+            AGGREGATE_PROVIDER_ID,
+          ),
+        )
       }
     } catch (error) {
       errors.push({

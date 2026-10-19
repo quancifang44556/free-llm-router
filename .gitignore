@@ -26,3 +26,11 @@ scripts/inspect_models.js
 
 # Playwright 临时测试快照与截图
 .playwright-mcp/
+
+# ── 本地运行时数据库（**含加密凭据与账号数据**，绝不入库）──
+# 2026-10-19 补：此前 `data/` 未被忽略，`git add -A` 会把 router.db 带进仓库。
+# 该库里有账号凭据（AES 加密后仍是敏感物）、用量明细、子密钥哈希。
+data/
+*.db
+*.db-wal
+*.db-shm

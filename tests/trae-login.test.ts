@@ -597,29 +597,79 @@ test('⚠️ 失败必须写回会话（否则面板只会一直等到超时）'
 
 // ─────────────────── ⑥ 能力声明 ───────────────────
 
-test('❌ trae 必须声明 login=false —— 它强制回调 127.0.0.1，Worker 接不住', () => {
-  // ## 这是被真实用户实测推翻的结论（2026-10-04）
+test('trae 必须声明 login=false —— 授权页对回调有硬编码正则，远程回调必然 invalidUrl', () => {
+  // ## 这条断言被翻转过两次，把完整历史留下来，避免第三个人再翻一次
   //
-  // 我曾以为 `auth_callback_url` 是通用参数、可以指向本服务 URL
-  //（codearts 正是这么做且能通），于是把 trae 的 `login` 改成 true。
-  // **对 TRAE 不成立**：用户登录后 TRAE 页面自己报
-  //「网络错误，请刷新页面重试」—— 它去连 `127.0.0.1:18080` 但那里没人监听。
+  // | 时间 | 结论 | 依据 |
+  // |---|---|---|
+  // | 2026-10-04 | `login=false` | 参考实现文件头写「强制回调 127.0.0.1」 |
+  // | 2026-10-19 上午 | 我改成 `true` | 只测了「服务端不对 URL 做白名单」，两个 URL 都 200 |
+  // | 2026-10-19 晚 | **改回 `false`** | 真机失败 + 定位到页面内硬编码正则 |
   //
-  // 依据（`deepseek-harness-codearts/src/trae-oauth.ts`）：
-  // - 文件头 `:4-11` 明写「TRAE 强制回调 `127.0.0.1`」，端口固定 18080；
-  // - `:555-566` 起本地服务器并把 `auth_callback_url` 填成
-  //   `http://127.0.0.1:<port>/authorize`；
-  // - 登录 URL 的 `auth_type=local` 字面即「本机回调」。
+  // ## 真凶（逐字节核对的页面源码）
   //
-  // ⚠️ 那条错误文案在本仓库里搜不到，正是「不是我们的页面报的」的旁证。
+  // `page.*.js` 里：
+  // ```js
+  // if (W) V(!1), eA();                    // W = parseInt(redirect)
+  // else {
+  //   if (!$ || !Z || !/^http:\/\/127\.0\.0\.1:(\d+)\/authorize$/.test(Z)) {
+  //     V(!1), ew("invalidUrl"), ep(3); return;   // ← 远程回调必然命中
+  //   }
+  //   eT()
+  // }
+  // ```
+  // `Z = auth_callback_url` ⇒ **只认 `http://127.0.0.1:<端口>/authorize`**。
   //
-  // ⚠️ **不要靠「把地址换成本服务 URL」来修** —— 架构上不成立。
+  // ⚠️ 页面埋点也自证：`module_id: "solo.auth.invalidUrl"`。
+  //   那句话「网络错误，请刷新页面重试」只是**硬编码兜底文案**
+  //   （`useState(T)` 的初始值），与网络毫无关系 —— 全程 **0 条请求失败**。
+  //
+  // ## 六组对照（同一套参数只改一处）
+  //
+  // A: HTTPS 域名 + redirect=0 → 失败
+  // B: 127.0.0.1:18080/authorize + redirect=0 → 正常登录页
+  // D: 127.0.0.1:18080/authorize-**other** + redirect=0 → 失败（卡在 `\/authorize$`）
+  // E: HTTPS 域名 + redirect=**1** → 登录成功（`if (W)` 跳过正则）
+  //
+  // ⚠️ 但 `redirect=1` 那条路的**凭证投递未验证**（对照实验跑在未登录态，
+  //   走不到取 token 那步，故「0 请求到回调域名」不能作为投递不通的证据）。
+  //   所以仍然保持 `login: false`，等真机用已登录账号验完再开。
+  //
+  // ⚠️ 教训：**「服务端返回 200」不等于「流程能跑通」**；
+  //   而**「页面报网络错误」也不等于网络有问题** —— 要去看它到底在哪一行失败。
   const provider = findProvider('trae')
-  assert.equal(provider?.capabilities.login, false, 'trae 不能声称支持登录')
-  assert.ok(
-    (provider?.capabilities.loginBlockedReason ?? '').includes('127.0.0.1'),
-    '阻塞原因必须点明是「强制回调 127.0.0.1」，而不是含糊的「未实现」',
+  assert.equal(
+    provider?.capabilities.login,
+    false,
+    'TRAE 授权页对 auth_callback_url 有硬编码正则，远程回调必然失败',
   )
+  // ⚠️ 阻塞原因必须指向**真正可用的替代路径**，而不是含糊的「未实现」。
+  assert.ok(
+    (provider?.capabilities.loginBlockedReason ?? '').includes('粘贴凭据导入'),
+    '阻塞原因必须告诉用户改用「粘贴凭据导入」',
+  )
+  // ⚠️ 阻塞原因还应点明**真实根因**，而不是复述那句误导的「网络错误」。
+  //    否则下一个人会照着「网络错误」去查网络，永远查不到。
+  assert.ok(
+    /127\.0\.0\.1|正则/.test(provider?.capabilities.loginBlockedReason ?? ''),
+    '阻塞原因必须说明是回调格式校验，不能只写「网络错误」',
+  )
+})
+
+test('trae 登录 URL 的 auth_callback_url 必须指向**我们自己的**域名（不是 127.0.0.1）', () => {
+  // 这条与 login=false 并不冲突：**原语本身是对的**（回调地址由调用方传入、
+  // 我们如实使用）。它只是当前跑不通，不是因为 URL 拼错了。
+  //
+  // ⚠️ 保留这条断言的价值：将来上游若放开远程回调，只需把 `login` 改回
+  //   `true`，而 URL 构造这边**不需要再改**——确保它现在就是对的。
+  const url = buildTraeLoginURL(
+    'a'.repeat(32),
+    'b'.repeat(32),
+    'https://example.test/login/trae/callback/deadbeef',
+  )
+  const cb = new URL(url).searchParams.get('auth_callback_url') ?? ''
+  assert.equal(cb, 'https://example.test/login/trae/callback/deadbeef')
+  assert.ok(!cb.includes('127.0.0.1'), '回调地址不得回落到本机端口')
 })
 
 test('trae 的登录原语保留（协议已逆向，将来若上游支持远程回调可直接接回）', () => {

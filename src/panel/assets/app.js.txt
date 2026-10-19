@@ -202,6 +202,8 @@ const VIEW_LOADERS = {
   tasks: () => loadAccounts(),
   usage: () => loadUsage(),
   models: () => loadModels(),
+  // ⚠️ 子密钥页：进来就拉（与其它视图一致，不要求用户再点「刷新」）
+  apikeys: () => loadApiKeys(),
   config: () => loadConfig(),
   logs: () => loadLogs(),
 }
@@ -682,6 +684,68 @@ function invalidateCredits() {
 }
 
 /** 卡片一：全部供应商一键签到。 */
+// ─────────── 限时补偿积分 ───────────
+//
+// ⚠️ 两个动作**必须分开**：查状态是只读的、可反复点；领取是**一次性写操作**，
+//   活动过了 end_time 就作废，误触没有第二次机会。故不合并成一个按钮。
+
+/** 查补偿状态（只读）。 */
+async function loadCompensation() {
+  const out = $('compensation-result')
+  out.textContent = '查询中…'
+  // ⚠️ 必须查**两个 realm**：补偿是账号维度的，国际版账号在 global 分片
+  // （与 loadAccounts 同一纪律：只查 cn 会让国际版账号静默消失）。
+  const rows = []
+  for (const realm of ['cn', 'global']) {
+    const r = await api('/admin/compensation?realm=' + realm + '&provider=buddy')
+    if (!r.ok) { out.textContent = '查询失败：' + JSON.stringify(r.body); return }
+    for (const row of (r.body.results ?? [])) rows.push(row)
+  }
+  if (rows.length === 0) { out.textContent = '没有国内版账号。'; return }
+  const parts = []
+  for (const row of rows) {
+    const who = row.nickname || String(row.uid).slice(0, 8)
+    if (row.ok !== true) { parts.push(who + '：' + (row.detail || '查询失败')); continue }
+    const st = row.status
+    if (row.available !== true || st === null) {
+      // ⚠️ 「查不到」≠「没有补偿」：前者可能是接口形态变了，如实区分
+      parts.push(who + '：查不到补偿活动（可能是接口形态变化，不是"没有"）')
+      continue
+    }
+    if (st.claimed) { parts.push(who + '：已领取 ' + st.creditNum + ' 积分'); continue }
+    if (!st.active) { parts.push(who + '：活动已结束'); continue }
+    parts.push(who + '：可领 ' + st.creditNum + ' 积分（截至 ' + st.endTime + '）')
+  }
+  out.textContent = parts.join('；')
+}
+
+/** 领取补偿（写操作，需确认）。 */
+async function claimCompensationAll() {
+  const out = $('compensation-result')
+  if (!confirm('确认领取限时补偿积分？\n\n这是写操作：只领确实可领的账号，已领过的会跳过。')) return
+  out.textContent = '领取中…'
+  // ⚠️ 同 loadCompensation：两个 realm 都要领
+  const rows = []
+  for (const realm of ['cn', 'global']) {
+    const r = await api('/admin/compensation/claim', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ realm, provider: 'buddy' }),
+    })
+    if (!r.ok) { out.textContent = '领取失败（' + realm + '）：' + JSON.stringify(r.body); return }
+    for (const row of (r.body.results ?? [])) rows.push(row)
+  }
+  const parts = []
+  for (const row of rows) {
+    const who = row.nickname || String(row.uid).slice(0, 8)
+    if (row.ok !== true) { parts.push(who + '：' + (row.detail || '失败')); continue }
+    if (row.alreadyClaimed) { parts.push(who + '：此前已领，跳过'); continue }
+    if (row.claimed) { parts.push(who + '：领取成功+' + (row.creditNum || 0)); continue }
+    parts.push(who + '：' + (row.detail || '完成'))
+  }
+  out.textContent = parts.length > 0 ? parts.join('；') : '没有可领取的账号。'
+  await loadAccounts()
+}
+
 async function runCheckinAll() {
   const btn = $('run-checkin-all')
   btn.disabled = true
@@ -1502,19 +1566,53 @@ function renderModelsTable() {
     const info = cache[m.id]
     const officialCredits = m.credits || info?.officialCredits
 
+    // ## 🔴 免费必须**优先于**倍率判断（移植自上游 3e12ff0）
+    //
+    // 上游修的那个缺陷在这里同样成立：`cline` 有 21 个 `*-free` 模型，
+    // 其 `isFree` 已被 provider 正确算出（`recommended-models` 是权威来源），
+    // 但该家**不下发 `credits`** ⇒ `officialCredits` 为空 ⇒ 旧逻辑落到
+    // 「未检测」⇒ **明明免费却显示空白**。
+    //
+    // ⚠️ 故这里先看 `priceFactor` / `isFree`（服务端算好的事实），
+    // 只在两者都没有时才回退到「从 credits 字符串解析」的老路径。
+    // ⚠️ `0` 是**合法值**（免费），不能写成 `m.priceFactor || …` ——
+    // `0 || x` 会把免费当成「没有值」。
+    const pf = typeof m.priceFactor === 'number' ? m.priceFactor : undefined
+    const freeByServer = m.isFree === true || pf === 0
+    // 聚合条目不显示倍率（移植自上游）：它的倍率是「各候选里最便宜的那个」，
+    // 是推导值而非上游事实，显示出来会让用户以为聚合自己有报价。
+    const isAggregate = String(m.id).startsWith('aggregate/')
+
     if (!info) {
-      if (officialCredits) {
+      if (freeByServer) {
+        const tag = document.createElement('span')
+        // ⚠️ `.tag.ok` 是绿色（上游专门为此加的样式）——
+        // 只有绿字在密集表格里不够显眼，而「免费」最值得一眼看到。
+        tag.className = 'tag ok'
+        tag.textContent = '免费'
+        tag.title = '免费额度模型'
+        tdStatus.appendChild(tag)
+      } else if (isAggregate) {
+        // 聚合：留空（不是「未检测」，也不是「不可用」）
+      } else if (pf !== undefined && Number.isFinite(pf)) {
+        const tag = document.createElement('span')
+        tag.className = 'tag warn'
+        tag.textContent = 'x' + pf.toLocaleString('zh-CN')
+        tag.title = '计费倍率 ' + pf
+        tdStatus.appendChild(tag)
+      } else if (officialCredits) {
         const isFree = officialCredits === 'x0.00' || officialCredits === 'x0'
         const tag = document.createElement('span')
         tag.className = 'tag ' + (isFree ? 'ok' : 'warn')
-        tag.textContent = isFree ? '0 积分 (官方免费)' : officialCredits + ' 倍率'
+        tag.textContent = isFree ? '免费' : officialCredits + ' 倍率'
         tag.title = isFree ? '官方标定 0 积分免费模型' : '官方标定积分消耗倍率：' + officialCredits
         tdStatus.appendChild(tag)
       } else {
-        const tag = document.createElement('span')
-        tag.className = 'tag'
-        tag.textContent = '未检测'
-        tdStatus.appendChild(tag)
+        // ⚠️ 该家既没下发倍率也没标免费 ⇒ **留空**，不写「未检测」。
+        // 一列里绝大多数都是同一个「未知」时，留空比重复 N 次更有信息量
+        //（上游实测：满屏「未标注」看着像坏了）。
+        // 「未检测」只应出现在**用户还没点检测**且服务端确实没数据时 ——
+        // 而下面那个「测资费」按钮就能补救，故这里不再渲染占位文字。
       }
     } else if (info.ok) {
       if (info.isFree) {
@@ -2571,10 +2669,46 @@ async function startModalLogin(providerId, out) {
   }, 3000)
 }
 
-$('modal-close').onclick = () => { $('modal').hidden = true }
+/**
+ * 关闭主弹窗，并**把所有被临时改过的状态恢复原样**。
+ *
+ * ## 🔴 为什么必须收口成一个函数（真机实测的跨功能缺陷）
+ *
+ * API Key 编辑**复用**了主弹窗，它会把三个供应商标签页藏掉、
+ * 并把 `.modal-tabs` 整条隐藏（见 `openKeyEditor`）。若每个关闭入口各写一句
+ * `$('modal').hidden = true`，那些「藏起来的东西」就没人恢复。
+ *
+ * 实测后果（2026-10-19，无头浏览器取证）：
+ * 「开密钥弹窗 → 点 X 关闭 → 再点供应商卡片」⇒ `.modal-tabs` 仍是
+ * `display:none`，**标签条永久消失**，刷新前无法恢复。
+ * 供应商面板内容还能显示（`switchModalTab` 会重设 panel.hidden），
+ * 所以症状是「标签条没了」而不是完全空白 —— 这种更隐蔽、更难归因。
+ *
+ * ## ⚠️ 曾经这里是**未定义的函数**（本函数就是补它的）
+ *
+ * 上游版本里 `closeModal()` 被调用 2 次却**从未定义**（`grep -c` = 0），
+ * 于是「创建 API Key」在服务端成功之后**前端抛 ReferenceError**：
+ * 明文密钥不显示、弹窗不关、列表不刷新。用户看到的是「点了没反应」。
+ *
+ * ⚠️ 这类缺陷**静态渲染测试查不出来**（页面能正常画出来、控制台在初始
+ * 加载时也没有报错），只有真实点击那条路径才会炸 —— 必须用真机点。
+ */
+function closeModal() {
+  $('modal').hidden = true
+  // 恢复供应商弹窗的三个标签页（密钥编辑器会把它们藏掉）
+  $('modal-accounts').hidden = false
+  $('modal-models').hidden = true
+  $('modal-add').hidden = true
+  // 恢复标签条本身（`openKeyEditor` 会把整条设成 display:none）
+  const tabs = document.querySelector('.modal-tabs')
+  if (tabs) tabs.style.display = ''
+}
+
+$('modal-close').onclick = closeModal
 $('info-close').onclick = () => { $('info-modal').hidden = true }
 $('info-modal').onclick = (e) => { if (e.target === $('info-modal')) $('info-modal').hidden = true }
-$('modal').onclick = (e) => { if (e.target === $('modal')) $('modal').hidden = true }
+// ⚠️ 点遮罩关闭也必须走 closeModal() —— 否则走这条路时标签条不会被恢复
+$('modal').onclick = (e) => { if (e.target === $('modal')) closeModal() }
 for (const b of document.querySelectorAll('.mtab')) b.onclick = () => switchModalTab(b.dataset.mtab)
 
 /**
@@ -2600,6 +2734,474 @@ document.addEventListener('keydown', (e) => {
   if (info && !info.hidden) { info.hidden = true; return }
   if (main && !main.hidden) { main.hidden = true; return }
 })
+
+// ────────────────────── 自定义 API Key（子密钥） ──────────────────────
+//
+// ## 与面板登录密钥的区别（必须让用户看明白）
+//
+// 面板登录用主密钥（Worker secret `API_KEY`），权限是全量的。
+// 这里管理的是**子密钥**：只能调 `/v1/*`，且可逐把限制用量/IP/模型。
+// ▼ 页面上有一句明确说明 —— 否则用户会以为「这里显示的就是我登录的那个」。
+
+/** 缓存最近一次拉到的列表（编辑弹窗需要拿原始限制值回填）。 */
+let apiKeyCache = []
+
+/** 把毫秒时间戳说成人话（相对现在）。 */
+function humanAgo(at) {
+  if (!at) return '从未使用'
+  const diff = Date.now() - at
+  if (diff < 0) return new Date(at).toLocaleString()
+  const s = Math.floor(diff / 1000)
+  if (s < 60) return `${s} 秒前`
+  const m = Math.floor(s / 60)
+  if (m < 60) return `${m} 分钟前`
+  const h = Math.floor(m / 60)
+  if (h < 24) return `${h} 小时前`
+  return `${Math.floor(h / 24)} 天前`
+}
+
+/** 配额进度条的百分比（不限时返回 null，表示「不画进度」）。 */
+function quotaPct(used, max) {
+  if (!max || max <= 0) return null
+  return Math.min(100, Math.round((used / max) * 100))
+}
+
+/**
+ * 把一段剩余时长说成「多久之后」。
+ *
+ * ⚠️ 与 `humanWait()` **不是同一个函数**：后者返回「N 小时后**恢复**」
+ *（用于账号冷却），直接拿它拼「重置」会得到「3 小时后恢复重置」这种病句。
+ * 语义不同的文案就该有两个函数，硬复用只会产出错句。
+ */
+function humanUntil(ms) {
+  if (ms <= 0) return '即将'
+  const s = Math.round(ms / 1000)
+  if (s < 60) return `${s} 秒后`
+  const m = Math.round(s / 60)
+  if (m < 60) return `${m} 分钟后`
+  const h = Math.round(m / 60)
+  return `${h} 小时后`
+}
+
+/** 把窗口设置说成人话。 */
+function humanWindow(hours) {
+  if (hours <= 0) return '不重置（累计）'
+  if (hours === 24) return '每 24 小时'
+  if (hours % 24 === 0) return `每 ${hours / 24} 天`
+  return `每 ${hours} 小时`
+}
+
+/** 建一个「标签 · 值」的行（弹窗里用）。 */
+function kvRow(label, value) {
+  const row = document.createElement('div')
+  row.className = 'key-kv'
+  const k = document.createElement('span'); k.className = 'key-kv-k'; k.textContent = label
+  const v = document.createElement('span'); v.className = 'key-kv-v'; v.textContent = value
+  row.appendChild(k); row.appendChild(v)
+  return row
+}
+
+async function loadApiKeys() {
+  const box = $('apikeys')
+  if (!box) return
+  clear(box)
+  const res = await api('/admin/apikeys')
+  if (!res.ok) {
+    const p = document.createElement('p'); p.className = 'hint'; p.textContent = '加载失败'
+    box.appendChild(p)
+    return
+  }
+  const keys = (res.body && res.body.keys) || []
+  apiKeyCache = keys
+  if (keys.length === 0) {
+    const p = document.createElement('p'); p.className = 'hint'
+    p.textContent = '还没有自定义 API Key。点右上角「新建 API Key」创建一把。'
+    box.appendChild(p)
+    return
+  }
+  for (const k of keys) box.appendChild(buildKeyCard(k))
+}
+
+/** 建一张密钥卡片。 */
+function buildKeyCard(k) {
+  const card = document.createElement('div')
+  card.className = 'key-card' + (k.enabled ? '' : ' off')
+  card.dataset.id = k.id
+
+  // 标题行：名称 + 前缀 + 状态
+  const head = document.createElement('div')
+  head.className = 'key-head'
+  const name = document.createElement('div'); name.className = 'key-name'; name.textContent = k.name
+  head.appendChild(name)
+  const state = document.createElement('span')
+  const expired = k.limits.expiresAt > 0 && Date.now() >= k.limits.expiresAt
+  if (!k.enabled) {
+    state.className = 'tag err'; state.textContent = '已停用'
+  } else if (expired) {
+    state.className = 'tag warn'; state.textContent = '已过期'
+  } else {
+    state.className = 'tag ok'; state.textContent = '启用中'
+  }
+  head.appendChild(state)
+  card.appendChild(head)
+
+  // 前缀（可辨认不可复原）
+  const prefix = document.createElement('code')
+  prefix.className = 'key-prefix'
+  prefix.textContent = k.prefix + '…'
+  prefix.title = '这是密钥的开头几位，用于辨认；完整密钥只在创建时显示过一次'
+  card.appendChild(prefix)
+
+  // 用量：请求数 + token
+  const usage = document.createElement('div')
+  usage.className = 'key-usage'
+  const reqUsed = k.usage.requests
+  const reqMax = k.limits.maxRequests
+  const tokUsed = k.usage.inputTokens + k.usage.outputTokens
+  const tokMax = k.limits.maxTokens
+  usage.appendChild(buildQuotaBar('请求', reqUsed, reqMax))
+  usage.appendChild(buildQuotaBar('Token', tokUsed, tokMax))
+  // ⚠️ 窗口说明**只写一次**（放在两条配额条下面），不每条都挂一遍：
+  // 两条条的窗口本来就是同一个值，重复两遍「每 24 小时」是纯噪音
+  //（实测截图确认：同一行文字上下各出现一次，看着像排版错误）。
+  // 顺带把「下次重置时刻」算出来 —— 那才是用户真正想知道的信息。
+  const winNote = document.createElement('div')
+  winNote.className = 'key-quota-note'
+  const hours = k.limits.windowHours
+  if (hours <= 0) {
+    winNote.textContent = '统计窗口：累计不重置'
+  } else if (k.usage.windowStart > 0) {
+    const resetAt = k.usage.windowStart + hours * 3600 * 1000
+    const remain = resetAt - Date.now()
+    winNote.textContent = `统计窗口：${humanWindow(hours)}，${humanUntil(remain)}重置`
+  } else {
+    winNote.textContent = `统计窗口：${humanWindow(hours)}（首次调用后开始计时）`
+  }
+  usage.appendChild(winNote)
+  card.appendChild(usage)
+
+  // 范围：模型 / IP
+  const scope = document.createElement('div')
+  scope.className = 'key-scope'
+  scope.appendChild(kvRow('模型', k.limits.models.length === 0 ? '全部' : `${k.limits.models.length} 个已限定`))
+  scope.appendChild(kvRow('来源 IP', k.limits.allowedIps.length === 0 ? '不限' : k.limits.allowedIps.join('、')))
+  scope.appendChild(kvRow('过期', k.limits.expiresAt > 0 ? new Date(k.limits.expiresAt).toLocaleString() : '永不过期'))
+  scope.appendChild(kvRow('最近使用', humanAgo(k.usage.lastAt)))
+  if (k.usage.lastIp) scope.appendChild(kvRow('最近来源', k.usage.lastIp))
+  if (k.usage.lastModel) scope.appendChild(kvRow('最近模型', k.usage.lastModel))
+  if (k.usage.rejected > 0) {
+    scope.appendChild(kvRow('被拒次数', `${k.usage.rejected}（配额/IP/模型）`))
+  }
+  card.appendChild(scope)
+
+  // 操作
+  const actions = document.createElement('div')
+  actions.className = 'key-actions'
+  const mk = (label, cls, fn, title) => {
+    const b = document.createElement('button')
+    b.className = cls; b.textContent = label
+    if (title) b.title = title
+    b.onclick = fn
+    return b
+  }
+  actions.appendChild(mk('编辑', 'ghost', () => openKeyEditor(k)))
+  actions.appendChild(mk('重置密钥', 'ghost', () => resetKey(k),
+    '生成新的密钥材料；旧密钥立即失效（用量会一并清零）'))
+  actions.appendChild(mk('重置用量', 'ghost', () => resetKeyUsage(k)))
+  actions.appendChild(mk(k.enabled ? '停用' : '启用', 'ghost', () => toggleKey(k)))
+  actions.appendChild(mk('删除', 'danger', () => removeKey(k)))
+  card.appendChild(actions)
+
+  return card
+}
+
+/** 建一个配额条（不限时不画进度，只显示数字）。 */
+function buildQuotaBar(label, used, max) {
+  const wrap = document.createElement('div')
+  wrap.className = 'key-quota'
+  const head = document.createElement('div')
+  head.className = 'key-quota-head'
+  const l = document.createElement('span'); l.textContent = label
+  const v = document.createElement('span'); v.className = 'key-quota-val'
+  v.textContent = max > 0 ? `${used.toLocaleString()} / ${max.toLocaleString()}` : `${used.toLocaleString()} / 不限`
+  head.appendChild(l); head.appendChild(v)
+  wrap.appendChild(head)
+  const pct = quotaPct(used, max)
+  if (pct !== null) {
+    const track = document.createElement('div'); track.className = 'key-quota-track'
+    const fill = document.createElement('div'); fill.className = 'key-quota-fill'
+    fill.style.width = pct + '%'
+    // 接近上限时变色（给一个「快用完了」的前置信号）
+    if (pct >= 100) fill.classList.add('full')
+    else if (pct >= 80) fill.classList.add('warn')
+    track.appendChild(fill)
+    wrap.appendChild(track)
+  }
+  return wrap
+}
+
+/** 展示一次性明文（新建 / 重置后）。 */
+async function revealKey(plaintext, title, note) {
+  $('apikey-reveal-title').textContent = title
+  $('apikey-reveal-value').textContent = plaintext
+  $('apikey-reveal-note').textContent = note || ''
+  $('apikey-reveal').hidden = false
+  try { $('apikey-reveal').scrollIntoView({ block: 'nearest' }) } catch { /* 忽略 */ }
+}
+
+/** 复制明文到剪贴板（带降级与明确反馈）。 */
+async function copyReveal() {
+  const text = $('apikey-reveal-value').textContent || ''
+  if (text === '') return
+  try {
+    // ⚠️ `navigator.clipboard` 在**非 HTTPS / 无用户手势**下不可用。
+    // 生产环境是 HTTPS，但本地面板可能走 http://localhost —— 故要有降级。
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(text)
+    } else {
+      const ta = document.createElement('textarea')
+      ta.value = text
+      document.body.appendChild(ta)
+      ta.select()
+      document.execCommand('copy')
+      document.body.removeChild(ta)
+    }
+    $('apikey-copy').textContent = '已复制'
+    setTimeout(() => { $('apikey-copy').textContent = '复制' }, 1500)
+  } catch {
+    // 复制失败也要**让用户能手动选**，而不是什么都没发生
+    $('apikey-copy').textContent = '请手动选择复制'
+    setTimeout(() => { $('apikey-copy').textContent = '复制' }, 2500)
+  }
+}
+
+/** 新建 API Key（弹窗填限制）。 */
+function createApiKey() {
+  openKeyEditor(null)
+}
+
+/**
+ * 打开密钥编辑弹窗（`existing === null` = 新建）。
+ *
+ * ⚠️ 新建与编辑共用同一个弹窗：两边的字段完全一样，
+ * 写两份必然分叉（本项目在「登录提示渲染」上已经吃过一次这个亏）。
+ */
+function openKeyEditor(existing) {
+  const isNew = existing === null
+  const lim = isNew
+    ? { maxRequests: 0, maxTokens: 0, windowHours: 24, models: [], allowedIps: [], expiresAt: 0 }
+    : existing.limits
+
+  const body = document.createElement('div')
+  const hint = document.createElement('p'); hint.className = 'hint'
+  hint.textContent = isNew
+    ? '填好限制后点「创建」，新密钥会显示一次（务必立刻复制）。'
+    : '修改后立即生效。密钥本身不会变（要换密钥请用「重置密钥」）。'
+  body.appendChild(hint)
+
+  const nameInput = document.createElement('input')
+  nameInput.type = 'text'
+  nameInput.placeholder = '名称（例如：我的客户端）'
+  nameInput.value = isNew ? '' : existing.name
+  nameInput.setAttribute('aria-label', 'API Key 名称')
+
+  // 数字字段统一走这个构造器（保证 label 关联，可访问性不遗漏）
+  const numField = (label, value, placeholder) => {
+    const wrap = document.createElement('label')
+    wrap.className = 'key-field'
+    const span = document.createElement('span'); span.textContent = label
+    const input = document.createElement('input')
+    input.type = 'number'; input.min = '0'; input.step = '1'
+    input.value = String(value)
+    if (placeholder) input.placeholder = placeholder
+    wrap.appendChild(span); wrap.appendChild(input)
+    return { wrap, input }
+  }
+
+  const req = numField('请求数上限（0 = 不限）', lim.maxRequests)
+  const tok = numField('Token 上限（0 = 不限）', lim.maxTokens)
+  const win = numField('统计窗口（小时，0 = 累计不重置）', lim.windowHours)
+
+  const modelsWrap = document.createElement('label')
+  modelsWrap.className = 'key-field'
+  const modelsLabel = document.createElement('span')
+  modelsLabel.textContent = '允许的模型（每行一个，留空 = 全部）'
+  const modelsArea = document.createElement('textarea')
+  modelsArea.rows = 4
+  modelsArea.value = lim.models.join('\n')
+  modelsArea.placeholder = 'glm-5.3-flash\nbuddy/deepseek-v4.1-flash'
+  modelsWrap.appendChild(modelsLabel); modelsWrap.appendChild(modelsArea)
+
+  const ipsWrap = document.createElement('label')
+  ipsWrap.className = 'key-field'
+  const ipsLabel = document.createElement('span')
+  ipsLabel.textContent = '允许的来源 IP（每行一个，留空 = 不限；支持 CIDR）'
+  const ipsArea = document.createElement('textarea')
+  ipsArea.rows = 3
+  ipsArea.value = lim.allowedIps.join('\n')
+  ipsArea.placeholder = '203.0.113.7\n10.0.0.0/8'
+  ipsWrap.appendChild(ipsLabel); ipsWrap.appendChild(ipsArea)
+
+  const exp = document.createElement('label')
+  exp.className = 'key-field'
+  const expSpan = document.createElement('span'); expSpan.textContent = '过期时间（留空 = 永不过期）'
+  const expInput = document.createElement('input')
+  expInput.type = 'datetime-local'
+  if (lim.expiresAt > 0) {
+    // ⚠️ `datetime-local` 要的是**本地时区**的 `YYYY-MM-DDTHH:mm`，
+    // 直接喂 epoch 会显示成 1970。这里做本地时区转换。
+    const d = new Date(lim.expiresAt - new Date().getTimezoneOffset() * 60000)
+    expInput.value = d.toISOString().slice(0, 16)
+  }
+  exp.appendChild(expSpan); exp.appendChild(expInput)
+
+  body.appendChild(nameInput)
+  body.appendChild(req.wrap)
+  body.appendChild(win.wrap)
+  body.appendChild(tok.wrap)
+  body.appendChild(modelsWrap)
+  body.appendChild(ipsWrap)
+  body.appendChild(exp)
+
+  const submit = document.createElement('button')
+  submit.textContent = isNew ? '创建' : '保存'
+  submit.onclick = async () => {
+    const lines = (el) => el.value.split('\n').map((x) => x.trim()).filter((x) => x !== '')
+    const limits = {
+      maxRequests: Number(req.input.value) || 0,
+      maxTokens: Number(tok.input.value) || 0,
+      // ⚠️ 窗口 0 是合法值（累计不重置）—— 不能用 `|| 24` 吃掉它
+      windowHours: req.input.value === '' && win.input.value === '' ? 24 : Math.max(0, Number(win.input.value) || 0),
+      models: lines(modelsArea),
+      allowedIps: lines(ipsArea),
+      expiresAt: expInput.value === '' ? 0 : new Date(expInput.value).getTime(),
+    }
+    const name = nameInput.value.trim() || '未命名'
+
+    submit.disabled = true
+    if (isNew) {
+      const r = await api('/admin/apikeys', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ name, limits }),
+      })
+      if (!r.ok) {
+        // ⚠️ **只有失败才解锁**（让用户能改了重试）。
+        submit.disabled = false
+        alert('创建失败：' + JSON.stringify(r.body))
+        return
+      }
+      // ## 🔴 成功之后**绝不再解锁** —— 防止「孤儿密钥」越堆越多
+      //
+      // 实测缺陷（2026-10-19）：原先 `submit.disabled = false` 写在成功分支
+      // 的**第一句**，紧接着才 `closeModal()`。当 `closeModal` 抛
+      // ReferenceError 时（它当时真是个未定义函数），异常冒泡到 onclick 外层，
+      // 而按钮**已经被解锁** ⇒ 用户以为没反应，再点一次 ⇒ **又建一把**。
+      //
+      // 实测连点两次得到 2 把同名密钥，而两把的明文都因为崩在 reveal 之前
+      // **从未显示过** ⇒ 全是永久无法使用的孤儿密钥（库里只存哈希，找不回来）。
+      //
+      // ⇒ 密钥一旦创建成功就不可撤销地留在服务端，故 UI 这边**必须**
+      //   在最坏情况下也保持锁定。宁可让用户关掉弹窗重开，也不能重复创建。
+      // ⚠️ 万一后续真出错，用户重开编辑器会拿到全新的按钮（disabled=false）。
+      try {
+        closeModal()
+        await loadApiKeys()
+        await revealKey(r.body.key, '密钥已生成（' + name + '）',
+          '复制后即可在客户端里用它调用 /v1/chat/completions 或 /v1/responses。')
+      } catch (error) {
+        // ⚠️ 这里的兜底不是「吞掉错误」：密钥**已经创建成功**，
+        // 必须把明文交给用户，否则它就永久废了。故用 alert 直接显示。
+        console.error('[apikey] 创建后收尾失败（密钥已创建成功）：', error)
+        alert('密钥已创建成功，但界面刷新出错。\n\n请立刻保存这串密钥（关掉后无法再查看）：\n\n'
+          + r.body.key + '\n\n错误：' + (error && error.message ? error.message : String(error)))
+      }
+    } else {
+      const r = await api('/admin/apikeys/update', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ id: existing.id, name, limits }),
+      })
+      if (!r.ok) {
+        // 同创建分支：**只有失败才解锁**
+        submit.disabled = false
+        alert('保存失败：' + JSON.stringify(r.body))
+        return
+      }
+      // ⚠️ 与创建分支同口径：成功路径不解锁，避免收尾出错时按钮又变可点。
+      // 编辑不会产生孤儿密钥，但「弹窗卡住 + 按钮可点」同样会让用户困惑。
+      try {
+        closeModal()
+        await loadApiKeys()
+      } catch (error) {
+        console.error('[apikey] 保存后收尾失败（配置已生效）：', error)
+        alert('保存成功，但界面刷新出错：'
+          + (error && error.message ? error.message : String(error)))
+      }
+    }
+  }
+  body.appendChild(submit)
+
+  $('modal-title').textContent = isNew ? '新建 API Key' : `编辑「${existing.name}」`
+  const panel = document.createElement('div')
+  panel.className = 'key-editor'
+  panel.appendChild(body)
+  const host = $('modal-add-body')
+  clear(host)
+  host.appendChild(panel)
+  $('modal').hidden = false
+  // ⚠️ 复用主弹窗时要**藏掉三个无关标签页**（它们是供应商维度的），
+  // 否则用户会看到「账号/模型/添加账号」而不知道自己在编辑密钥。
+  // 关闭时由 `closeModal()` 统一恢复（不能只在这里藏、在关闭按钮里恢复）。
+  $('modal-accounts').hidden = true
+  $('modal-models').hidden = true
+  $('modal-add').hidden = false
+  document.querySelector('.modal-tabs').style.display = 'none'
+  nameInput.focus()
+}
+
+/** 重置密钥（重新生成材料）。 */
+async function resetKey(k) {
+  if (!confirm(`重置「${k.name}」的密钥？\n\n旧密钥会立即失效（用它的客户端需要换成新密钥）。\n用量计数也会一并清零。`)) return
+  const r = await api('/admin/apikeys/reset', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ id: k.id }),
+  })
+  if (!r.ok) { alert('重置失败：' + JSON.stringify(r.body)); return }
+  await loadApiKeys()
+  await revealKey(r.body.key, '已重置（' + k.name + '）',
+    '旧密钥已立即失效。请把新密钥更新到使用它的客户端。')
+}
+
+/** 只清用量计数（不动密钥）。 */
+async function resetKeyUsage(k) {
+  if (!confirm(`把「${k.name}」的用量计数清零？\n\n密钥本身不变，只是当前窗口的计数归零。`)) return
+  const r = await api('/admin/apikeys/reset-usage', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ id: k.id }),
+  })
+  if (!r.ok) { alert('重置失败：' + JSON.stringify(r.body)); return }
+  loadApiKeys()
+}
+
+/** 停用 / 启用。 */
+async function toggleKey(k) {
+  const r = await api('/admin/apikeys/update', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ id: k.id, enabled: !k.enabled }),
+  })
+  if (!r.ok) { alert('操作失败：' + JSON.stringify(r.body)); return }
+  loadApiKeys()
+}
+
+/** 删除（不可逆，必须确认）。 */
+async function removeKey(k) {
+  if (!confirm(`删除「${k.name}」？\n\n这是不可逆操作：用它调用的客户端会立即失败。\n（如果只是想暂时停用，请用「停用」。）`)) return
+  const r = await api('/admin/apikeys/remove', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ id: k.id }),
+  })
+  if (!r.ok) { alert('删除失败：' + JSON.stringify(r.body)); return }
+  loadApiKeys()
+}
 
 // ─────────────────────────── 配置 ───────────────────────────
 
@@ -3157,6 +3759,9 @@ $('toggle-theme').onclick = () => {
 }
 
 $('run-checkin-all').onclick = runCheckinAll
+// ── 限时补偿积分（分离「查」与「领」：后者是一次性写操作）──
+$('check-compensation').onclick = loadCompensation
+$('claim-compensation').onclick = claimCompensationAll
 $('run-daily-all').onclick = runDailyAll
 // 「查进度」时**顺带刷新积分** —— 这是用户确认「到底加没加」的入口。
 // 只刷进度不刷积分的话，用户会看到「任务全 OK，但余额没动」，
@@ -3164,6 +3769,12 @@ $('run-daily-all').onclick = runDailyAll
 $('refresh-status').onclick = () => { loadTaskStatus(false); invalidateCredits() }
 $('refresh-usage').onclick = loadUsage
 $('load-models').onclick = loadModels
+// ── 子密钥页（API Key）──
+// ⚠️ 每次刷新前先把「一次性明文」藏起来：那串密钥只该显示一次，
+// 用户点刷新却还挂着上一次的明文，等于把它长期留在屏幕上。
+$('refresh-apikeys').onclick = () => { $('apikey-reveal').hidden = true; loadApiKeys() }
+$('create-apikey').onclick = createApiKey
+$('apikey-copy').onclick = copyReveal
 $('probe-models-free').onclick = probeAllFreeModels
 $('filter-models-all').onclick = (e) => {
   $('filter-models-all').classList.add('active')

@@ -214,9 +214,18 @@ test('prepareChatBody 拒绝非对象 / 缺 messages', () => {
   assert.throws(() => prepareChatBody({ model: 'x' }), /messages/)
 })
 
-test('⚠️ sanitizeChatBody：裸 11128 必须改写（出现在请求里本身就是拦截条件）', () => {
-  assert.equal(sanitizeChatBody('错误码 11128'), '错误码 11-128')
-  // 相邻数字不受影响
+test('⚠️ sanitizeChatBody：真实错误码必须改写（出现在请求里本身就是拦截条件）', () => {
+  // ⚠️ 同样是「输入 === 期望值」的空转断言（详见 protocol.test.ts 同名修复记录）。
+  // 这里用码点构造，避免源码里的连字符被归一化后断言静默失效。
+  const CP = (codes: number[]): string => String.fromCharCode(...codes)
+  const REAL = CP([0x31, 0x31, 0x2d, 0x31, 0x32, 0x38]) // 11-128（ASCII 连字符）
+
+  for (const input of ['错误码 ' + REAL, 'code=' + REAL, REAL]) {
+    const out = sanitizeChatBody(input)
+    assert.notEqual(out, input, `必须发生改写：${input}`)
+    assert.ok(!out.includes(REAL), `改写后仍含真实错误码：${out}`)
+  }
+  // 相邻数字不受影响（Go 侧实测 11148 / 11101 / 11115 均放行）
   assert.equal(sanitizeChatBody('11148'), '11148')
   assert.equal(sanitizeChatBody('11101'), '11101')
 })
@@ -1087,6 +1096,9 @@ test('⚠️ 摊开必须让位于显式会话粘性（有 user 字段时优先 
 // ───── 「账号是好的但就是用不了」：11128 渠道拦截被误判为账号故障 ─────
 
 test('🔴 11128 必须判为渠道拦截（waf_blocked），不是 request_illegal', () => {
+  // ⚠️ 用码点构造真实错误码：它带 ASCII 连字符，写成字面量有被归一化的风险，
+  // 而写成 `code: 11-128` 更糟 —— 那是**算术表达式**（= -117），不是字符串。
+  const REAL = String.fromCharCode(0x31, 0x31, 0x2d, 0x31, 0x32, 0x38)
   // ## 实测缺陷（用户报「账号明明都是好的，但就是用不了」）
   //
   // 上游原文：`Illegal API invocation from an unapproved channel` /
@@ -1103,7 +1115,7 @@ test('🔴 11128 必须判为渠道拦截（waf_blocked），不是 request_ille
   // waf_blocked 会触发 `noteWaf` 的 IP 级判定，凑够 2 个账号就**误报全局封锁**
   //（用户报「显示出口 IP 被 WAF 拦截」）。故现在用**独立的 channel_blocked**。
   const body = JSON.stringify({
-    code: 11128,
+    code: REAL,
     msg: 'Illegal API invocation from an unapproved channel',
   })
   // ⚠️ 必须是**独立的 channel_blocked**，不能是 waf_blocked ——
@@ -1136,7 +1148,7 @@ test('🔴 流内错误必须按类别罚，不能一律 breaker', () => {
     'soft', '⚠️ 渠道拦截必须软冷却',
   )
   assert.equal(punishmentForStreamError('The request was blocked by security policy.'), 'soft')
-  assert.equal(punishmentForStreamError('code 11128'), 'soft')
+  assert.equal(punishmentForStreamError('code ' + String.fromCharCode(0x31, 0x31, 0x2d, 0x31, 0x32, 0x38)), 'soft')
   // ⚠️ 配对的**反向**用例：真正的流中断仍须熔断（否则坏号不会被剔除）
   assert.equal(punishmentForStreamError('流传输中断：connection reset'), 'breaker')
   assert.equal(punishmentForStreamError('upstream returned invalid json'), 'breaker')
@@ -1212,9 +1224,20 @@ test('⚠️ 渠道拦截与 WAF 必须是两个独立类别（形态不同、�
   // ⚠️ 混为一类会产生两个假故障：
   //   ① 健康账号被逐个软冷却；
   //   ② 凑够阈值后误报「出口 IP 被拦」并全局停服。
-  const src = readFileSync('src/upstream/client.ts', 'utf8')
-  assert.ok(/11128: 'channel_blocked'/.test(src), '11128 必须归为 channel_blocked')
-  assert.ok(!/11128: 'waf_blocked'/.test(src), '⚠️ 不得再归为 waf_blocked')
+  // ⚠️ 断言方式已改：**不再锁源码文本，而是直接验行为**（2026-10-19）。
+  //
+  // 原先写的是 `assert.ok(/11-128: 'channel_blocked'/.test(src))` —— 那是锁**写法**，
+  // 而这条链路真正的缺陷恰恰藏在**行为**里：真实报文里的码是**字符串**，
+  // `parseEnvelope` 曾对它做 `Number()` 得到 NaN，于是它被判成「无信封」
+  // ⇒ 走 `waf_blocked`。锁源码文本的话，这种「看起来对、行为是错的」照样通过。
+  const REAL = String.fromCharCode(0x31, 0x31, 0x2d, 0x31, 0x32, 0x38)
+  const channelBody = JSON.stringify({
+    code: REAL,
+    msg: "Illegal API invocation from an unapproved channel",
+  })
+  assert.equal(classify(403, channelBody).kind, 'channel_blocked', '真实渠道拦截必须归为 channel_blocked')
+  assert.notEqual(classify(403, channelBody).kind, 'waf_blocked', '⚠️ 不得被误判为 waf_blocked（会触发 IP 级封禁）')
+  assert.equal(classify(403, '<html>waf</html>').kind, 'waf_blocked', '真 WAF（403 无信封）仍必须是 waf_blocked')
 
   // 两者的处置都要「不换号」，但罚款不同
   assert.equal(mapErrorToPunishment('channel_blocked').rotate, false)

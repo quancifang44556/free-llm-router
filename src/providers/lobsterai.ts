@@ -526,6 +526,17 @@ async function listModels(credential: ProviderCredential, signal: AbortSignal): 
     // （`lobsterai-adapter.ts:270-290` 的「不编造值」约定）。
     const contextWindow = readNumber(record, 'contextWindow')
     const maxTokens = readNumber(record, 'maxTokens')
+    // ## 🔴 `costMultiplier` —— 上游**真实下发**的计费倍率（实测 `0.05`）
+    //
+    // 实测（只读诊断 dump 原始条目，2026-10-11）：上游 `/api/models/available`
+    // 的条目有 **`costMultiplier`** 字段（`deepseek-flash` = `0.05`），
+    // 还有 `limitedFree` / `limitedFreeActive`（限时免费标记）。
+    //
+    // ⚠️ 我们此前**只读了 modelId / modelName / contextWindow / maxTokens**，
+    // 把倍率与免费标记**一起丢掉了** ⇒ 面板那一列全空。
+    // ⚠️ **教训（这次是第三次同型）**：先去上游原始响应里找字段，
+    // 不要因为「解析后的形状里没有」就断定上游没有。
+    const priceFactor = readNumber(record, 'costMultiplier')
     models.push({
       id,
       name: name.length > 0 ? name : id,
@@ -535,8 +546,13 @@ async function listModels(credential: ProviderCredential, signal: AbortSignal): 
       // ⚠️ 缺字段时给 false 而非 true：谎报支持图片会让请求被上游按体积拒绝
       // （`lobsterai-product.ts` 记录过 12 张原图能过、13 张 500 的实测）。
       supportsImage: record.supportsImage === true,
-      // LobsterAI 没有「免费额度模型」标记；远端也没有该字段，如实为 false。
-      isFree: false,
+      // ⚠️ 倍率为 0 或缺失时**不给该字段**（`undefined` = 上游没提供），
+      // 而不是给 0 —— 那会显示成「免费」，把付费模型说成免费。
+      ...(priceFactor > 0 ? { priceFactor } : {}),
+      // ⚠️ 「免费」判据用上游的 `limitedFreeActive`
+      //（`limitedFree` 是「有这个活动」，`Active` 才是「**现在**生效」——
+      //  只读前者会把已结束的活动当成免费）。
+      isFree: record.limitedFreeActive === true,
     })
   }
   return models.length > 0 ? models : fallbackModels()

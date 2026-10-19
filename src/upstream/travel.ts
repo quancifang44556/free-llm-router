@@ -73,7 +73,7 @@ async function growthCall(
     httpStatus: res.httpStatus,
     data: res.envelope?.data,
     raw: res.raw,
-    code: res.envelope?.code,
+    code: typeof res.envelope?.code === 'number' ? res.envelope.code : undefined,
     msg: c.msg,
   }
 }

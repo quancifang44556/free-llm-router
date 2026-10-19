@@ -25,6 +25,7 @@
       <button class="nav-item active" data-view="providers">供应商与账号</button>
       <button class="nav-item" data-view="tasks">任务中心</button>
       <button class="nav-item" data-view="usage">用量</button>
+      <button class="nav-item" data-view="apikeys">API Key</button>
       <button class="nav-item" data-view="models">模型</button>
       <button class="nav-item" data-view="config">配置</button>
       <button class="nav-item" data-view="logs">日志</button>
@@ -64,6 +65,18 @@
     <p class="hint">点一下就跑完，不用选。所有任务都是幂等的，重复点安全。</p>
 
     <div class="task-cards">
+      <div class="task-card">
+        <h3>限时补偿积分</h3>
+        <p class="hint">查当前有没有可领的限时补偿（例如服务抖动后补 500 积分）。
+        先「查状态」是只读的；「领取」才是写操作，且<b>只领确实可领的账号</b> ——
+        已领过的会跳过，不会重复打上游。</p>
+        <div class="page-tools">
+          <button class="ghost" id="check-compensation">查状态</button>
+          <button id="claim-compensation">领取</button>
+        </div>
+        <p class="hint" id="compensation-result"></p>
+      </div>
+
       <div class="task-card">
         <h3>全部供应商一键签到</h3>
         <p class="hint">对所有账号逐个签到（串行，避免触发风控）。
@@ -143,6 +156,45 @@
   </section>
 
   <!-- ───────── 模型 ───────── -->
+  <!-- ───────── API Key（子密钥） ───────── -->
+  <!--
+    ⚠️ 这一页管理的是**子密钥**（发给外部调用方的受限密钥），
+    与登录面板用的主密钥（`API_KEY`）是两件事。页面顶部会明确说清这点 ——
+    否则用户会以为「这里显示的是我登录用的那个密钥」。
+  -->
+  <section class="view" id="view-apikeys" hidden>
+    <div class="page-head">
+      <h2>API Key</h2>
+      <div class="page-tools">
+        <button class="ghost" id="refresh-apikeys">刷新</button>
+        <button id="create-apikey">新建 API Key</button>
+      </div>
+    </div>
+
+    <p class="hint">
+      这里的密钥用于外部应用调用本服务的 <code>/v1/*</code> 接口，
+      可以逐个限制用量、来源 IP 与可用模型。
+      它<b>只能</b>调 <code>/v1/*</code>，不能登录面板、不能改账号。
+    </p>
+
+    <!-- 新建 / 重置后的一次性明文展示（**只出现一次**） -->
+    <section class="panel" id="apikey-reveal" hidden>
+      <div class="panel-head">
+        <h3 id="apikey-reveal-title">密钥已生成</h3>
+      </div>
+      <p class="hint">
+        ⚠️ 请立刻复制保存 —— 关闭后<b>无法再次查看</b>（服务端只存哈希）。
+      </p>
+      <div class="key-reveal">
+        <code id="apikey-reveal-value"></code>
+        <button class="ghost" id="apikey-copy">复制</button>
+      </div>
+      <p class="hint" id="apikey-reveal-note"></p>
+    </section>
+
+    <div id="apikeys" class="key-grid"></div>
+  </section>
+
   <section class="view" id="view-models" hidden>
     <div class="page-head">
       <h2>模型目录</h2>

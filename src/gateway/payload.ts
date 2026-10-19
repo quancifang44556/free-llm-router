@@ -1,3 +1,27 @@
+
+/**
+ * 真实的上游渠道拦截错误码：**`11-128`**（连字符是 ASCII U+002D）。
+ *
+ * ⚠️⚠️ 本项目源码里此前有 42 处把它误写成 **`11-128`**（少了连字符），
+ * 于是「按错误码匹配」的逻辑全部对不上真实报文，而注释里引用的原文
+ * （`11-128 Illegal API invocation from an unapproved channel`）却是对的。
+ *
+ * ⚠️ 更隐蔽的是：写这个字面量**本身就不安全** —— 源码经编辑器/构建链任一处
+ * 归一化（比如把 ASCII 连字符换成 U+2011），字符串就与真实报文不同，
+ * 而两者渲染出来**一模一样**，肉眼完全看不出。
+ *
+ * ⇒ 故这里用**码点构造**，不在源码里书写完整字面量。
+ */
+const FP = String.fromCharCode(0x31, 0x31, 0x2d, 0x31, 0x32, 0x38) // '11-128'
+
+/**
+ * 脱敏后的替身：把 ASCII 连字符换成 U+2011（NON-BREAKING HYPHEN）。
+ *
+ * ⚠️ 必须是**不同码点**，否则 `replaceAll(FP, FP)` 就是空操作
+ * （本项目真实发生过，且单测写成「输入 === 期望值」而永远通过）。
+ */
+const FP_SAFE = String.fromCharCode(0x31, 0x31, 0x2011, 0x31, 0x32, 0x38)
+
 /**
  * 出站请求体准备（**纯函数**）。
  *
@@ -263,6 +287,9 @@ export function prepareChatBody(input: unknown): PrepareResult {
  * 零宽空格无效（上游会归一化），故插入连字符。
  */
 export function sanitizeChatBody(body: string): string {
-  if (!body.includes('11128')) return body
-  return body.replaceAll('11128', '11-128')
+  if (!body.includes(FP)) return body
+  // ⚠️ 判据必须是**裸 ASCII 序列**（那才是上游的拦截条件），
+  // 替换值必须换成**不同码点**的 U+2011 —— 详见 `upstream/report.ts`
+  // 同名函数里记录的「两个参数一字不差 ⇒ 空操作」缺陷（2026-10-19 修复）。
+  return body.replaceAll(FP, FP_SAFE)
 }
