@@ -2296,19 +2296,49 @@ async function loadModalAccounts() {
       const p = byUid.get(uid)
       const total = p === undefined ? undefined : p.total
       const err = p === undefined ? undefined : p.error
-      if (typeof total === 'number' && total > 0) {
-        el.textContent = total.toLocaleString('zh-CN') + ' 积分'
-        el.title = '该账号剩余积分（实时查上游）'
-      } else if (typeof err === 'string' && err !== '') {
-        // ⚠️ 查失败要说**原因**，不能只显示 `—` —— 否则用户以为「这家没额度」，
-        // 而真实原因可能是「登录态过期」（该重新登录）或「上游不支持查余额」。
+      // ── 额度分级（把「没钱」与「查不到」分开）──
+      //
+      // ⚠️⚠️ 原实现是 `total > 0` 才显示积分，否则落到最后的 `—`。
+      // 后果：**额度用光（total === 0）与查不到（p === undefined）在界面上完全一样**，
+      // 都是 `—`。而两者的处置相反 ——
+      //   「用光了」要去充值/换号；「查不到」要查网络/凭据。
+      // 这正是本项目反复禁止的「静默失败」形态。
+      // ⚠️ 顺序很重要：**「查询失败」「不支持查余额」比额度分级更具体**，
+      // 必须先判。否则 unknown 会把它们吞掉、统一显示成 '—'，
+      // 而真实原因（凭据过期 / 该家不支持）就永远看不到。
+      const failed = typeof err === 'string' && err !== ''
+      const unsupported = !failed && p !== undefined && p.skipped === true
+
+      const quotaLevel = (failed || unsupported || p === undefined || typeof total !== 'number')
+        ? 'unknown'
+        : total <= 0 ? 'exhausted'
+        : (typeof p.expiring === 'number' && p.expiring >= total && total > 0) ? 'critical'
+        : (typeof p.expiring === 'number' && total > 0 && p.expiring / total >= 0.6) ? 'tight'
+        : 'ok'
+
+      if (failed) {
         el.textContent = '查询失败'
         el.title = err
         el.style.color = 'var(--err)'
-      } else if (p !== undefined && p.skipped === true) {
-        // 后端用它标记「该供应商不支持查余额」—— 不该显示成「查询失败」
+      } else if (unsupported) {
         el.textContent = '不支持查余额'
         el.title = typeof p.reason === 'string' ? p.reason : '该供应商不支持查余额'
+      } else if (quotaLevel === 'exhausted') {
+        // ⚠️ 明确写「0 积分」而不是 `—`：用户必须能区分「用光了」与「查不到」
+        el.textContent = '0 积分（已用尽）'
+        el.title = '该账号积分已用尽，需要充值或换号'
+        el.style.color = 'var(--err)'
+      } else if (quotaLevel === 'critical') {
+        el.textContent = total.toLocaleString('zh-CN') + ' 积分（全部临期）'
+        el.title = '该账号剩余积分全部是临期额度，即将过期'
+        el.style.color = 'var(--warn, #b45309)'
+      } else if (quotaLevel === 'tight') {
+        el.textContent = total.toLocaleString('zh-CN') + ' 积分（' + p.expiring.toLocaleString('zh-CN') + ' 临期）'
+        el.title = '大部分额度即将过期，建议优先使用'
+        el.style.color = 'var(--warn, #b45309)'
+      } else if (quotaLevel === 'ok' && typeof total === 'number' && total > 0) {
+        el.textContent = total.toLocaleString('zh-CN') + ' 积分'
+        el.title = '该账号剩余积分（实时查上游）'
       } else {
         el.textContent = '—'
         el.title = '未查到积分（该账号可能在冷却，或上游未返回额度）'
