@@ -147,9 +147,11 @@ function clear(el) { while (el.firstChild) el.removeChild(el.firstChild) }
  *   用于「冷却中 / 模型限流」—— 用户要求点开能看到**具体是哪些账号/模型**。
  *   计数本身说明不了问题：看到「冷却中 3」但不知道是哪 3 个，等于没信息。
  */
-function countBlock(label, value, onClick) {
+function countBlock(label, value, onClick, tone) {
   const d = document.createElement('div')
   d.className = onClick ? 'count clickable' : 'count'
+  // tone 只决定标签前的小色点（ok / warn / err / info / accent），数字本身保持中性色
+  d.dataset.tone = tone || 'accent'
   const b = document.createElement('b'); b.textContent = String(value)
   const s = document.createElement('span'); s.textContent = label
   d.appendChild(b); d.appendChild(s)
@@ -286,13 +288,13 @@ async function loadPool() {
   clear(box)
   if (!res.ok || !res.body || !res.body.counts) return
   const c = res.body.counts
-  box.appendChild(countBlock('总账号', c.total))
-  box.appendChild(countBlock('可用', c.healthy))
+  box.appendChild(countBlock('总账号', c.total, null, 'info'))
+  box.appendChild(countBlock('可用', c.healthy, null, 'ok'))
   // ⚠️ 这两项**必须可点开**：只给一个数字，用户不知道是哪个账号/哪个模型，
   // 也就无法判断「该等一会」还是「该重新登录」。
-  box.appendChild(countBlock('冷却中', c.cooling, () => showCoolingDetail()))
-  box.appendChild(countBlock('模型限流', c.modelExempt, () => showModelThrottleDetail()))
-  box.appendChild(countBlock('已禁用', c.disabled))
+  box.appendChild(countBlock('冷却中', c.cooling, () => showCoolingDetail(), 'warn'))
+  box.appendChild(countBlock('模型限流', c.modelExempt, () => showModelThrottleDetail(), 'warn'))
+  box.appendChild(countBlock('已禁用', c.disabled, null, 'err'))
   // ⚠️ **「供应商」计数块紧跟「已禁用」右边**（用户要求：放在已禁用右边）。
   // 它复用 `countBlock` 的**同款样式**（不是另做一套）—— 视觉统一。
   // 数字是**已启用的供应商数**，点开调整顺序与开关。
@@ -1832,8 +1834,16 @@ async function loadProviderCredits() {
   // 只更新徽标，不重建整张卡片（避免闪烁）
   for (const [pid, total] of Object.entries(byProvider)) {
     const el = document.querySelector(`.prov-card[data-provider="${pid}"] .prov-credits`)
-    if (el) { el.hidden = false; el.textContent = total.toLocaleString('zh-CN') }
+    // ⚠️ 与卡片首次渲染同一口径：必须带单位「积分」（之前这条刷新路径漏了单位）
+    if (el) { el.hidden = false; el.textContent = total.toLocaleString('zh-CN') + ' 积分'; el.title = '该供应商全部账号的剩余积分合计（实时查上游）' }
   }
+}
+
+/** 供应商头像色相：按 id 做个简单哈希，同一家永远同一个颜色。 */
+function providerHue(id) {
+  let h = 0
+  for (const ch of String(id)) h = (h * 31 + ch.charCodeAt(0)) % 360
+  return h
 }
 
 async function loadProviders() {
@@ -1919,9 +1929,18 @@ async function loadProviders() {
     }
     card.appendChild(credits)
 
+    // 头部：首字母头像（色相由 id 决定，稳定不随排序变）+ 名称 + id
+    const head = document.createElement('div'); head.className = 'prov-head'
+    const avatar = document.createElement('span'); avatar.className = 'prov-avatar'
+    avatar.setAttribute('aria-hidden', 'true')
+    avatar.textContent = (prov.name || prov.id || '?').trim().charAt(0).toUpperCase()
+    avatar.style.setProperty('--h', String(providerHue(prov.id)))
+    const titles = document.createElement('div'); titles.className = 'prov-titles'
     const name = document.createElement('div'); name.className = 'prov-name'; name.textContent = prov.name
     const id = document.createElement('div'); id.className = 'prov-id'; id.textContent = prov.id
-    card.appendChild(name); card.appendChild(id)
+    titles.appendChild(name); titles.appendChild(id)
+    head.appendChild(avatar); head.appendChild(titles)
+    card.appendChild(head)
 
     const caps = document.createElement('div'); caps.className = 'caps'
     for (const [key, label] of CAPS) {
@@ -1942,6 +1961,16 @@ async function loadProviders() {
       off.textContent = '已关闭（不参与 API）'
       card.appendChild(off)
     }
+    // 底部：账号数 + 「管理」入口（让「整张卡可点」这件事一眼可见）
+    const foot = document.createElement('div'); foot.className = 'prov-foot'
+    const n = accountCounts[prov.id] || 0
+    const accts = document.createElement('span')
+    accts.className = 'prov-accts' + (n > 0 ? ' has' : '')
+    accts.textContent = n > 0 ? n + ' 个账号' : '暂无账号'
+    const manage = document.createElement('span'); manage.className = 'prov-manage'
+    manage.textContent = '管理 →'
+    foot.appendChild(accts); foot.appendChild(manage)
+    card.appendChild(foot)
     box.appendChild(card)
   }
 
@@ -1986,6 +2015,7 @@ function openProviderManager() {
   body.appendChild(hint)
 
   const list = document.createElement('div')
+  list.className = 'prov-mgr-list'
 
   const save = async () => {
     const r = await api('/admin/providers/settings', {
@@ -3349,6 +3379,8 @@ async function loadConfig() {
 
   const baseUrl = window.location.origin + '/v1'
   const key = apiKey() || '（请在面板填入有效密钥）'
+  // ⚠️ 主密钥只脱敏显示（前 4 位 + 圆点），复制按钮复制完整值 —— 配置页常被截图分享
+  const maskedKey = apiKey() ? key.slice(0, 4) + '••••••••' + (key.length > 12 ? key.slice(-2) : '') : key
 
   // 1. 客户端接入指南卡片
   const clientCard = document.createElement('div')
@@ -3369,7 +3401,7 @@ async function loadConfig() {
   const fields = document.createElement('div')
   fields.className = 'config-fields'
 
-  function addCopyField(label, val) {
+  function addCopyField(label, val, shown) {
     const f = document.createElement('div')
     f.className = 'config-field-item'
     const lbl = document.createElement('span')
@@ -3380,7 +3412,8 @@ async function loadConfig() {
     const code = document.createElement('code')
     code.className = 'copyable-code'
     code.title = '轻触即可全选复制'
-    code.textContent = val
+    // shown：屏幕上显示的文本（主密钥脱敏，防止截图/旁人看到）；复制的始终是完整值
+    code.textContent = shown || val
     code.onclick = () => copyText(val, '已复制 ' + label)
     const copy = document.createElement('button')
     copy.className = 'ghost small'
@@ -3394,7 +3427,7 @@ async function loadConfig() {
   }
 
   addCopyField('API Base URL', baseUrl)
-  addCopyField('API Key (Bearer)', key)
+  addCopyField('API Key (Bearer)', key, maskedKey)
   addCopyField('推荐默认模型', 'buddy/deepseek-v4.1-flash')
   addCopyField('临期优选聚合模型', 'aggregate/auto')
 
@@ -3409,7 +3442,8 @@ async function loadConfig() {
     + '  -H "Authorization: Bearer ' + key + '" \\\n'
     + '  -H "Content-Type: application/json" \\\n'
     + '  -d \'{"model":"buddy/deepseek-v4.1-flash","messages":[{"role":"user","content":"Hi"}]}\''
-  curlPre.textContent = curlCmd
+  // 屏幕上的 cURL 同样脱敏；复制按钮给完整命令
+  curlPre.textContent = curlCmd.split(key).join(maskedKey)
   const curlBtn = document.createElement('button')
   curlBtn.className = 'ghost small copy-curl-btn'
   curlBtn.textContent = '复制 cURL 示例命令'
@@ -3588,7 +3622,7 @@ async function loadConfig() {
     ['Cron 触发', '每小时 1 次（0 * * * *）'],
     ['任务时点（UTC+8）', '09 签到 / 10 活跃 / 21 签到'],
     ['凭据加密', 'AES-GCM（密钥来自 CREDENTIAL_KEY secret）'],
-    ['运行环境', 'Cloudflare Workers (V8 Serverless + Durable Object SQLite)'],
+    ['运行环境', 'Cloudflare Workers 或 Node / VPS（两者均用 SQLite 持久化）'],
   )
 
   statusCard.appendChild(wrapTable(buildTable(['项', '值'], pairs)))
@@ -3626,54 +3660,39 @@ async function loadPermanentLocks() {
     return
   }
 
+  // 每家一行：名称 + 状态说明 + 开关（开 = 已锁，保护永久积分）
   for (const p of providers) {
     const isLocked = Boolean(locks[p.id])
-    const card = document.createElement('div')
-    card.className = 'key-card' + (isLocked ? '' : ' off')
+    const row = document.createElement('div')
+    row.className = 'lock-row' + (isLocked ? ' on' : '')
 
-    const head = document.createElement('div')
-    head.className = 'key-head'
-
+    const main = document.createElement('div')
+    main.className = 'lock-main'
     const name = document.createElement('div')
-    name.className = 'key-name'
+    name.className = 'lock-name'
     name.textContent = p.name || p.id
-    head.appendChild(name)
+    const state = document.createElement('div')
+    state.className = 'lock-state'
+    state.textContent = isLocked ? '已锁定 · 永久积分受保护' : '未锁定 · 可能消耗永久积分'
+    main.appendChild(name)
+    main.appendChild(state)
+    row.appendChild(main)
 
-    const tag = document.createElement('span')
-    tag.className = 'tag ' + (isLocked ? 'warn' : 'ok')
-    tag.textContent = isLocked ? '已开启保护（锁定）' : '未加锁（允许消耗）'
-    head.appendChild(tag)
-    card.appendChild(head)
-
-    const pid = document.createElement('code')
-    pid.className = 'key-prefix'
-    pid.textContent = p.id
-    card.appendChild(pid)
-
-    const desc = document.createElement('p')
-    desc.className = 'hint'
-    desc.style.margin = '4px 0'
-    desc.textContent = isLocked
-      ? '该供应商下「只剩永久积分」的账号已退出选号，永久积分被保护。'
-      : '该供应商下所有账号正常参与选号，免费额度用完后将消耗永久积分。'
-    card.appendChild(desc)
-
-    const actions = document.createElement('div')
-    actions.className = 'key-head'
-    actions.style.marginTop = '6px'
-
-    const btn = document.createElement('button')
-    btn.className = isLocked ? 'ghost small' : 'primary-btn small'
-    btn.textContent = isLocked ? '解除保护（允许消耗）' : '开启保护（锁定永久额度）'
-    btn.onclick = async () => {
-      btn.disabled = true
+    const sw = document.createElement('button')
+    sw.className = 'switch' + (isLocked ? ' on' : '')
+    sw.setAttribute('role', 'switch')
+    sw.setAttribute('aria-checked', isLocked ? 'true' : 'false')
+    sw.setAttribute('aria-label', (p.name || p.id) + ' 永久积分锁')
+    sw.title = isLocked ? '已锁定，点击解除' : '未锁定，点击锁定'
+    sw.onclick = async () => {
+      sw.disabled = true
       const nextLocked = !isLocked
       const res = await api('/admin/permanent-locks', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ provider: p.id, locked: nextLocked }),
       })
-      btn.disabled = false
+      sw.disabled = false
       if (res.ok) {
         showToast(`${p.name || p.id} 永久积分锁已${nextLocked ? '开启' : '解除'}`, 'ok')
         await loadPermanentLocks()
@@ -3681,10 +3700,8 @@ async function loadPermanentLocks() {
         showToast('设置失败：' + (res.body?.message || res.body || '未知错误'), 'err')
       }
     }
-    actions.appendChild(btn)
-    card.appendChild(actions)
-
-    box.appendChild(card)
+    row.appendChild(sw)
+    box.appendChild(row)
   }
 }
 
@@ -4117,6 +4134,8 @@ async function bootstrap() {
 }
 
 // ⚠️ 主题要在**最早期**应用（在任何渲染之前），否则浅色用户会看到深色闪烁。
-applyTheme(localStorage.getItem('wb_theme') || 'dark')
+// 首次访问默认「跟随系统」—— 与登录页一致（登录页没有主题开关，只能跟随系统），
+// 否则浅色系统的用户会从浅色登录页跳进深色面板。
+applyTheme(localStorage.getItem('wb_theme') || 'auto')
 
 bootstrap()

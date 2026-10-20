@@ -39,6 +39,10 @@ import panelCss from './assets/style.css.txt'
 import panelJs from './assets/app.js.txt'
 import loginHtml from './assets/login.html'
 import loginJs from './assets/login.js.txt'
+import { APP_VERSION } from '../version.js'
+
+/** 面板 HTML 里的版本占位符在模块加载时替换一次（避免版本号在 HTML 里硬编码后忘了改）。 */
+const panelPage = panelHtml.split('__APP_VERSION__').join(APP_VERSION)
 
 /**
  * 内容安全策略（严格版，**无需 unsafe-inline**）。
@@ -127,7 +131,7 @@ export function panelAsset(path: string): { body: string; contentType: string } 
   switch (path) {
     case '/panel':
     case '/panel/':
-      return { body: panelHtml, contentType: 'text/html; charset=utf-8' }
+      return { body: panelPage, contentType: 'text/html; charset=utf-8' }
     case '/panel/style.css':
       return { body: panelCss, contentType: 'text/css; charset=utf-8' }
     case '/panel/app.js':

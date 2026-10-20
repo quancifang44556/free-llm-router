@@ -2000,3 +2000,12 @@ test('🔴 closeModal 必须复位三个供应商标签页（否则密钥编辑�
     'closeModal 必须恢复 .modal-tabs 的 display（否则标签条永久消失）',
   )
 })
+
+test('⚠️ 顶栏版本号必须与 package.json 一致（不得在 HTML 里硬编码）', () => {
+  // 实测：HTML 里硬编码的 `v0.1.2` 在发到 v0.4.0 时没人改 —— 顶栏一直显示旧版本。
+  // 现在 HTML 只写占位符 `__APP_VERSION__`，由 panelAsset 替换成 src/version.ts 的值。
+  const html = panelAsset('/panel/')?.body ?? ''
+  const pkg = JSON.parse(readFileSync('package.json', 'utf8')) as { version: string }
+  assert.ok(!html.includes('__APP_VERSION__'), '版本占位符应已被替换')
+  assert.ok(html.includes(`>v${pkg.version}<`), `顶栏应显示 v${pkg.version}`)
+})
