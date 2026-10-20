@@ -42,11 +42,12 @@
  *   `Cosy-MachineToken` / `Cosy-MachineType`。Workers **无 `child_process`**
  *   （`AGENTS.md §2.5` 第 4 条）。故这两个值改为凭据 `extras` 里的两个字符串。
  *   ⚠️ **后果必须知道**（`src/qoder-machine.ts:33-59`）：缺这两个头时
- *   `/sash/api/v1/me/campaigns` 只回 **1 条 `VIEW_DETAILS`、`claimable:false`**，
+ *   **国际版**的 `/sash/api/v1/me/campaigns` 只回 **1 条 `VIEW_DETAILS`、`claimable:false`**，
  *   于是「今天已领」与「服务端没下发可领项」在响应上**无法区分** ——
  *   参考实现因此把「未领取」误报成「今天已领」（用户报障）。
- *   本适配器**刻意不复制该行为**：缺 machine 头时 `checkin()` **抛错**
- *   说明缺什么，而不是返回 `alreadyDone:true`（见 {@link checkin}）。
+ *   本适配器**刻意不复制该行为**：没有可领项时 `checkin()` **抛错**
+ *   说明原因，而不是返回 `alreadyDone:true`（见 {@link checkin}）。
+ *   **中国版不需要**这两个头（不带反而正常下发，见 {@link QoderProduct.checkinRequiresMachine}）。
  */
 
 import { ProviderError } from './types.js'
@@ -188,6 +189,17 @@ export interface QoderProduct {
    * （`src/qoder-product.ts:244-274` 的对照表：`'5'` → 空活动、`'10'` → 1 条）。
    */
   sashClientType: string
+  /**
+   * 每日签到是否**必须**带真实设备身份头（`Cosy-MachineToken` + `Cosy-MachineType`）。
+   *
+   * - **国际版 `true`**：不带 → 服务端不下发 `CLAIM_BENEFIT`（本文件 {@link checkin} 的消融表；
+   *   Zhengyuuuui/qoder2api `checkin.go:73-88`、L0NE-6/Qoder-Daily 同结论）。
+   * - **中国版 `false`**：完全不带指纹头 → **正常下发**；带**自造/过期**的
+   *   machineToken 反而**不下发**（Zhengyuuuui/qoder2api `checkin.go:76-79` 单变量对照；
+   *   shuishuipingan/qoder2api-hub 同结论：派生假头会让每日领取活动被过滤）。
+   *   故 CN 缺头时照常签到，带头却没拿到可领项时再**不带头重试一次**。
+   */
+  checkinRequiresMachine: boolean
   userAgentPrefix: string
   fallbackModels: readonly QoderFallbackModel[]
 }
@@ -220,6 +232,7 @@ export function buildQoderProduct(variant: 'qoder' | 'qodercn'): QoderProduct {
         scene: 'assistant',
       },
       sashClientType: '10',
+      checkinRequiresMachine: false,
       userAgentPrefix: 'qoder',
       fallbackModels: QODER_CN_FALLBACK_MODELS,
     }
@@ -241,6 +254,7 @@ export function buildQoderProduct(variant: 'qoder' | 'qodercn'): QoderProduct {
       scene: 'assistant',
     },
     sashClientType: '10',
+    checkinRequiresMachine: true,
     userAgentPrefix: 'qoder',
     fallbackModels: QODER_FALLBACK_MODELS,
   }
@@ -252,6 +266,8 @@ export function buildQoderProduct(variant: 'qoder' | 'qodercn'): QoderProduct {
 const EXTRA_MACHINE_ID = 'machineId'
 const EXTRA_MACHINE_TOKEN = 'machineToken'
 const EXTRA_MACHINE_TYPE = 'machineType'
+/** 可选的第三件（`Cosy-MachineCode`），runtime-info 输出里与 token/type 同出。 */
+const EXTRA_MACHINE_CODE = 'machineCode'
 
 /** 宽容读取：接受嵌套（`{credential:{…}}` / `{data:{…}}`）与扁平两种形态。 */
 function unwrapCredential(input: unknown): Record<string, unknown> {
@@ -369,12 +385,17 @@ export function parseCredential(input: unknown): ProviderCredential {
   const nickname = readString(source, ['nickname', 'user_name', 'userName', 'name'])
     ?? (jwt === undefined ? undefined : readString(jwt, ['name', 'nickname']))
 
-  /** extras 是兜底口袋；机器头是**用户提供的配置**（Workers 无 child_process）。 */
+  /**
+   * extras 是兜底口袋；机器头是**用户提供的配置**（Workers 无 child_process）。
+   * 只有国际版签到必需；中国版不需要（见 `checkinRequiresMachine`）。
+   */
   const extras: Record<string, string> = { [EXTRA_MACHINE_ID]: machineId }
   const machineToken = readString(source, ['machineToken', 'machine_token', 'cosyMachineToken'])
   const machineType = readString(source, ['machineType', 'machine_type', 'cosyMachineType'])
   if (machineToken !== undefined) extras[EXTRA_MACHINE_TOKEN] = machineToken
   if (machineType !== undefined) extras[EXTRA_MACHINE_TYPE] = machineType
+  const machineCode = readString(source, ['machineCode', 'machine_code', 'cosyMachineCode'])
+  if (machineCode !== undefined) extras[EXTRA_MACHINE_CODE] = machineCode
 
   return {
     provider: 'qoder',
@@ -1000,10 +1021,26 @@ async function chat(
 
 // ─────────────────────────── 余额 / 签到（`/sash/` 端点） ───────────────────────────
 
-/** `/sash/` 端点的请求头。 */
-function sashHeaders(product: QoderProduct, credential: ProviderCredential): Record<string, string> {
+/** 凭据里是否带了**成对**的设备身份头。 */
+function hasMachineIdentity(credential: ProviderCredential): boolean {
+  return credential.extras[EXTRA_MACHINE_TOKEN] !== undefined
+    && credential.extras[EXTRA_MACHINE_TYPE] !== undefined
+}
+
+/**
+ * `/sash/` 端点的请求头。
+ *
+ * `useMachine=false` 时**刻意不带**设备身份头（中国版签到的回退路径，见
+ * {@link QoderProduct.checkinRequiresMachine}）。
+ */
+function sashHeaders(
+  product: QoderProduct,
+  credential: ProviderCredential,
+  useMachine = true,
+): Record<string, string> {
   const headers: Record<string, string> = {
     Accept: 'application/json',
+    'Accept-Language': 'zh-CN',
     Authorization: `Bearer ${credential.accessToken}`,
     // ⚠️ 桌面 app 身份（`'10'`）；用 CLI 的 `'5'` 时活动列表恒为空。
     'Cosy-ClientType': product.sashClientType,
@@ -1013,9 +1050,11 @@ function sashHeaders(product: QoderProduct, credential: ProviderCredential): Rec
   const token = credential.extras[EXTRA_MACHINE_TOKEN]
   const type = credential.extras[EXTRA_MACHINE_TYPE]
   // ⚠️ **必须成对**出现：只带一个等于没带（实测消融表）。
-  if (token !== undefined && type !== undefined) {
+  if (useMachine && token !== undefined && type !== undefined) {
     headers['Cosy-MachineToken'] = token
     headers['Cosy-MachineType'] = type
+    const code = credential.extras[EXTRA_MACHINE_CODE]
+    if (code !== undefined) headers['Cosy-MachineCode'] = code
   }
   return headers
 }
@@ -1134,27 +1173,43 @@ async function balance(
 /** 一条活动（`campaigns[]` 的一项）。 */
 interface QoderCampaign {
   campaignId: string
+  campaignKey?: string
   actionType?: string
   claimStatus?: string
   amount?: number
 }
 
-/** 解析 `/sash/api/v1/me/campaigns` 的响应。 */
+/**
+ * 解析 `/sash/api/v1/me/campaigns` 的响应。
+ *
+ * 兼容 `{campaigns:[…]}` 与 `{data:{campaigns:[…]}}` 两种外形
+ * （L0NE-6/Qoder-Daily `do_checkin` 同样两种都认）。
+ */
 function parseCampaigns(body: unknown): { claimable: boolean; campaigns: QoderCampaign[] } {
   if (typeof body !== 'object' || body === null) return { claimable: false, campaigns: [] }
-  const record = body as Record<string, unknown>
+  let record = body as Record<string, unknown>
+  if (!Array.isArray(record.campaigns)
+    && typeof record.data === 'object' && record.data !== null
+    && Array.isArray((record.data as Record<string, unknown>).campaigns)) {
+    record = record.data as Record<string, unknown>
+  }
   const raw = Array.isArray(record.campaigns) ? record.campaigns : []
   const campaigns: QoderCampaign[] = []
   for (const item of raw) {
     if (typeof item !== 'object' || item === null) continue
     const entry = item as Record<string, unknown>
-    const campaignId = entry.campaignId ?? entry.campaign_id ?? entry.id
-    if (typeof campaignId !== 'string' || campaignId.length === 0) continue
+    const key = typeof entry.campaignKey === 'string' && entry.campaignKey.length > 0
+      ? entry.campaignKey
+      : undefined
+    const idRaw = entry.campaignId ?? entry.campaign_id ?? entry.id
+    const campaignId = typeof idRaw === 'string' && idRaw.length > 0 ? idRaw : key
+    if (campaignId === undefined) continue
     const benefit = typeof entry.benefit === 'object' && entry.benefit !== null
       ? (entry.benefit as Record<string, unknown>)
       : undefined
     campaigns.push({
       campaignId,
+      ...(key !== undefined ? { campaignKey: key } : {}),
       ...(typeof entry.actionType === 'string' ? { actionType: entry.actionType } : {}),
       ...(typeof entry.claimStatus === 'string' ? { claimStatus: entry.claimStatus } : {}),
       ...(typeof benefit?.amount === 'number' ? { amount: benefit.amount } : {}),
@@ -1166,10 +1221,18 @@ function parseCampaigns(body: unknown): { claimable: boolean; campaigns: QoderCa
 /**
  * 每日签到（领取活动积分）。
  *
- * ## ⚠️ 缺 machine 头时**必须抛错**，不能报「今天已领」
+ * ## 中国版 vs 国际版
+ *
+ * - **中国版（qodercn）**：**不需要** machine 头 —— 不带指纹头正常下发
+ *   `CLAIM_BENEFIT`；带自造/过期 token 反而被过滤（出处见
+ *   {@link QoderProduct.checkinRequiresMachine}）。故缺头时照常签到；
+ *   带头却没拿到可领项时**不带头重试一次**。
+ * - **国际版（qoder）**：必须带真实 machine 头，见下表。
+ *
+ * ## ⚠️ 没有可领项时**必须抛错**，不能报「今天已领」
  *
  * 这是本适配器与参考实现**刻意不同**的一处，理由是那条被记录的真实缺陷
- * （`deepseek-harness-codearts/src/qoder-machine.ts:33-59`）：
+ * （`deepseek-harness-codearts/src/qoder-machine.ts:33-59`，国际版实测）：
  *
  * | 请求头 | `/sash/api/v1/me/campaigns` |
  * |---|---|
@@ -1178,7 +1241,8 @@ function parseCampaigns(body: unknown): { claimable: boolean; campaigns: QoderCa
  *
  * 参考实现把「筛出 0 个可领活动」当成「今天已领」，于是**把
  * 『服务端没下发数据』误报成『今天已领』**（用户报障：插件说已领、官方还能领）。
- * 本适配器改为：**没有 machine 头就不下结论**，抛错说明要配哪两个字段。
+ * 本适配器改为：只有看到 `CLAIMED` 才报已领；国际版缺头时抛错说明要配哪两个字段，
+ * 其余「无可领项」也抛错（调用方对任何返回值都会记「今日已签到」）。
  *
  * ⚠️ 「今天已领」的**正确判据不是「列表为空」** —— 抓包实测领取前后对照
  * （`AGENTS.md` 的「Qoder 每日领取」章节）：领取成功后列表**仍非空**，
@@ -1186,75 +1250,110 @@ function parseCampaigns(body: unknown): { claimable: boolean; campaigns: QoderCa
  * 顶层 `claimable` 变 `false`。
  *
  * ⚠️ 幂等判据是响应体的 `replayed`，**不是 HTTP 状态码**：重复领取同样返回
- * **200**，但 `replayed:true`、**不含 `benefit`**。
+ * **200**，但 `replayed:true`、**不含 `benefit`**（另认 409 / `ALREADY_CLAIMED`）。
+ * 成功判据是 `status === 'CLAIMED'`。
  */
 async function checkin(
   product: QoderProduct,
   credential: ProviderCredential,
   signal: AbortSignal,
 ): Promise<CheckinResult> {
-  const machineToken = credential.extras[EXTRA_MACHINE_TOKEN]
-  const machineType = credential.extras[EXTRA_MACHINE_TYPE]
-  if (machineToken === undefined || machineType === undefined) {
-    throw new ProviderError({
-      provider: product.id,
-      message: 'Qoder 自动签到需要设备身份头 `Cosy-MachineToken` + `Cosy-MachineType`（必须成对）。'
-        + 'Workers 无法运行 Qoder 的 `runtime-info.exe` 生成它们，'
-        + '请在导入凭据时把这两个值一并放进 `machineToken` / `machineType` 字段'
-        + '（可从 Qoder 桌面端的 `machine_token.json` 取：`token` → machineToken、`type` → machineType）。'
-        + '缺这两个头时服务端只下发 1 条 `VIEW_DETAILS`（`claimable:false`），'
-        + '此时「今天已领」与「没有可领项」无法区分 —— 故这里如实报错而不谎报已领',
-    })
-  }
-
-  const timeout = AbortSignal.timeout(20_000)
+  const hasMachine = hasMachineIdentity(credential)
+  const timeout = AbortSignal.timeout(25_000)
   const requestSignal = signal.aborted ? signal : AbortSignal.any([signal, timeout])
 
-  const res = await fetch(`${product.openApiBase}/sash/api/v1/me/campaigns`, {
-    method: 'GET',
-    headers: sashHeaders(product, credential),
-    signal: requestSignal,
-  })
-  if (!res.ok) {
-    throw new ProviderError({
-      provider: product.id,
-      httpStatus: res.status,
-      retryable: res.status === 429,
-      message: `Qoder 活动列表查询失败：http=${res.status}`,
+  const listCampaigns = async (useMachine: boolean): Promise<QoderCampaign[]> => {
+    // `forceRefresh=true`：拉实时列表而不是服务端缓存（L0NE-6/Qoder-Daily `CAMPAIGNS_QUERY`）。
+    const res = await fetch(`${product.openApiBase}/sash/api/v1/me/campaigns?forceRefresh=true`, {
+      method: 'GET',
+      headers: sashHeaders(product, credential, useMachine),
+      signal: requestSignal,
     })
+    if (!res.ok) {
+      const hint = res.status === 401 || res.status === 403 ? '（凭据失效或地区选错，请重新登录）' : ''
+      throw new ProviderError({
+        provider: product.id,
+        httpStatus: res.status,
+        retryable: res.status === 429,
+        message: `Qoder 活动列表查询失败：http=${res.status}${hint}`,
+      })
+    }
+    return parseCampaigns(await res.json().catch(() => undefined)).campaigns
   }
-  const { claimable, campaigns } = parseCampaigns(await res.json())
-
+  const isBenefit = (c: QoderCampaign): boolean => c.actionType === 'CLAIM_BENEFIT'
   // ⚠️ 只领 `actionType === 'CLAIM_BENEFIT' && claimStatus === 'CLAIMABLE'`：
   // 实测还有 `VIEW_DETAILS` 型活动（如「Pro 首月翻倍」），对它发 claim 是错的。
-  const target = campaigns.find(
-    (c) => c.actionType === 'CLAIM_BENEFIT' && c.claimStatus === 'CLAIMABLE',
-  )
-  if (target === undefined) {
-    // 有 `CLAIM_BENEFIT` 但已 `CLAIMED` → 真·今天已领。
-    const claimed = campaigns.find((c) => c.actionType === 'CLAIM_BENEFIT')
-    if (claimed !== undefined) {
-      return { alreadyDone: true, gained: 0, detail: 'Qoder 今日积分已领取（活动状态为 CLAIMED）' }
+  const findTarget = (list: QoderCampaign[]): QoderCampaign | undefined =>
+    list.find((c) => isBenefit(c) && c.claimStatus === 'CLAIMABLE')
+
+  let useMachine = hasMachine
+  let campaigns = await listCampaigns(useMachine)
+  // ⚠️ 中国版：带了（可能已过期的）machine 头却没拿到 `CLAIM_BENEFIT` →
+  // **不带头再查一次**。CN 不带指纹头本来就正常下发，而过期/自造的 token
+  // 会让服务端过滤掉每日领取活动（见 `checkinRequiresMachine` 的出处）。
+  if (useMachine && !product.checkinRequiresMachine && !campaigns.some(isBenefit)) {
+    const plain = await listCampaigns(false)
+    if (plain.some(isBenefit)) {
+      useMachine = false
+      campaigns = plain
     }
-    // 只有 `VIEW_DETAILS` → 服务端**没有下发可领项**。带齐 machine 头后仍如此，
-    // 才可能是「今天真的没有活动」（活动每日 10:00 UTC+8 刷新）。
-    if (campaigns.length > 0) {
-      return {
-        alreadyDone: true,
-        gained: 0,
-        detail: `Qoder 当前没有可领取的活动（服务端下发 ${campaigns.length} 条，`
-          + '均为 VIEW_DETAILS 型；活动每日 10:00（UTC+8）刷新）',
-      }
-    }
-    return { alreadyDone: true, gained: 0, detail: 'Qoder 活动列表为空，暂无可领积分' }
   }
 
-  // ⚠️ 请求体必须是**空串**（抓包实测 `content-length: 0`）。
+  const target = findTarget(campaigns)
+  if (target === undefined) {
+    // 有 `CLAIM_BENEFIT` 但已 `CLAIMED` → 真·今天已领。
+    if (campaigns.some((c) => isBenefit(c) && c.claimStatus === 'CLAIMED')) {
+      return { alreadyDone: true, gained: 0, detail: 'Qoder 今日积分已领取（活动状态为 CLAIMED）' }
+    }
+    const listed = campaigns.length === 0
+      ? '活动列表为空'
+      : `服务端下发 ${campaigns.length} 条：${campaigns.map((c) => `${c.actionType ?? '?'}/${c.claimStatus ?? '?'}`).join('、')}`
+    // ⚠️ 国际版缺 machine 头 → 服务端只下发 `VIEW_DETAILS`，此时「今天已领」与
+    // 「没有可领项」**无法区分**，如实报错说明缺什么，绝不谎报已领。
+    if (product.checkinRequiresMachine && !hasMachine) {
+      throw new ProviderError({
+        provider: product.id,
+        message: 'Qoder 国际版自动签到需要设备身份头 `Cosy-MachineToken` + `Cosy-MachineType`（必须成对）。'
+          + '请在导入凭据时把这两个值一并放进 `machineToken` / `machineType`（可选 `machineCode`）字段'
+          + '（取自官方客户端 / qodercli 的 runtime-info 输出，或桌面端的 `machine_token.json`：'
+          + '`token` → machineToken、`type` → machineType）。'
+          + `缺这两个头时服务端不下发可领项（${listed}）`,
+      })
+    }
+    // ⚠️ 不返回 `alreadyDone:true`：调用方会据此记「今日已签到」，
+    // 而这里服务端确实没有给可领项 —— 如实报错，下一轮 cron 再试。
+    throw new ProviderError({
+      provider: product.id,
+      message: `Qoder 当前没有可领取的签到活动（${listed}）。`
+        + '每日活动在 10:00（UTC+8）刷新；若今天已在客户端领过，活动行可能直接消失'
+        + (hasMachine ? '；若导入了 machineToken，它可能已过期，可删除后重试' : ''),
+    })
+  }
+
+  // ⚠️ 请求体必须是**空串**（抓包实测 `content-length: 0`；
+  // Zhengyuuuui/qoder2api `doCheckinRequest` 同样空 body + `origin`）。
   const claimRes = await fetch(
     `${product.openApiBase}/sash/api/v1/me/campaigns/${encodeURIComponent(target.campaignId)}/claim`,
-    { method: 'POST', headers: sashHeaders(product, credential), body: '', signal: requestSignal },
+    {
+      method: 'POST',
+      headers: { ...sashHeaders(product, credential, useMachine), Origin: product.openApiBase },
+      body: '',
+      signal: requestSignal,
+    },
   )
   const text = await claimRes.text().catch(() => '')
+  let parsed: Record<string, unknown> | undefined
+  try {
+    const value: unknown = JSON.parse(text)
+    if (typeof value === 'object' && value !== null) parsed = value as Record<string, unknown>
+  } catch {
+    parsed = undefined
+  }
+  // ⚠️ **幂等判据是 `replayed`，不是状态码**：重复领取也回 200，但
+  // `replayed:true`、不含 `benefit`。另认 409 / `ALREADY_CLAIMED`（L0NE-6/Qoder-Daily）。
+  if (claimRes.status === 409 || parsed?.result === 'ALREADY_CLAIMED' || parsed?.replayed === true) {
+    return { alreadyDone: true, gained: 0, detail: 'Qoder 今日积分已领取（服务端回已领取/replayed）' }
+  }
   if (!claimRes.ok) {
     throw new ProviderError({
       provider: product.id,
@@ -1263,28 +1362,28 @@ async function checkin(
       message: `Qoder 领取失败：http=${claimRes.status} ${text.slice(0, 200)}`,
     })
   }
-  let replayed = false
-  let gained = target.amount ?? 0
-  let message: string | undefined
-  try {
-    const parsed = JSON.parse(text) as { replayed?: unknown; benefit?: { amount?: unknown }; message?: unknown }
-    // ⚠️ **幂等判据是 `replayed`，不是状态码**：重复领取也回 200，
-    // 但 `replayed:true`、不含 `benefit`。
-    replayed = parsed.replayed === true
-    if (parsed.benefit?.amount === undefined) gained = 0
-    else if (typeof parsed.benefit.amount === 'number') gained = parsed.benefit.amount
-    if (typeof parsed.message === 'string') message = parsed.message
-  } catch {
-    // 非 JSON 响应：claimable 已经说明成功过，按成功处理但收益未知。
-    gained = 0
+  // 成功的权威判据是 `status === 'CLAIMED'`（三个参考实现一致）；
+  // 有 status 却不是 CLAIMED → 没领成，不能报成功。
+  if (typeof parsed?.status === 'string' && parsed.status !== 'CLAIMED') {
+    throw new ProviderError({
+      provider: product.id,
+      message: `Qoder 签到未完成（上游状态 ${parsed.status}）：${text.slice(0, 200)}`,
+    })
   }
-  if (replayed) {
-    return { alreadyDone: true, gained: 0, detail: 'Qoder 今日积分已领取（服务端回 replayed=true）' }
-  }
+  const benefit = typeof parsed?.benefit === 'object' && parsed.benefit !== null
+    ? (parsed.benefit as Record<string, unknown>)
+    : undefined
+  const gained = typeof benefit?.amount === 'number' ? benefit.amount : 0
+  const validity = typeof benefit?.validity === 'object' && benefit.validity !== null
+    ? (benefit.validity as Record<string, unknown>)
+    : undefined
+  const days = typeof validity?.days === 'number' ? validity.days : undefined
+  const message = typeof parsed?.message === 'string' ? parsed.message : undefined
   return {
     alreadyDone: false,
     gained,
-    detail: message ?? `Qoder 领取成功${gained > 0 ? `，+${gained} 积分` : ''}`,
+    detail: message
+      ?? `Qoder 领取成功${gained > 0 ? `，+${gained} 积分` : ''}${days !== undefined ? `（${days} 天有效）` : ''}`,
   }
 }
 
@@ -1456,7 +1555,7 @@ async function refresh(
 
   return {
     // ⚠️ `{...credential}` 展开保留 uid / nickname / extras（machineId、machineToken、
-    // machineType）—— 机器头是**用户提供的配置**，Workers 里无法重新探测，
+    // machineType、machineCode）—— 机器头是**用户提供的配置**，Workers 里无法重新探测，
     // 丢了积分/推理能力都会退化。
     ...credential,
     uid: nextUid,
@@ -1491,9 +1590,9 @@ export function buildQoderProvider(product: QoderProduct): Provider {
       chat: true,
       balance: true,
       /**
-       * ✅ **可自动签到**，但**依赖用户提供两个 device 头**
+       * ✅ **可自动签到**：中国版直接可用；国际版**依赖用户提供两个 device 头**
        * （见 {@link checkin} 的说明与 `capabilities` 的诚实纪律：
-       * 缺配置时 `checkin()` 抛错而不是谎报已领）。
+       * 没有可领项时 `checkin()` 抛错而不是谎报已领）。
        */
       checkin: true,
     },
