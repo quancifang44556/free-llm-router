@@ -10,6 +10,13 @@ export interface GatewayModel {
   credits?: string
   priceFactor?: number
   isFree?: boolean
+  /** 上下文窗口（OpenRouter 风格字段）。 */
+  context_length?: number
+  top_provider?: { context_length?: number; max_completion_tokens?: number }
+  architecture?: { input_modalities?: string[] }
+  /** 上游明确列出的思考档位（如 `['low','high','max']`）。 */
+  reasoning_efforts?: string[]
+  reasoning_default_effort?: string
 }
 
 interface BuiltinModel {
@@ -30,9 +37,10 @@ export interface ModelCatalog {
 
 export const isAggregate = (id: string) => id.startsWith('aggregate/')
 
-export function useModelCatalog() {
+export function useModelCatalog(enabled = true) {
   return useQuery({
     queryKey: ['models'],
+    enabled,
     queryFn: async (): Promise<ModelCatalog> => {
       const [remote, builtin] = await Promise.all([
         api<{

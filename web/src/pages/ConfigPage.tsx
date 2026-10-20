@@ -20,6 +20,8 @@ import {
   useSetPermanentLock,
   useWaf,
 } from '@/lib/config'
+import { dshSnippet } from '@/lib/dsh'
+import { useModelCatalog } from '@/lib/models'
 import { useAccounts, usePool, useProviders } from '@/lib/queries'
 import { cn, fmtDateTime, fmtInt } from '@/lib/utils'
 import { copyText } from './ModelsPage'
@@ -61,7 +63,7 @@ function Head({ icon, title, desc, action }: { icon: ReactNode; title: string; d
 
 // ── 接入指南 ──
 
-type Snippet = 'curl' | 'python' | 'env'
+type Snippet = 'curl' | 'python' | 'env' | 'dsh'
 
 function ConnectCard() {
   const [show, setShow] = useState(false)
@@ -69,8 +71,11 @@ function ConnectCard() {
   const key = auth.get()
   const masked = key.length > 16 ? `${key.slice(0, 4)}${'•'.repeat(12)}${key.slice(-4)}` : '•'.repeat(Math.max(key.length, 8))
   const base = `${location.origin}/v1`
+  // 只有切到 DSH 片段才拉目录（/v1/models 要逐家问上游，配置页本身不需要它）
+  const catalog = useModelCatalog(snippet === 'dsh')
   const code = useMemo(() => {
     const k = show ? key : 'YOUR_API_KEY'
+    if (snippet === 'dsh') return dshSnippet(base, k, catalog.data?.models ?? [])
     if (snippet === 'curl')
       return `curl ${base}/chat/completions \\
   -H "Authorization: Bearer ${k}" \\
@@ -87,7 +92,7 @@ r = client.chat.completions.create(
 print(r.choices[0].message.content)`
     return `OPENAI_BASE_URL=${base}
 OPENAI_API_KEY=${k}`
-  }, [snippet, show, key, base])
+  }, [snippet, show, key, base, catalog.data])
 
   return (
     <Card>
@@ -116,13 +121,22 @@ OPENAI_API_KEY=${k}`
                 { value: 'curl', label: 'cURL' },
                 { value: 'python', label: 'Python' },
                 { value: 'env', label: '环境变量' },
+                { value: 'dsh', label: 'DSH' },
               ]}
             />
             <Button variant="ghost" size="sm" onClick={() => copyText(code.replace('YOUR_API_KEY', key), '已复制（含真实密钥）')}>
               <Copy /> 复制
             </Button>
           </div>
-          <pre className="bg-muted/70 overflow-x-auto rounded-lg px-4 py-3 font-mono text-[12px] leading-relaxed">{code}</pre>
+          <pre className={cn('bg-muted/70 overflow-x-auto rounded-lg px-4 py-3 font-mono text-[12px] leading-relaxed', snippet === 'dsh' && 'max-h-96 overflow-y-auto')}>{code}</pre>
+          {snippet === 'dsh' && (
+            <p className="text-muted-foreground mt-2 text-[12.5px] leading-relaxed">
+              DSH 只给配置里声明了 <code className="font-mono">reasoningEfforts</code> 的模型开「推理努力」，否则在本地直接报「不支持推理努力」。
+              这份片段按「模型」页的真实目录生成（档位取上游下发的值），改完重启 DSH；模型 id 必须与这里一致。
+              {catalog.isFetching && !catalog.data && ' 正在读取模型目录，稍等再复制…'}
+              {catalog.data?.fallback && ' 当前没拉到真实模型，展示的是内置清单（没有档位与上下文信息）。'}
+            </p>
+          )}
         </div>
         <ul className="text-muted-foreground space-y-1.5 pt-1 text-[12.5px] leading-relaxed">
           <li>

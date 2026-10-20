@@ -13,6 +13,7 @@ import {
   cleanupOrphanToolCalls,
   cleanupToolPairing,
   clampGptMaxTokens,
+  fillDeepseekEffort,
   isDeepseekThinking,
   mergeAdjacentToolCalls,
   normalizeStop,
@@ -20,8 +21,10 @@ import {
   normalizeTools,
   prepareChatBody,
   repackToolResultBlocks,
+  sanitizeChatBody,
   scrubFingerprintText,
   scrubFingerprints,
+  scrubToolArguments,
 } from '../src/gateway/payload.ts'
 import { classify, shouldPunish, shouldRotate } from '../src/upstream/client.ts'
 import { clientStatusFor, mapErrorToPunishment, refineModelScoped } from '../src/gateway/server.ts'
@@ -318,6 +321,146 @@ test('scrubFingerprints 覆盖文本分段，且无指纹时返回原数组', ()
   assert.equal(((out[0]!.content as M[])[0] as M).text, 'Default branch (you will usually use this for PRs)')
   const clean = [{ role: 'user', content: 'hi' }]
   assert.equal(scrubFingerprints(clean), clean)
+})
+
+// ── 身份句（hub #533 / #537 / #539）与拦截码 ──
+
+const BARE = String.fromCharCode(0x31, 0x31, 0x31, 0x32, 0x38)
+const SAFE = String.fromCharCode(0x31, 0x31, 0x2011, 0x31, 0x32, 0x38)
+const NEUTRAL = 'You are a helpful AI assistant.'
+
+test('🔴 身份句 + 品牌整句改写：DSH 首句与同族变体', () => {
+  for (const s of [
+    'You are an AI agent powered by DeepSeek Harness.',
+    'you are an ai agent POWERED BY deepseek harness.',
+    'You are a coding agent powered by the deepseek-v4.1-flash model.',
+    'You are an AI assistant built on DeepSeek.',
+    'You are an agent  powered by Foo',
+  ]) {
+    assert.equal(scrubFingerprintText(s, true), NEUTRAL, s)
+  }
+  // 嵌在长提示里：只换那一句，前后原样
+  const sys = '# Rules\nYou are an AI agent powered by DeepSeek Harness. Be concise.\nUse tools.'
+  assert.equal(scrubFingerprintText(sys, true), '# Rules\n' + NEUTRAL + ' Be concise.\nUse tools.')
+  // 句末不带句点 / 版本号里的点不截断
+  assert.equal(scrubFingerprintText('You are a coding agent powered by v4.1 now\nnext', true), NEUTRAL + '\nnext')
+  // 幂等
+  assert.equal(scrubFingerprintText(NEUTRAL, true), NEUTRAL)
+})
+
+test('身份句：只有整句结构才改写；单独品牌词、拆开的短语放行', () => {
+  for (const s of [
+    'DeepSeek Harness is great.',
+    'This tool is powered by DeepSeek.',
+    'You are an AI agent. Powered by DeepSeek.',
+    'You are an assistant made by DeepSeek.',
+  ]) {
+    assert.equal(scrubFingerprintText(s, true), s, s)
+  }
+  // identity 关闭（默认）时不动
+  const dsh = 'You are an AI agent powered by DeepSeek Harness.'
+  assert.equal(scrubFingerprintText(dsh), dsh)
+})
+
+test('🔴 scrubFingerprints：身份句只改 system / developer，user / assistant / tool 是用户数据', () => {
+  const dsh = 'You are an AI agent powered by DeepSeek Harness.'
+  const msgs = [
+    { role: 'system', content: dsh },
+    { role: 'developer', content: [{ type: 'text', text: dsh }] },
+    { role: 'user', content: dsh },
+    { role: 'assistant', content: dsh, reasoning_content: dsh },
+    { role: 'tool', tool_call_id: 'c1', content: dsh },
+  ]
+  const out = scrubFingerprints(msgs) as M[]
+  assert.equal(out[0]!.content, NEUTRAL)
+  assert.equal(((out[1]!.content as M[])[0] as M).text, NEUTRAL)
+  assert.equal(out[2], msgs[2], 'user 原样（同一对象）')
+  assert.equal(out[3], msgs[3], 'assistant 原样')
+  assert.equal(out[4], msgs[4], 'tool 原样')
+})
+
+test('🔴 裸拦截码：正文 / 推理 / 工具结果里一律改写成 U+2011 形态', () => {
+  assert.equal(scrubFingerprintText('error code ' + BARE + ' again'), 'error code ' + SAFE + ' again')
+  const msgs = [
+    { role: 'user', content: 'why ' + BARE + '?' },
+    { role: 'assistant', content: 'ok', reasoning_content: 'saw ' + BARE },
+    { role: 'tool', tool_call_id: 'c1', content: [{ type: 'text', text: 'log: ' + BARE }] },
+  ]
+  const out = JSON.stringify(scrubFingerprints(msgs))
+  assert.ok(!out.includes(BARE), out)
+  assert.equal(out.split(SAFE).length - 1, 3)
+})
+
+test('🔴 工具参数：只改 JSON 字符串值，数字保持合法、首尾空白保留', () => {
+  const args = JSON.stringify({ path: 'a.log', text: 'code ' + BARE + '\n', line: Number(BARE) })
+  const out = scrubToolArguments(args)
+  const parsed = JSON.parse(out) as M
+  assert.equal(parsed.text, 'code ' + SAFE + '\n', '字符串值改写且不 trim')
+  assert.equal(parsed.line, Number(BARE), '数字不能被改成非法 JSON')
+  // 只有数字命中 ⇒ 无法安全改写，原样返回
+  const numOnly = JSON.stringify({ line: Number(BARE) })
+  assert.equal(scrubToolArguments(numOnly), numOnly)
+  // 非 JSON（流式残片）⇒ 退回文本改写
+  assert.equal(scrubToolArguments('{"text":"' + BARE), '{"text":"' + SAFE)
+  // __proto__ 键不污染原型
+  const proto = '{"__proto__":{"x":"' + BARE + '"}}'
+  const p2 = JSON.parse(scrubToolArguments(proto)) as M
+  assert.equal(({} as M).x, undefined)
+  assert.ok(Object.prototype.hasOwnProperty.call(p2, '__proto__'))
+  // 无指纹原样
+  assert.equal(scrubToolArguments('{"a":1}'), '{"a":1}')
+  // scrubFingerprints 走的是这条路径
+  const msgs = [{ role: 'assistant', content: null, tool_calls: [call('c1', 'f', args)] }]
+  const scrubbed = scrubFingerprints(msgs) as M[]
+  const a2 = (((scrubbed[0]!.tool_calls as M[])[0] as M).function as M).arguments as string
+  assert.equal((JSON.parse(a2) as M).line, Number(BARE))
+})
+
+test('sanitizeChatBody：整串只改连字符形态，不碰裸 5 位（防止改坏数字与 base64）', () => {
+  const HYPHEN = String.fromCharCode(0x31, 0x31, 0x2d, 0x31, 0x32, 0x38)
+  const body = JSON.stringify({ max_tokens: Number(BARE), messages: [{ role: 'user', content: HYPHEN }] })
+  const out = sanitizeChatBody(body)
+  const parsed = JSON.parse(out) as M
+  assert.equal(parsed.max_tokens, Number(BARE))
+  assert.equal(((parsed.messages as M[])[0] as M).content, SAFE)
+})
+
+test('fillDeepseekEffort：只在「显式开思考却没给档位」时补 high', () => {
+  const b1: M = { model: 'deepseek-v4.1-flash', thinking: { type: 'enabled' } }
+  assert.equal(fillDeepseekEffort(b1), true)
+  assert.equal(b1.reasoning_effort, 'high')
+  const b2: M = { model: 'deepseek-v4.1-flash', thinking: { type: 'enabled' }, reasoning_effort: 'low' }
+  assert.equal(fillDeepseekEffort(b2), false)
+  assert.equal(b2.reasoning_effort, 'low', '客户端自己的档位优先')
+  const b3: M = { model: 'deepseek-v4.1-flash' }
+  assert.equal(fillDeepseekEffort(b3), false, '没开思考不补（hub #508：强补 high 会整轮只思考）')
+  assert.equal('reasoning_effort' in b3, false)
+  const b4: M = { model: 'deepseek-v4.1-flash', thinking: { type: 'disabled' } }
+  assert.equal(fillDeepseekEffort(b4), false)
+  const b5: M = { model: 'glm-5.3', thinking: { type: 'enabled' } }
+  assert.equal(fillDeepseekEffort(b5), false, '非 DeepSeek 不动')
+  const b6: M = { model: 'workbuddy/DeepSeek-V4.1-Flash', thinking: { type: 'Enabled' }, reasoning_effort: '' }
+  assert.equal(fillDeepseekEffort(b6), true)
+  assert.equal(b6.reasoning_effort, 'high')
+  const b7: M = { model: 'deepseek-v4.1-flash', thinking: { type: 'enabled' }, reasoningEffort: 'max' }
+  assert.equal(fillDeepseekEffort(b7), false, 'camelCase 档位也算客户端给了')
+})
+
+test('prepareChatBody：DSH 首句与拦截码在完整管线里被清洗', () => {
+  const r = prepareChatBody({
+    model: 'deepseek-v4.1-flash',
+    reasoning_effort: 'high',
+    messages: [
+      { role: 'system', content: 'You are an AI agent powered by DeepSeek Harness.\nRules...' },
+      { role: 'user', content: 'last error was ' + BARE },
+    ],
+  })
+  const body = JSON.parse(r.body) as M
+  const msgs = body.messages as M[]
+  assert.equal(msgs[0]!.content, NEUTRAL + '\nRules...')
+  assert.ok(!r.body.includes(BARE))
+  assert.ok(r.applied.includes('fingerprint'))
+  assert.equal(body.reasoning_effort, 'high', '客户端档位原样透传')
 })
 
 // ─────────────────────── 完整管线 ───────────────────────

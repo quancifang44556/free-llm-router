@@ -104,7 +104,9 @@ systemd、HTTPS 反向代理、备份迁移、自定义域名和常见问题，�
 | `aggregate/auto` | 不指定模型，在上面所有聚合渠道里挑 |
 | 不带前缀的模型名 | 交给默认供应商 `buddy`，兼容旧客户端 |
 
-`/v1/models` 只列出**有可用账号且未停用**的供应商，模型 ID 都带前缀。
+`/v1/models` 只列出**有可用账号且未停用**的供应商，模型 ID 都带前缀。供应商前缀不区分大小写（`Workbuddy/…` 等同 `workbuddy/…`）；`buddy` / `workbuddy` 的模型名会统一转成小写再发给上游。
+
+上游给了可选思考档位的模型，`/v1/models` 会带 `reasoning_efforts`（如 `["low","high","max"]`）和 `reasoning_default_effort`；WorkBuddy 目录偶尔缺这一块，已知模型会按内置快照补上。
 
 **Python（openai SDK）**
 
@@ -134,7 +136,19 @@ export OPENAI_API_KEY=<API_KEY 或子密钥>
 
 - **复用 prompt cache**：请求里带一个稳定的 `user` 字段（或 `conversation_id`），同一会话 30 分钟内会固定用同一个账号。不带就按常规轮转。
 - **临时指定账号**：加请求头 `X-FLR-Account: <uid>`，只对这一次请求生效；这个号不可用时直接返回 503，不会换号。
-- **现成片段**：面板「配置 → 接入指南」里有填好你地址的 cURL、Python 和环境变量示例，可以直接复制。
+- **现成片段**：面板「配置 → 接入指南」里有填好你地址的 cURL、Python、环境变量和 DSH 配置示例，可以直接复制。
+
+**DeepSeek Harness（DSH）**
+
+DSH 给自定义提供商拉模型列表时，只读 id、名称、上下文和输出上限，不读推理档位。没在配置里声明 `reasoningEfforts` 的模型，一选「推理努力」就会在 DSH 本地报「提供商 … 模型 … 不支持推理努力 …」，请求根本到不了网关。
+
+用面板「配置 → 接入指南 → DSH」生成的片段即可：它按当前真实模型目录写好 `reasoningEfforts`（档位取上游下发的值，WorkBuddy 的 `deepseek-v4.1-flash` 是 low / high / max）、视觉模型的 `input: [text, image]` 以及上下文和输出上限。
+
+1. 把第一段追加到 `~/.dsh/profiles/<profile>/cordis.patch.yml`。如果已经有 `id: llm-pi-ai` 条目，只把 `flr:` 那段并进它的 `config.providers`。
+2. 把第二段写进 `~/.dsh/.credentials.yaml` 的 `refs:`，建议 `chmod 600`。
+3. 重启 DSH。模型 id 必须和 `/v1/models` 完全一致，例如 `workbuddy/deepseek-v4.1-flash`。
+
+也可以在 DSH 的 Models 设置页手动给对应模型加上档位。网关这边：客户端发了 `thinking: {type: "enabled"}` 但没给档位时，DeepSeek 模型会补 `reasoning_effort: "high"`，因为上游不带档位就不思考。
 
 ## 支持的供应商
 
@@ -265,6 +279,7 @@ export OPENAI_API_KEY=<API_KEY 或子密钥>
 - **IP 级 WAF 护栏**：60 秒内有 2 个不同账号接连收到裸 403，就判断为出口 IP 被拦截，暂停轮转。可在面板或 `POST /admin/waf/clear` 手动解除。
 - **零输出熔断**：上游收下请求却输出 0 个字，并返回 `finish_reason=length`（通常是虚报了上下文窗口）时，把这个账号和模型冷却 10 分钟，再换号重发。
 - **只在开始输出前换号**：流式输出一旦开始就不再换号，否则会把两个模型的半截回答拼在一起。
+- **渠道校验清洗**：上游会拦截某些客户端特有的系统提示原文（400 + 渠道拦截码，同一账号在官方客户端照常可用）。网关会改写已确认的指纹：Claude Code / Codex / OmO 的固定句、billing header，system / developer 里的「自我介绍句式 + 品牌」整句（如 DSH 首句 `You are an AI agent powered by DeepSeek Harness.`，改成 `You are a helpful AI assistant.`），以及正文、思考内容、工具参数和工具结果里出现的拦截码本身。工具参数只改 JSON 里的字符串值，不会把数字改成非法 JSON。拦截码不管是数字形态还是带连字符的字符串形态，都会归为 `channel_blocked`：不换号、只软冷却，不会熔断账号。
 - **不用空回复掩盖失败**：上游没有正文、没有思考内容、也没有可识别的错误时，返回 502 `upstream_error` 并附上游原文片段（只调用工具的响应除外）。
 
 <details>
@@ -412,7 +427,7 @@ probe/             出口 IP 探针（独立 Worker）
 
 ## 致谢
 
-- [ardeyouxipianyi/workbuddy2api-hub](https://github.com/ardeyouxipianyi/workbuddy2api-hub)（MIT）：请求体修复（工具调用配对/孤儿清理、`tool_choice`/`tools`/`stop` 归一、DeepSeek `reasoning_content` 回填、客户端指纹清洗）、400 业务码分类，以及国际版网页端活跃打卡流程，移植自该项目，许可声明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+- [ardeyouxipianyi/workbuddy2api-hub](https://github.com/ardeyouxipianyi/workbuddy2api-hub)（MIT）：请求体修复（工具调用配对/孤儿清理、`tool_choice`/`tools`/`stop` 归一、DeepSeek `reasoning_content` 回填、客户端指纹与身份句清洗）、400 业务码分类、思考档位与 DSH 配置格式，以及国际版网页端活跃打卡流程，移植自该项目，许可声明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 - Qoder 签到的请求头与判定逻辑、模型目录接口（`/algo/api/v2/model/list` 的 COSY 签名公式与过滤口径）参考了 [Zhengyuuuui/qoder2api](https://github.com/Zhengyuuuui/qoder2api)、[L0NE-6/Qoder-Daily](https://github.com/L0NE-6/Qoder-Daily)（MIT）、[shuishuipingan/qoder2api-hub](https://github.com/shuishuipingan/qoder2api-hub)（MIT）、[Ebony-Vinyl/dsh-our-free-model](https://github.com/Ebony-Vinyl/dsh-our-free-model)（MIT）的实测结论（未复制代码）。
 
 ## License

@@ -242,6 +242,10 @@ export function toProviderModels(models: OpenAiModel[]): ProviderModel[] {
     ...(parseCreditsFactor(m.credits) === undefined
       ? {}
       : { priceFactor: parseCreditsFactor(m.credits) as number }),
+    // 思考档位：上游列出的优先，缺字段时按内置快照回落（见 `resolveReasoning`）
+    ...(m.reasoningEfforts === undefined ? {} : { reasoningEfforts: m.reasoningEfforts }),
+    ...(m.defaultEffort === undefined ? {} : { defaultEffort: m.defaultEffort }),
+    ...(m.canDisableThinking === undefined ? {} : { canDisableThinking: m.canDisableThinking }),
   }))
 }
 

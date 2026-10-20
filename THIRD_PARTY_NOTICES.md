@@ -6,7 +6,7 @@
 
 来源：https://github.com/ardeyouxipianyi/workbuddy2api-hub
 
-移植内容：`src/gateway/payload.ts` 中的请求体修复、`src/upstream/client.ts` 的 400 业务码分类、`src/upstream/webagent.ts` 的国际版网页端活跃打卡流程。
+移植内容：`src/gateway/payload.ts` 中的请求体修复（含客户端指纹与「身份句 + 品牌」清洗规则、DeepSeek 思考档位补全）、`src/upstream/client.ts` 的 400 业务码分类、`src/upstream/webagent.ts` 的国际版网页端活跃打卡流程，以及 `src/gateway/models.ts` 的思考档位解析与 `web/src/lib/dsh.ts` 的 DSH 配置片段格式（参考其 `wb_agents.py` 一键配置）。
 
 ```text
 MIT License

@@ -1575,8 +1575,10 @@ test('🔴 聚合前缀必须在 `splitModelName` **之前**剥掉（否则会�
   assert.ok(/const AGG_PREFIX = `\$\{AGGREGATE_PROVIDER_ID\}\/`/.test(code),
     '⚠️ 必须手写剥聚合前缀（splitModelName 不认识它）')
   // ② 判据必须是**完全前缀匹配**，不能是「包含」
-  assert.ok(/rawModel === AGGREGATE_PROVIDER_ID \|\| rawModel\.startsWith\(AGG_PREFIX\)/.test(code),
+  //    （2026-10-21 起比较的是小写副本：`Aggregate/auto` 也要进聚合）
+  assert.ok(/rawLower === AGGREGATE_PROVIDER_ID \|\| rawLower\.startsWith\(AGG_PREFIX\)/.test(code),
     '⚠️ 必须是完全前缀匹配（否则 buddy/aggregate/x 会被误吞）')
+  assert.ok(/const rawLower = rawModel\.toLowerCase\(\)/.test(code), '小写副本必须由 rawModel 派生')
   // ③ 传进聚合的 model 必须是**剥过前缀**的
   assert.ok(/model: rawModel\.slice\(AGG_PREFIX\.length\)/.test(code),
     '⚠️ 必须传剥过前缀的裸键')

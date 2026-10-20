@@ -1,24 +1,25 @@
 
 /**
- * 真实的上游渠道拦截错误码：**`11-128`**（连字符是 ASCII U+002D）。
+ * 上游渠道拦截码的两种书写形态（**码点构造**，源码里不写裸字面量）。
  *
- * ⚠️⚠️ 本项目源码里此前有 42 处把它误写成 **`11-128`**（少了连字符），
- * 于是「按错误码匹配」的逻辑全部对不上真实报文，而注释里引用的原文
- * （`11-128 Illegal API invocation from an unapproved channel`）却是对的。
+ * - `FP_BARE`：不带连字符的 5 位裸码 —— 反探测的**触发串**（请求里出现即整单拦截，
+ *   Go 侧 `sanitize.go` 与 workbuddy2api-hub 都按它改写），也是参考实现记录的数字 `code`。
+ * - `FP`：带 ASCII 连字符的 6 字符形态 —— workbuddy2api-hub 把裸码改写成的样子，
+ *   本仓库也有样本记录它出现在错误信封里。2026-10-19 曾把它当成「唯一真实码」，
+ *   导致裸码不再被改写（2026-10-21 纠正）。两种都改写成 `FP_SAFE`，不赌哪一种。
  *
- * ⚠️ 更隐蔽的是：写这个字面量**本身就不安全** —— 源码经编辑器/构建链任一处
- * 归一化（比如把 ASCII 连字符换成 U+2011），字符串就与真实报文不同，
- * 而两者渲染出来**一模一样**，肉眼完全看不出。
- *
- * ⇒ 故这里用**码点构造**，不在源码里书写完整字面量。
+ * ⚠️ 写字面量**不安全**：ASCII 连字符与 U+2011 等渲染一模一样，
+ * 编辑器/构建链任一处归一化都会让判据与替身同形，函数静默变成空操作。
  */
-const FP = String.fromCharCode(0x31, 0x31, 0x2d, 0x31, 0x32, 0x38) // '11-128'
+const FP_BARE = String.fromCharCode(0x31, 0x31, 0x31, 0x32, 0x38)
+const FP = String.fromCharCode(0x31, 0x31, 0x2d, 0x31, 0x32, 0x38)
 
 /**
- * 脱敏后的替身：把 ASCII 连字符换成 U+2011（NON-BREAKING HYPHEN）。
+ * 脱敏后的替身：中间放 U+2011（NON-BREAKING HYPHEN）。
  *
- * ⚠️ 必须是**不同码点**，否则 `replaceAll(FP, FP)` 就是空操作
+ * ⚠️ 必须与 `FP` / `FP_BARE` 都是**不同码点序列**，否则 `replaceAll` 就是空操作
  * （本项目真实发生过，且单测写成「输入 === 期望值」而永远通过）。
+ * NFKC 归一化会把 U+2011 变成 U+2010，仍不会还原成裸码。
  */
 const FP_SAFE = String.fromCharCode(0x31, 0x31, 0x2011, 0x31, 0x32, 0x38)
 
@@ -459,6 +460,27 @@ export function isDeepseekThinking(body: Record<string, unknown>): boolean {
 }
 
 /**
+ * DeepSeek：客户端**显式开了思考**（`thinking.type === 'enabled'`）却没给档位时补 `high`。
+ *
+ * 上游只认档位：workbuddy2api-hub 实测 deepseek-v4.1-flash 同一提示词下，
+ * `thinking.enabled` 不带档位 ⇒ reasoning_tokens 0；带 `reasoning_effort=high` ⇒ 正常思考。
+ * 只补「明确要思考却没说多深」这一种；没开思考、显式关闭或客户端自己给了档位都不碰
+ *（hub 默认对所有 DeepSeek 请求强补 high，曾导致整轮都在思考、没有正文，hub #508）。
+ *
+ * @returns 是否改动
+ */
+export function fillDeepseekEffort(body: Record<string, unknown>): boolean {
+  if (!bareModel(body.model).startsWith('deepseek')) return false
+  const thinking = body.thinking
+  if (!isObj(thinking) || typeof thinking.type !== 'string' || thinking.type.trim().toLowerCase() !== 'enabled') return false
+  const effort = body.reasoning_effort ?? body.reasoningEffort
+  if (typeof effort === 'string' ? effort.trim() !== '' : effort !== undefined && effort !== null) return false
+  body.reasoning_effort = 'high'
+  delete body.reasoningEffort
+  return true
+}
+
+/**
  * DeepSeek 多轮一致性：给每条 assistant 补 `reasoning_content`（移植自 workbuddy2api-hub）。
  *
  * 上游在思考模式下要求每条 assistant 都带回 `reasoning_content` 字符串，否则 400
@@ -722,7 +744,7 @@ export function normalizeTools(body: Record<string, unknown>): boolean {
   return changed
 }
 
-// ── 客户端指纹脱敏（移植自 workbuddy2api-hub `sanitize_text`） ──
+// ── 客户端指纹脱敏（移植自 workbuddy2api-hub `sanitize_text` / `sanitize_messages`） ──
 //
 // 上游 WAF 对几段**特定客户端**的系统提示词原文回 `11128`（unapproved channel）。
 // 改写刻意收得很窄：只动已确认的指纹短语，不删 agent 身份与行为约束。
@@ -752,16 +774,44 @@ const BILLING_HDR_RE = /x-anthropic-billing-header:[^;\r\n]*;?\s*/gi
 const BARE_BILLING_HDR_RE = /x-anthropic-billing-header/gi
 const CC_KV_RE = /\bcc_[a-z0-9_]+=[^;\r\n]*;?\s*/gi
 
-function hasFingerprint(text: string): boolean {
+
+/**
+ * 「客户端自我介绍句式 + 品牌」组合指纹（hub #533 / #537 / #539，2026-10-21）。
+ *
+ * 上游对这类整句做**大小写不敏感的连续子串匹配**，命中即 400 + 渠道拦截码：
+ * - `You are an AI agent powered by DeepSeek Harness.`（DSH 系统提示首句）
+ * - `You are a coding agent powered by the deepseek-v4.1-flash model.`
+ * - `You are an AI assistant built on DeepSeek.`
+ *
+ * 单独的品牌词、拆开的词组都放行，所以只把**整句**换成中性句，不依赖具体品牌。
+ * 表现是「同一账号官方客户端正常、经网关换号/换身份都失败、短请求却正常」。
+ *
+ * ⚠️ 只作用于 system / developer（见 `scrubFingerprints`）：user / assistant / tool
+ * 里的同名文本是用户数据，改写会让模型看到与磁盘不一致的内容（hub #537）。
+ */
+const IDENTITY_RE =
+  /You are an?(?:\s+AI)?(?:\s+coding)?\s+(?:agent\s+powered by|assistant\s+built on)[^\n]*?(?:\.(?=\s|$)|(?=\n|$))/gi
+const IDENTITY_PROBE = /agent\s+powered by|assistant\s+built on/i
+const IDENTITY_REPLACEMENT = 'You are a helpful AI assistant.'
+
+function hasFingerprint(text: string, identity: boolean): boolean {
   for (const f of FINGERPRINT_LITERALS) if (text.includes(f)) return true
-  return FINGERPRINT_CI.test(text)
+  if (text.includes(FP_BARE)) return true
+  if (FINGERPRINT_CI.test(text)) return true
+  return identity && IDENTITY_PROBE.test(text)
 }
 
-/** 改写一段文本里的客户端指纹（无指纹时原样返回同一字符串）。 */
-export function scrubFingerprintText(text: string): string {
-  if (text === '' || !hasFingerprint(text)) return text
+/**
+ * 改写一段文本里的客户端指纹（无指纹时原样返回同一字符串）。
+ *
+ * @param identity 是否同时改写「自我介绍句 + 品牌」（只对 system / developer 开）。
+ */
+export function scrubFingerprintText(text: string, identity = false, trim = true): string {
+  if (text === '' || !hasFingerprint(text, identity)) return text
   let out = text.replace(OMO_JUNIOR_RE, 'Sisyphus-Junior - Focused executor')
+  if (identity) out = out.replace(IDENTITY_RE, IDENTITY_REPLACEMENT)
   for (const [from, to] of FINGERPRINT_REWRITES) out = out.replaceAll(from, to)
+  out = out.replaceAll(FP_BARE, FP_SAFE)
   out = out.replace(BILLING_HDR_RE, '')
   if (out.includes('cc_')) {
     for (let prev = ''; prev !== out;) {
@@ -770,16 +820,51 @@ export function scrubFingerprintText(text: string): string {
     }
   }
   out = out.replace(BARE_BILLING_HDR_RE, 'x-anthropic-billing-hdr')
-  return out.trim()
+  return trim ? out.trim() : out
 }
 
-function scrubContent(content: unknown): unknown {
-  if (typeof content === 'string') return scrubFingerprintText(content)
+/**
+ * 工具调用参数（JSON 字符串）的指纹脱敏：**只改 JSON 里的字符串值**。
+ *
+ * 直接按文本替换会把 `{"line":` + 裸码 + `}` 这种数字改成非法 JSON；
+ * 这里先解析，逐个字符串值脱敏（不 trim —— 文件内容的首尾空白有意义），
+ * 有改动才重新序列化。数字里的裸码无法在不改语义的前提下处理，保持原样。
+ * 解析失败（流式残片等）才退回整段文本改写。
+ */
+export function scrubToolArguments(args: string): string {
+  if (args === '' || !hasFingerprint(args, false)) return args
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(args)
+  } catch {
+    return scrubFingerprintText(args)
+  }
+  if (parsed === null || typeof parsed !== 'object') {
+    return typeof parsed === 'string' ? JSON.stringify(scrubFingerprintText(parsed, false, false)) : args
+  }
+  let changed = false
+  const walk = (v: unknown): unknown => {
+    if (typeof v === 'string') {
+      const s = scrubFingerprintText(v, false, false)
+      if (s !== v) changed = true
+      return s
+    }
+    if (Array.isArray(v)) return v.map(walk)
+    // fromEntries 走 CreateDataProperty：`__proto__` 键仍是普通自有属性，不会改原型
+    if (isObj(v)) return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, walk(x)]))
+    return v
+  }
+  const next = walk(parsed)
+  return changed ? JSON.stringify(next) : args
+}
+
+function scrubContent(content: unknown, identity: boolean): unknown {
+  if (typeof content === 'string') return scrubFingerprintText(content, identity)
   if (!Array.isArray(content)) return content
   let changed = false
   const out = content.map((part) => {
     if (!isObj(part) || part.type !== 'text' || typeof part.text !== 'string') return part
-    const text = scrubFingerprintText(part.text)
+    const text = scrubFingerprintText(part.text, identity)
     if (text === part.text) return part
     changed = true
     return { ...part, text }
@@ -787,13 +872,18 @@ function scrubContent(content: unknown): unknown {
   return changed ? out : content
 }
 
-/** 对整段消息历史做指纹脱敏（正文 / 文本分段 / reasoning_content / 工具参数）。无改动返回原数组。 */
+/**
+ * 对整段消息历史做指纹脱敏（正文 / 文本分段 / reasoning_content / 工具参数）。无改动返回原数组。
+ *
+ * 身份句改写只对 system / developer 生效；其余规则（已确认的固定指纹与裸拦截码）全角色生效。
+ */
 export function scrubFingerprints(messages: unknown[]): unknown[] {
   let changed = false
   const out = messages.map((m) => {
     if (!isObj(m)) return m
     let item: Msg | undefined
-    const content = scrubContent(m.content)
+    const identity = m.role === 'system' || m.role === 'developer'
+    const content = scrubContent(m.content, identity)
     if (content !== m.content) (item ??= { ...m }).content = content
     if (typeof m.reasoning_content === 'string') {
       const rc = scrubFingerprintText(m.reasoning_content)
@@ -803,7 +893,7 @@ export function scrubFingerprints(messages: unknown[]): unknown[] {
       let callsChanged = false
       const calls = (m.tool_calls as unknown[]).map((tc) => {
         if (!isObj(tc) || !isObj(tc.function) || typeof tc.function.arguments !== 'string') return tc
-        const args = scrubFingerprintText(tc.function.arguments)
+        const args = scrubToolArguments(tc.function.arguments)
         if (args === tc.function.arguments) return tc
         callsChanged = true
         return { ...tc, function: { ...tc.function, arguments: args } }
@@ -866,6 +956,7 @@ export function prepareChatBody(input: unknown): PrepareResult {
   // ⑤ tools / stop 归一化（schema 不合法 11129、stop 字符串 11101）
   if (normalizeTools(body)) applied.push('tools')
   if (normalizeStop(body)) applied.push('stop[]')
+  if (fillDeepseekEffort(body)) applied.push('reasoning_effort=high')
 
   // ⑥ 消息历史：指纹脱敏 → 工具配对修复 → DeepSeek 思考回填
   if (!Array.isArray(body.messages)) throw new Error('messages 必须是数组')
@@ -891,15 +982,15 @@ export function prepareChatBody(input: unknown): PrepareResult {
 }
 
 /**
- * 反探测脱敏（AGENTS.md §6.6）。
+ * 反探测脱敏（AGENTS.md §6.6）—— 整体请求体上的兜底一遍。
  *
- * 裸数字 `11128` 出现在请求体里**本身就是拦截条件**，必须改写。
- * 零宽空格无效（上游会归一化），故插入连字符。
+ * 裸 5 位拦截码已在 `scrubFingerprintText` 里按**文本字段**改写（正文 / 推理 / 工具参数，
+ * 与参考实现同口径）；这里不对整串做裸码替换：请求体里的 base64 图片、数字字段都可能
+ * 碰巧含这 5 位，整串替换会改坏图片或把数字变成非法 JSON。
+ * 带连字符的形态不可能出现在数字与标准 base64 里，故仍在整串上改写。
+ * 零宽空格无效（上游会归一化），故替身用 U+2011。
  */
 export function sanitizeChatBody(body: string): string {
   if (!body.includes(FP)) return body
-  // ⚠️ 判据必须是**裸 ASCII 序列**（那才是上游的拦截条件），
-  // 替换值必须换成**不同码点**的 U+2011 —— 详见 `upstream/report.ts`
-  // 同名函数里记录的「两个参数一字不差 ⇒ 空操作」缺陷（2026-10-19 修复）。
   return body.replaceAll(FP, FP_SAFE)
 }

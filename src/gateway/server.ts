@@ -271,13 +271,27 @@ export function mapErrorToPunishment(kind: ErrorKind): {
  * ⚠️ 这里按**文案**判定而不是按 `kind`：流内错误在 `onError` 回调里
  * 拿到的只有一句 `message`，没有结构化的错误类别。
  */
-// ⚠️ 用码点构造正则源串：真实错误码带 ASCII 连字符（11-128），
-// 而源码里此前大面积写成无连字符形态（对不上真实报文）。
+// ⚠️ 用码点构造正则源串：拦截码有**裸 5 位数字**与**带连字符**两种记录形态，
+// 两种都认（2026-10-19 曾只认带连字符形态，数字码的流内错误因此一律被记成熔断）。
+// 码两侧要求非数字：流内错误文案里常带 requestId / 时间戳，长数字串里碰巧含这 5 位
+// 不能因此把真正的流中断降级成软冷却。
 const CHANNEL_BLOCK_RE = new RegExp(
-  'unapproved channel|security policy|安全策略|' +
-    String.fromCharCode(0x31, 0x31, 0x2d, 0x31, 0x32, 0x38),
+  'unapproved channel|security policy|安全策略|(?<![0-9])(?:' +
+    String.fromCharCode(0x31, 0x31, 0x31, 0x32, 0x38) +
+    '|' +
+    String.fromCharCode(0x31, 0x31, 0x2d, 0x31, 0x32, 0x38) +
+    ')(?![0-9])',
   'i',
 )
+
+/**
+ * 渠道拦截时附给客户端的排查提示（不换号、不罚号，所以要让用户知道该看哪里）。
+ *
+ * 这类拦截判的是**请求内容/指纹**，同一账号在官方客户端里照常可用。
+ */
+export const CHANNEL_BLOCKED_HINT =
+  '（上游渠道校验拦截：与账号无关，多由客户端系统提示里的固定身份句或特征串触发；' +
+  '网关已内置常见客户端的清洗，若仍复现请提供触发的系统提示首句）'
 
 export function punishmentForStreamError(message: string): 'soft' | 'breaker' {
   return CHANNEL_BLOCK_RE.test(message) ? 'soft' : 'breaker'
@@ -355,7 +369,7 @@ export function refineModelScoped(
    * ⚠️ 字符串形态的业务码（`{"code":"11-128"}`）解析不出数字，
    * 此时**不得**使用文案正则（`switch models`）判模型维度 —— 见上方的说明。
    */
-  const isChannelBlockedText = /"code"\s*:\s*"11-128"/.test(bodyText)
+  const isChannelBlockedText = /"code"\s*:\s*"11-128"/.test(bodyText) || code === 11_128
   if (isChannelBlockedText) return { dimension: 'soft', code, resetAt }
   // 6004 / 14003 = 模型级限流（切模型即可用，不该罚整个账号）
   // 11134 = 模型供应方暂不可用（同属「换个模型就行」）
@@ -666,7 +680,10 @@ export async function handleChatCompletions(
   // ⚠️ 判据是**前缀完全匹配**（`=== id` 或 `startsWith(id + '/')`），
   // 不是「包含 `aggregate/`」—— 否则 `buddy/aggregate/x` 会被误吞。
   const AGG_PREFIX = `${AGGREGATE_PROVIDER_ID}/`
-  if (rawModel === AGGREGATE_PROVIDER_ID || rawModel.startsWith(AGG_PREFIX)) {
+  // 前缀大小写不敏感（与 `splitModelName` 一致）：`Aggregate/auto` 若漏到默认供应商，
+  // 小写化后会以 `aggregate/auto` 打上游 ⇒ 11102 ⇒ 被记成模型冷却。
+  const rawLower = rawModel.toLowerCase()
+  if (rawLower === AGGREGATE_PROVIDER_ID || rawLower.startsWith(AGG_PREFIX)) {
     return await handleAggregateChat({
       model: rawModel.slice(AGG_PREFIX.length),
       // ⚠️ 就地算 `wantsStream`（不用外层那个 `const`）——
@@ -683,7 +700,10 @@ export async function handleChatCompletions(
   const routed = splitModelName(rawModel, providerIds(), DEFAULT_PROVIDER)
 
   const providerId = routed.provider
-  const model = routed.model
+  // WorkBuddy 两个渠道的上游模型 id 全是小写（`deepseek-v4.1-flash`、`glm-5.3` …），
+  // 客户端手填的 `Workbuddy/DeepSeek-v4.1-Flash` 若原样上送会 11102 ⇒ 被记 6 小时模型冷却。
+  // 其他供应商的 id 可能区分大小写，不动。
+  const model = providerId === 'buddy' || providerId === 'workbuddy' ? routed.model.toLowerCase() : routed.model
 
   // ⚠️ **读客户端要的是流式还是非流式**（实测踩到的严重缺陷）。
   //
@@ -948,7 +968,7 @@ export async function handleChatCompletions(
       lastError = {
         // ⚠️ 不原样透传上游状态码：400 会让客户端误以为「是我请求写错了」。
         status: clientStatusFor(upstream.status, kind),
-        message: `${kind}: ${msg || text.slice(0, 160)}`,
+        message: `${kind}: ${msg || text.slice(0, 160)}${kind === 'channel_blocked' ? CHANNEL_BLOCKED_HINT : ''}`,
         kind,
       }
 
@@ -999,7 +1019,7 @@ export async function handleChatCompletions(
 
       lastError = {
         status: clientStatusFor(200, kind),
-        message: `${kind}: ${msg || errText.slice(0, 160)}`,
+        message: `${kind}: ${msg || errText.slice(0, 160)}${kind === 'channel_blocked' ? CHANNEL_BLOCKED_HINT : ''}`,
         kind,
       }
 
@@ -1996,7 +2016,7 @@ export async function handleProviderChat(input: {
       if (isChannelBlocked) {
         lastError = {
           status: clientStatusFor(upstream.status, 'channel_blocked'),
-          message: `渠道校验失败（11-128）：${text.slice(0, 200)}`,
+          message: `渠道校验失败：${text.slice(0, 200)}${CHANNEL_BLOCKED_HINT}`,
         }
         clearSessionBinding(pool, sessionKey, ctx)
         break

@@ -1,24 +1,25 @@
 
 /**
- * 真实的上游渠道拦截错误码：**`11-128`**（连字符是 ASCII U+002D）。
+ * 上游渠道拦截码的两种书写形态（**码点构造**，源码里不写裸字面量）。
  *
- * ⚠️⚠️ 本项目源码里此前有 42 处把它误写成 **`11-128`**（少了连字符），
- * 于是「按错误码匹配」的逻辑全部对不上真实报文，而注释里引用的原文
- * （`11-128 Illegal API invocation from an unapproved channel`）却是对的。
+ * - `FP_BARE`：不带连字符的 5 位裸码 —— 反探测的**触发串**（请求里出现即整单拦截，
+ *   Go 侧 `sanitize.go` 与 workbuddy2api-hub 都按它改写），也是参考实现记录的数字 `code`。
+ * - `FP`：带 ASCII 连字符的 6 字符形态 —— workbuddy2api-hub 把裸码改写成的样子，
+ *   本仓库也有样本记录它出现在错误信封里。2026-10-19 曾把它当成「唯一真实码」，
+ *   导致裸码不再被改写（2026-10-21 纠正）。两种都改写成 `FP_SAFE`，不赌哪一种。
  *
- * ⚠️ 更隐蔽的是：写这个字面量**本身就不安全** —— 源码经编辑器/构建链任一处
- * 归一化（比如把 ASCII 连字符换成 U+2011），字符串就与真实报文不同，
- * 而两者渲染出来**一模一样**，肉眼完全看不出。
- *
- * ⇒ 故这里用**码点构造**，不在源码里书写完整字面量。
+ * ⚠️ 写字面量**不安全**：ASCII 连字符与 U+2011 等渲染一模一样，
+ * 编辑器/构建链任一处归一化都会让判据与替身同形，函数静默变成空操作。
  */
-const FP = String.fromCharCode(0x31, 0x31, 0x2d, 0x31, 0x32, 0x38) // '11-128'
+const FP_BARE = String.fromCharCode(0x31, 0x31, 0x31, 0x32, 0x38)
+const FP = String.fromCharCode(0x31, 0x31, 0x2d, 0x31, 0x32, 0x38)
 
 /**
- * 脱敏后的替身：把 ASCII 连字符换成 U+2011（NON-BREAKING HYPHEN）。
+ * 脱敏后的替身：中间放 U+2011（NON-BREAKING HYPHEN）。
  *
- * ⚠️ 必须是**不同码点**，否则 `replaceAll(FP, FP)` 就是空操作
+ * ⚠️ 必须与 `FP` / `FP_BARE` 都是**不同码点序列**，否则 `replaceAll` 就是空操作
  * （本项目真实发生过，且单测写成「输入 === 期望值」而永远通过）。
+ * NFKC 归一化会把 U+2011 变成 U+2010，仍不会还原成裸码。
  */
 const FP_SAFE = String.fromCharCode(0x31, 0x31, 0x2011, 0x31, 0x32, 0x38)
 
@@ -161,49 +162,50 @@ export function withFingerprint(events: Event[], fingerprint: Event): Event[] {
 }
 
 /**
- * 反探测脱敏：把请求体里的裸数字 `11128` 改写。
+ * 反探测脱敏：把文本里的渠道拦截码（裸 5 位与带连字符两种形态）改写。
  *
  * ## 为什么必须做
  *
- * 上游的**反探测**机制：请求体里只要出现裸 `11128` 就整单拦截，
- * 与该数字的上下文无关（`code=11128` / 裸 `11128` / `错误码 11128` 全部命中），
- * 而相邻的 `11148` / `11101` / `11115` 均放行
- * （Go 侧 `sanitize.go:70-76` 实测记录）。
+ * 上游的**反探测**机制：请求体里只要出现裸 5 位拦截码就整单拦截，
+ * 与上下文无关（`code=` / 裸码 / `错误码 ` 前缀全部命中），
+ * 而相邻的 `11148` / `11101` / `11115` 均放行（Go 侧 `sanitize.go:70-76` 实测记录）。
+ * 这个码**既表示拦截、又是拦截条件**，不改写必然失败。
  *
- * 因果很微妙：**11128 正是这类拦截自身的错误码**，上游据此识别
- * 「在讨论/回显其内部错误码」的请求。所以这串数字**出现在请求里本身就是拦截条件**，
- * 不改写必然失败。
- *
- * 改法：插入连字符（`11-128`）保留可读性与指代。
+ * 改法：中间插 U+2011，保留可读性与指代。
  * ⚠️ 零宽空格**无效** —— 实测上游会先归一化再匹配。
+ *
+ * ## 🔴 历史上的两次静默失效
+ *
+ * 1. 2026-10-19 之前：`replaceAll` 的两个参数一字不差，单测又写成「输入 === 期望值」。
+ * 2. 2026-10-19 的「修复」把判据换成了带连字符形态，裸码反而不再改写（2026-10-21 纠正）。
+ *
+ * ⚠️ **别凭肉眼判断两个字符串是否相同**，断言必须比对码点。
  */
 export function sanitizeFingerprints(text: string): string {
-  if (!text.includes(FP)) return text
-  // ## 🔴 这里曾经是个**静默失效的空操作**（2026-10-19 修复）
-  //
-  // 原实现的两个 replaceAll 参数**一字不差**（已用 codePointAt 逐字符核验），
-  // 替换结果与输入**逐字节相等** ⇒ 脱敏从未生效。而它的单测写的也是
-  // 「输入 === 期望值」，所以那条断言**永远通过**，把这个缺陷锁了整整一个版本。
-  //
-  // ⚠️ 与 §7.2「失败必须显式」同源：这类调用是**看起来在做事的空转**，
-  // 比干脆不写更危险 —— 它让人相信功能已经存在。
-  //
-  // ⚠️ **别再凭肉眼判断两个字符串是否相同**：ASCII 连字符 -(U+002D) 与
-  // 各种 Unicode 连字符（U+2010/2011/2013/2014）在编辑器里几乎不可分辨。
-  // 本次就是逐码点打印才确认的；断言必须比对**码点**，不能只比对渲染结果。
-  //
-  // 替换值改用 U+2011（NON-BREAKING HYPHEN）：视觉上仍像连字符，
-  // 但字节不同 ⇒ 不再命中上游「请求体含裸 11-128 即拦截」的判据。
-  // ⚠️ 用 String.fromCharCode 构造替换值，**不在源码里写字面量**：
-  //   本次踩到的坑是 —— 源码/编辑器/构建链任一环把 U+2011 归一化成 ASCII，
-  //   替换值就与判据同形，函数又变回空操作，而接口看起来毫发无损。
-  const NB_HYPHEN = String.fromCharCode(0x2011)
-  return text.replaceAll(FP, FP_SAFE)
+  if (!text.includes(FP_BARE) && !text.includes(FP)) return text
+  return text.replaceAll(FP_BARE, FP_SAFE).replaceAll(FP, FP_SAFE)
 }
 
-/** 对事件数组做脱敏（JSON 序列化后整体替换，覆盖所有字段）。 */
+/** 递归改写结构里的**字符串值**（数字、布尔原样保留）。 */
+function sanitizeValue(value: unknown): unknown {
+  if (typeof value === 'string') return sanitizeFingerprints(value)
+  if (Array.isArray(value)) return value.map(sanitizeValue)
+  if (value !== null && typeof value === 'object') {
+    const out: Record<string, unknown> = {}
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) out[sanitizeFingerprints(k)] = sanitizeValue(v)
+    return out
+  }
+  return value
+}
+
+/**
+ * 对事件数组做脱敏：只改**字符串值**。
+ *
+ * ⚠️ 不能像以前那样在 `JSON.stringify` 结果上整串替换：毫秒时间戳等数字可能碰巧含这 5 位，
+ * 整串替换会把数字改成非法 JSON，`JSON.parse` 直接抛错，整次上报失败。
+ */
 export function sanitizeEvents(events: Event[]): Event[] {
   const serialized = JSON.stringify(events)
-  if (!serialized.includes('11128')) return events
-  return JSON.parse(sanitizeFingerprints(serialized)) as Event[]
+  if (!serialized.includes(FP_BARE) && !serialized.includes(FP)) return events
+  return sanitizeValue(events) as Event[]
 }

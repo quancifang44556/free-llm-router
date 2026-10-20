@@ -13,7 +13,7 @@ import assert from 'node:assert/strict'
 
 import { isMpTask, mergeTaskLists, parseClaim, parseTasks } from '../src/upstream/tasks.ts'
 import { parseBalance } from '../src/upstream/checkin.ts'
-import { sanitizeFingerprints, withFingerprint } from '../src/upstream/report.ts'
+import { sanitizeEvents, sanitizeFingerprints, withFingerprint } from '../src/upstream/report.ts'
 import { classify, parseEnvelope, CHANNEL_BLOCKED_CODE } from '../src/upstream/client.ts'
 import { isValidUid, needsRefresh, REFRESH_SKEW_MS } from '../src/upstream/auth.ts'
 import { cstDay } from '../src/upstream/travel.ts'
@@ -222,52 +222,53 @@ test("🔴 classify：真实渠道拦截码（字符串 11-128）必须归到 ch
 
 // ─────────────────────────── 反探测脱敏 ───────────────────────────
 
-test('⚠️ sanitizeFingerprints：真实错误码必须被改写（它出现在请求里本身就是拦截条件）', () => {
-  // ## 🔴 本条断言曾经**两次**是自我实现的空转（2026-10-19 修复）
+test('⚠️ sanitizeFingerprints：拦截码的裸形态与连字符形态都必须被改写', () => {
+  // ## 🔴 本条断言的历史（两次空转 + 一次判据反转）
   //
-  // 第一次：原写法是
-  //   assert.equal(sanitizeFingerprints('错误码 11-128'), '错误码 11-128')
-  //                            ↑ 输入              ↑ 期望值**一模一样**
-  // 于是它**永远通过**，哪怕实现是 replaceAll(a, a) 这样的空操作也拦不住 ——
-  // 而实现正是那个空操作。
+  // ① 最早写成 `assert.equal(sanitizeFingerprints('错误码 11-128'), '错误码 11-128')`
+  //    —— 输入与期望一模一样，实现是空操作也永远通过。
+  // ② 2026-10-19（d8547df）误以为上游真实码是带连字符的 6 字符形态，
+  //    并断言「裸 5 位不应改写」。**反了**：上游下发的是**数字** 11128
+  //   （workbuddy2api-hub 的修复说明与 11128 诊断都写的是裸 5 位）；
+  //    参考项目文档写连字符形态，恰恰是为了**不在文档/日志里写出裸码**。
+  // ⇒ 现在两种形态都改写成 U+2011（非断字连字符，上游不会归一化成 ASCII）。
   //
-  // 第二次（更隐蔽）：本项目源码**此前把真实错误码写错了一个连字符**
-  // （真实是带 ASCII 连字符的 11-128，源码里却大面积写成无连字符形态），
-  // 判据与真实报文对不上，而两者渲染出来**肉眼无法分辨**。
-  //
-  // ⇒ 故这里全部用**码点构造**，不在源码里书写完整字面量：
-  //   这样即使源码/编辑器/构建链把连字符归一化，断言也不会跟着静默变成空转。
+  // 样本一律码点构造，不在源码里书写完整字面量（源码本身也会被打包进请求/日志）。
   const CP = (codes: number[]): string => String.fromCharCode(...codes)
-  // 真实错误码：11-128（连字符 = ASCII U+002D）
-  const REAL = CP([0x31, 0x31, 0x2d, 0x31, 0x32, 0x38])
-  // 曾经的错误写法：少一个连字符
-  const NO_HYPHEN = CP([0x31, 0x31, 0x31, 0x32, 0x38])
+  const BARE = CP([0x31, 0x31, 0x31, 0x32, 0x38])
+  const HYPHEN = CP([0x31, 0x31, 0x2d, 0x31, 0x32, 0x38])
+  const SAFE = CP([0x31, 0x31, 0x2011, 0x31, 0x32, 0x38])
 
-  // ⓪ 先自证样本本身正确，否则后面的断言全是空转
-  assert.equal(REAL.length, 6, '真实错误码应为 6 个字符（11-128）')
-  assert.equal(NO_HYPHEN.length, 5, '错误写法应为 5 个字符（11128）')
-  assert.notEqual(REAL, NO_HYPHEN, '两个样本必须不同，否则本测试无意义')
+  // ⓪ 自证样本
+  assert.equal(BARE.length, 5)
+  assert.equal(HYPHEN.length, 6)
+  assert.notEqual(BARE, HYPHEN)
 
-  for (const input of ['错误码 ' + REAL, 'code=' + REAL, REAL]) {
-    const out = sanitizeFingerprints(input)
-
-    // ① 必须**真的改了**（这条正是原断言缺失的核心）
-    assert.notEqual(out, input, `必须发生改写，否则等于没脱敏：${input}`)
-
-    // ② 改写后**不得再含真实错误码** —— 那才是上游的拦截条件
-    assert.ok(!out.includes(REAL), `改写后仍含真实错误码（会被上游整单拦截）：${out}`)
-
-    // ③ 数字本体不能丢：只换连字符，不删内容
-    assert.ok(out.includes('11'), '不应丢掉 11')
-    assert.ok(out.includes('128'), '不应丢掉 128')
+  for (const form of [BARE, HYPHEN]) {
+    for (const input of ['错误码 ' + form, 'code=' + form, form]) {
+      const out = sanitizeFingerprints(input)
+      assert.notEqual(out, input, `必须发生改写：${input}`)
+      assert.ok(!out.includes(BARE), `改写后仍含裸码：${out}`)
+      assert.ok(!out.includes(HYPHEN), `改写后仍含连字符形态：${out}`)
+      assert.ok(out.includes(SAFE), `应换成 U+2011 形态（数字本体不丢）：${out}`)
+    }
   }
+  // 幂等：已是安全形态的不再变化
+  assert.equal(sanitizeFingerprints('x ' + SAFE), 'x ' + SAFE)
+})
 
-  // ④ 无连字符的写法**不应被改写**（它不是拦截条件，改了反而破坏原意）
-  assert.equal(
-    sanitizeFingerprints(NO_HYPHEN),
-    NO_HYPHEN,
-    '无连字符形态不是真实错误码，不应被改写',
-  )
+test('sanitizeEvents：只改字符串值，含同样 5 位的数字/时间戳保持合法', () => {
+  const BARE = String.fromCharCode(0x31, 0x31, 0x31, 0x32, 0x38)
+  const ts = Number('17' + BARE + '000') // 一个碰巧含这 5 位的毫秒时间戳
+  const events = [{ eventCode: 'err', ts, msg: 'code ' + BARE, nested: { list: ['a' + BARE] } }]
+  const out = sanitizeEvents(events) as typeof events
+  assert.equal(out[0]?.ts, ts, '数字字段不能被改写（整串替换会产出非法 JSON）')
+  assert.ok(!(out[0]?.msg ?? '').includes(BARE))
+  assert.ok(!(out[0]?.nested.list[0] ?? '').includes(BARE))
+  assert.doesNotThrow(() => JSON.parse(JSON.stringify(out)))
+  // 无指纹时原样返回
+  const clean = [{ eventCode: 'ok', ts: 1 }]
+  assert.deepEqual(sanitizeEvents(clean), clean)
 })
 
 

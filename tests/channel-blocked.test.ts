@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs'
 import { test } from 'node:test'
 
 import { classify } from '../src/upstream/client.ts'
-import { refineModelScoped } from '../src/gateway/server.ts'
+import { CHANNEL_BLOCKED_HINT, punishmentForStreamError, refineModelScoped } from '../src/gateway/server.ts'
 
 // ⚠️ 与 panel.test.ts 同口径：测试在仓库根目录运行，用相对路径读源码。
 const SERVER_RAW = readFileSync('src/gateway/server.ts', 'utf8')
@@ -97,4 +97,35 @@ test('🔴 provider 路径同样不得为空账号池报「没有可用账号」
     body.indexOf('lastError === undefined') < body.indexOf('await describeNoAccount('),
     '有 lastError 的分支必须优先于「没有可用账号」',
   )
+})
+
+// ───── 2026-10-21：数字形态的拦截码、流内裸码、提示文案 ─────
+
+const BARE_CODE = Number(String.fromCharCode(0x31, 0x31, 0x31, 0x32, 0x38))
+
+test('🔴 数字形态的拦截码同样归类为 channel_blocked（曾落到 unknown ⇒ 3 次熔断健康账号）', () => {
+  const body = JSON.stringify({ code: BARE_CODE, msg: 'Illegal API invocation from an unapproved channel' })
+  for (const status of [400, 403, 502]) {
+    assert.equal(classify(status, body).kind, 'channel_blocked', `HTTP ${status}`)
+  }
+  // 字符串形态仍认（不赌哪种）
+  assert.equal(classify(400, CHANNEL_BLOCKED_BODY).kind, 'channel_blocked')
+  // 相邻码不受影响
+  assert.equal(classify(400, JSON.stringify({ code: 11140, msg: 'illegal request' })).kind, 'request_illegal')
+})
+
+test('流内错误：裸码文案也按渠道拦截软冷却', () => {
+  assert.equal(punishmentForStreamError('upstream_error code=' + String(BARE_CODE)), 'soft')
+  assert.equal(punishmentForStreamError('code 11148'), 'breaker', '相邻码不是渠道拦截')
+  assert.equal(
+    punishmentForStreamError('流传输中断：reset ts=17' + String(BARE_CODE) + '000'),
+    'breaker',
+    '长数字串里碰巧含这 5 位不算渠道拦截',
+  )
+  // 数字码 + 「switch models」文案落到限流路径时，同样不能写模型冷却
+  const rl = refineModelScoped('rate_limited', JSON.stringify({ code: BARE_CODE, displayMsg: { en: 'Please switch models' } }))
+  assert.equal(rl.dimension, 'soft')
+  assert.ok(CHANNEL_BLOCKED_HINT.includes('与账号无关'))
+  // 提示里不能出现拦截码本身（客户端可能把它原样贴回下一轮请求）
+  assert.ok(!CHANNEL_BLOCKED_HINT.includes(String(BARE_CODE)))
 })

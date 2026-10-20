@@ -129,6 +129,15 @@ export interface ProviderModel {
    * `undefined` = **该家没提供**（不是「免费」，也不是「不可用」）。
    */
   priceFactor?: number
+  /**
+   * 可选思考档位（上游明确列出的才有，如 WorkBuddy 的 `reasoning.supportedEfforts`）。
+   * `/v1/models` 会以 `reasoning_efforts` 透出，面板据此生成 DSH 的 `reasoningEfforts`。
+   */
+  reasoningEfforts?: string[]
+  /** 默认思考档位。 */
+  defaultEffort?: string
+  /** 能否关闭思考（只认上游显式给的布尔）。 */
+  canDisableThinking?: boolean
 }
 
 /** 余额信息（统一形状）。 */
@@ -312,6 +321,11 @@ export function splitModelName(
     if (knownProviders.includes(head)) {
       return { provider: head, model: raw.slice(slash + 1) }
     }
+    // 前缀大小写不敏感：客户端里手填的 `Workbuddy/…` 也该落到 `workbuddy`，
+    // 而不是被当成默认供应商的一个（不存在的）模型名。供应商 id 全小写，不会撞车。
+    const lower = head.toLowerCase()
+    const canonical = knownProviders.find((p) => p.toLowerCase() === lower)
+    if (canonical !== undefined) return { provider: canonical, model: raw.slice(slash + 1) }
   }
   return { provider: defaultProvider, model: raw }
 }

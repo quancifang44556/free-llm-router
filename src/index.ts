@@ -1145,6 +1145,19 @@ function annotateModelEntry(
     input_modalities: acceptsImage ? ['text', 'image'] : ['text'],
     output_modalities: ['text'],
   }
+
+  // ── 路径 3：思考档位（与 workbuddy2api-hub 的 `/v1/models` 同名字段） ──
+  //
+  // ⚠️ DSH 的模型发现**只读** id / name / 上下文 / 输出上限，不读这些字段 ——
+  // 它只给配置里声明了 `reasoningEfforts` 的模型开「推理努力」选择器，
+  // 否则报「不支持推理努力」。面板「接入指南 → DSH」据这里生成那份声明。
+  if (Array.isArray(entry.reasoningEfforts) && entry.reasoningEfforts.length > 0) {
+    out.reasoning_efforts = entry.reasoningEfforts
+  }
+  if (typeof entry.defaultEffort === 'string' && entry.defaultEffort !== '') {
+    out.reasoning_default_effort = entry.defaultEffort
+  }
+  if (typeof entry.canDisableThinking === 'boolean') out.reasoning_can_disable = entry.canDisableThinking
   return out
 }
 

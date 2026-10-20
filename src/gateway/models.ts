@@ -31,6 +31,18 @@ export interface OpenAiModel {
   supportsToolCall?: boolean
   /** 是否支持推理（上游 `supportsReasoning`）。 */
   supportsReasoning?: boolean
+  /**
+   * 可选的思考档位（上游 `reasoning.supportedEfforts`，如 `['low','high','max']`）。
+   *
+   * ⚠️ 只有上游**明确列出**档位的模型才带；只给 `reasoning.effort`/`defaultEffort`
+   * 的模型是固定档位，客户端选了也不会改变上游实际跑的档位，故不宣告。
+   * DSH 等客户端只给声明了档位的模型开「推理努力」选择器，否则一律报不支持。
+   */
+  reasoningEfforts?: string[]
+  /** 默认思考档位（上游 `reasoning.defaultEffort`，缺省回落 `reasoning.effort`）。 */
+  defaultEffort?: string
+  /** 能否关闭思考（上游 `reasoning.canDisableThinking`；只认显式布尔）。 */
+  canDisableThinking?: boolean
   /** 是否默认模型（上游 `isDefault`）。 */
   isDefault?: boolean
   /** 厂商（上游 `vendor`）。 */
@@ -137,6 +149,96 @@ export function extractModels(payload: unknown): OpenAiModel[] {
   return []
 }
 
+/** 档位名的合法形态（防止上游脏数据把奇怪的字符串塞进客户端配置）。 */
+const EFFORT_NAME = /^[a-z][a-z0-9_-]{0,15}$/
+
+/**
+ * 解析上游 `reasoning` 对象（`/v3/config` 的 `data.models[].reasoning`）。
+ *
+ * 形如 `{"defaultEffort":"high","supportedEfforts":["low","high","max"],"summary":"auto"}`
+ *（workbuddy2api-hub 内置目录与官方客户端缓存的同一形状）。
+ */
+export function parseReasoning(raw: unknown): Pick<OpenAiModel, 'reasoningEfforts' | 'defaultEffort' | 'canDisableThinking'> {
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return {}
+  const r = raw as Record<string, unknown>
+  const out: Pick<OpenAiModel, 'reasoningEfforts' | 'defaultEffort' | 'canDisableThinking'> = {}
+  if (Array.isArray(r.supportedEfforts)) {
+    const efforts: string[] = []
+    for (const e of r.supportedEfforts) {
+      if (typeof e !== 'string') continue
+      const name = e.trim().toLowerCase()
+      if (EFFORT_NAME.test(name) && !efforts.includes(name)) efforts.push(name)
+    }
+    if (efforts.length > 0) out.reasoningEfforts = efforts
+  }
+  const def = typeof r.defaultEffort === 'string' ? r.defaultEffort : typeof r.effort === 'string' ? r.effort : undefined
+  if (def !== undefined && EFFORT_NAME.test(def.trim().toLowerCase())) out.defaultEffort = def.trim().toLowerCase()
+  if (typeof r.canDisableThinking === 'boolean') out.canDisableThinking = r.canDisableThinking
+  return out
+}
+
+/**
+ * 思考档位快照（取自 workbuddy2api-hub `wb_catalog.py` 的内置目录，国内/国际两表一致处合并；
+ * 只收录明确列出 `supportedEfforts` 的模型，默认档位均为 `high`）。
+ *
+ * ## 为什么需要快照
+ *
+ * 上游 `/v3/config` **并不总是**把 `reasoning` 写全：有时整块缺失，有时只给一个裸
+ * `effort`（看起来像固定档位）。hub 实测后改成「实时目录为准、缺字段时逐字段回落快照」
+ *（`merge_reasoning`）。只信实时数据的话，DSH 片段就生成不出档位，用户照样报
+ *「不支持推理努力」。
+ *
+ * ⚠️ 只用于 WorkBuddy（`extractModels` 只解析 `/v3/config`）；实时目录给了列表就以实时为准。
+ */
+const REASONING_SNAPSHOT: Readonly<Record<string, string>> = {
+  'deepseek-v4.1-flash': 'low,high,max',
+  'deepseek-v4-flash': 'high,xhigh',
+  'deepseek-v4-pro': 'high,xhigh',
+  'glm-5.3': 'low,high,max',
+  'glm-5.3-flash': 'low,high,max',
+  'glm-5.2': 'high,xhigh',
+  'kimi-k3-1': 'low,high,xhigh',
+  'kimi-k2.8-preview': 'low,high,max',
+  'hy3': 'low,high',
+  'hy3-x': 'low,high',
+  'hy4-preview': 'high',
+  'hy4-preview-dev': 'high',
+  'hy4-preview-f': 'high',
+  'hy4-preview-x': 'high',
+  'primary-model': 'low,high,max',
+  'gpt-6-astra': 'low,medium,high,xhigh,max',
+  'gpt-5.6-sol': 'low,medium,high,xhigh,max',
+  'gpt-5.6-terra': 'low,medium,high,xhigh,max',
+  'gpt-5.6-luna': 'low,medium,high,xhigh,max',
+  'gpt-5.5': 'low,medium,high,xhigh',
+  'gpt-5.4': 'low,medium,high,xhigh',
+  'grok-4.7': 'low,medium,high,xhigh',
+}
+
+/**
+ * 实时 `reasoning` 与快照逐字段合并（口径同 hub `merge_reasoning`）。
+ *
+ * - 实时给了档位列表 ⇒ 用实时的；
+ * - 实时没给列表、快照有 ⇒ 用快照列表；实时的 `effort`/`defaultEffort` 若在列表内则作默认档位
+ *  （有列表时它是「默认值」而不是「锁定档位」），否则回落 `high`；
+ * - 上游显式 `supportsReasoning: false` ⇒ 不套快照。
+ */
+export function resolveReasoning(
+  id: string,
+  rawReasoning: unknown,
+  supportsReasoning?: boolean,
+): Pick<OpenAiModel, 'reasoningEfforts' | 'defaultEffort' | 'canDisableThinking'> {
+  const live = parseReasoning(rawReasoning)
+  if (live.reasoningEfforts !== undefined || supportsReasoning === false) return live
+  const snap = REASONING_SNAPSHOT[id.trim().toLowerCase()]
+  if (snap === undefined) return live
+  const efforts = snap.split(',')
+  const def = live.defaultEffort !== undefined && efforts.includes(live.defaultEffort)
+    ? live.defaultEffort
+    : efforts.includes('high') ? 'high' : efforts[0]
+  return { ...live, reasoningEfforts: efforts, ...(def === undefined ? {} : { defaultEffort: def }) }
+}
+
 /** 把上游模型条目映射成 OpenAI 形状（跳过无 id 的脏数据）。 */
 function mapModels(models: unknown[]): OpenAiModel[] {
   const out: OpenAiModel[] = []
@@ -155,6 +257,7 @@ function mapModels(models: unknown[]): OpenAiModel[] {
       return typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : undefined
     }
     const bool = (k: string): boolean | undefined => (typeof m[k] === 'boolean' ? (m[k] as boolean) : undefined)
+    const reasoning = resolveReasoning(id, m.reasoning, bool('supportsReasoning'))
 
     out.push({
       id,
@@ -169,6 +272,7 @@ function mapModels(models: unknown[]): OpenAiModel[] {
       ...(bool('supportsImages') === undefined ? {} : { supportsImage: bool('supportsImages') as boolean }),
       ...(bool('supportsToolCall') === undefined ? {} : { supportsToolCall: bool('supportsToolCall') as boolean }),
       ...(bool('supportsReasoning') === undefined ? {} : { supportsReasoning: bool('supportsReasoning') as boolean }),
+      ...reasoning,
       ...(bool('isDefault') === undefined ? {} : { isDefault: bool('isDefault') as boolean }),
       ...(str('vendor') === undefined ? {} : { vendor: str('vendor') as string }),
       // ⚠️ 上游把它叫 `credits`，值是 `"x0.21"` 这种**带 x 的字符串**
