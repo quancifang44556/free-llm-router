@@ -35,17 +35,24 @@ export class NodeDurableObjectNamespace<T extends { alarm?: () => Promise<void> 
   private factory: (ctx: any, env: any) => T
   private getEnv: () => any
   private prefix: string
+  private serialize: boolean
 
+  /**
+   * @param options.serialize 是否把对实例的方法调用**逐个排队执行**（见 {@link serializeCalls}）。
+   *   只应对「方法内部只读写存储、不发外部请求」的 DO 开启（如 `AccountPoolDO`）。
+   */
   constructor(
     prefix: string,
     db: DatabaseSync,
     factory: (ctx: any, env: any) => T,
     getEnv: () => any,
+    options: { serialize?: boolean } = {},
   ) {
     this.prefix = prefix
     this.db = db
     this.factory = factory
     this.getEnv = getEnv
+    this.serialize = options.serialize === true
   }
 
   /**
@@ -84,7 +91,8 @@ export class NodeDurableObjectNamespace<T extends { alarm?: () => Promise<void> 
       },
     })
 
-    const instance = this.factory(state, this.getEnv())
+    const raw = this.factory(state, this.getEnv())
+    const instance = this.serialize ? serializeCalls(raw) : raw
     holder.instance = instance
     this.instances.set(key, { instance, state, lastAccess: Date.now() })
     return instance
@@ -131,4 +139,48 @@ export class NodeDurableObjectNamespace<T extends { alarm?: () => Promise<void> 
   get size(): number {
     return this.instances.size
   }
+}
+
+/**
+ * 把对一个 DO 实例的方法调用**逐个排队执行**（一次只跑一个，按调用顺序）。
+ *
+ * ## ⚠️ 为什么必须有（否则 Node 下并发写会互相覆盖）
+ *
+ * Cloudflare 的 DO 有 input gate：方法在等存储读写时，**不会**有别的请求插进来。
+ * 所以 `AccountPoolDO` 里大量「先 `get` → 改 → 再 `put`」的写法在 CF 上是原子的。
+ *
+ * Node 适配层没有这层保证：`storage.get()` 虽是同步实现，但调用方 `await` 它时会让出
+ * 执行权，另一个并发请求就可能在「读」与「写」之间插进来，读到同一份旧值，
+ * 后写的覆盖先写的。实测 50 个并发 `recordApiKeyUse` 只记下 **1** 次 ——
+ * 用量、冷却、熔断、WAF 计数、日志都会这样静默丢失。
+ *
+ * ## 为什么排队不会死锁
+ *
+ * - 方法内部 `this.xxx()` 调的是**原始实例**，不经过队列；
+ * - 只对「方法里只碰存储、不发外部请求、不调别的 DO」的类开启（`AccountPoolDO` 满足）。
+ *
+ * 排队后语义与 CF 一致：CF 的 DO RPC 本来就返回 Promise，调用方无需改动。
+ */
+export function serializeCalls<T extends object>(target: T): T {
+  let tail: Promise<unknown> = Promise.resolve()
+  const wrappers = new Map<PropertyKey, (...args: unknown[]) => Promise<unknown>>()
+  const settle = (): void => {}
+  return new Proxy(target, {
+    get(obj, prop) {
+      const value = Reflect.get(obj, prop, obj) as unknown
+      if (typeof value !== 'function' || prop === 'constructor') return value
+      let wrapped = wrappers.get(prop)
+      if (wrapped === undefined) {
+        const fn = value as (...args: unknown[]) => unknown
+        wrapped = (...args: unknown[]): Promise<unknown> => {
+          const run = tail.then(() => fn.apply(obj, args))
+          // 前一个调用失败不能卡住后面的调用：队尾只关心「结束了」，不关心成败。
+          tail = run.then(settle, settle)
+          return run
+        }
+        wrappers.set(prop, wrapped)
+      }
+      return wrapped
+    },
+  })
 }

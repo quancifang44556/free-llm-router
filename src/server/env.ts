@@ -118,6 +118,8 @@ export function createNodeRuntime(databasePath?: string): NodeRuntimeContext {
     db,
     (ctx, e) => new AccountPoolDO(ctx, e),
     () => envObj as Env,
+    // ⚠️ 必须串行：Node 没有 CF 的 input gate，并发「读-改-写」会丢更新（见 serializeCalls）。
+    { serialize: true },
   )
 
   const taskRunnerNamespace = new NodeDurableObjectNamespace<TaskRunnerDO>(

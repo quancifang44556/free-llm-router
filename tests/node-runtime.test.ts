@@ -216,3 +216,37 @@ test('startServer：HTTP 服务端启动、健康检查与面板可访问性', a
     if (fs.existsSync(tmpDbPath)) fs.unlinkSync(tmpDbPath)
   }
 })
+
+test('🔴 Node 下 AccountPoolDO 并发「读-改-写」不丢更新（串行队列）', async () => {
+  // 复现：没有串行队列时，50 个并发 recordApiKeyUse 只记下 1 次。
+  const rt = createNodeRuntime(':memory:')
+  const pool = rt.env.ACCOUNT_POOL.get(rt.env.ACCOUNT_POOL.idFromName('cn')) as any
+  const rec = await pool.addApiKey({ name: 'race', hash: 'hash-race', prefix: 'sk-race' })
+  await Promise.all(
+    Array.from({ length: 50 }, () =>
+      pool.recordApiKeyUse({ id: rec.id, ip: '203.0.113.9', model: 'm', input: 0, output: 0 }),
+    ),
+  )
+  const usage = await pool.getApiKeyUsage(rec.id)
+  assert.equal(usage.requests, 50)
+})
+
+test('串行队列：前一个调用抛错不会卡住后续调用', async () => {
+  const { serializeCalls } = await import('../src/server/namespace.js')
+  const order: string[] = []
+  const obj = serializeCalls({
+    async boom(): Promise<void> {
+      order.push('boom')
+      throw new Error('x')
+    },
+    async ok(v: string): Promise<string> {
+      order.push(v)
+      return v
+    },
+  })
+  const a = obj.boom().catch(() => 'caught')
+  const b = obj.ok('after')
+  assert.equal(await a, 'caught')
+  assert.equal(await b, 'after')
+  assert.deepEqual(order, ['boom', 'after'])
+})
