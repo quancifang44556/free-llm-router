@@ -15,14 +15,17 @@ OUT=".build/tests"
 rm -rf "$OUT"
 mkdir -p "$OUT"
 
+# --loader:.wasm=binary 与 --target=node22 都与 `npm run build:node` 一致：qoder 的 WASM 在 Node 下拿到的是
+# 字节，测试也必须走这条路径（曾用 `file` loader，结果 Node 部署时 WASM 实例化
+# 必炸的缺陷在单测里完全测不到）。
 for f in tests/*.test.ts; do
   name=$(basename "$f" .test.ts)
   # --alias:cloudflare:workers 让 Node.js 环境下测试能够无缝加载并实例化 DurableObject 状态机
   ./node_modules/.bin/esbuild "$f" \
-    --bundle --format=esm --platform=node \
+    --bundle --format=esm --platform=node --target=node22 \
     --alias:cloudflare:workers=./src/server/cf-shim.ts \
     --loader:.html=text --loader:.css.txt=text --loader:.js.txt=text \
-    --loader:.wasm=file \
+    --loader:.wasm=binary \
     --outfile="$OUT/$name.test.mjs" --log-level=warning
 done
 

@@ -77,11 +77,8 @@ const WASM_MODULE = wasmModule as unknown as WebAssembly.Module
 async function compileWasm(raw: unknown): Promise<WebAssembly.Module> {
   if (raw instanceof WebAssembly.Module) return raw
 
-  // ⚠️ 用 `WebAssembly.instantiate(bytes, {})` 而不是 `WebAssembly.compile`：
-  // 本项目的 tsconfig 是 `lib: ["ES2022"]`（无 DOM），
-  // `WebAssembly.compile` 的声明来自 DOM lib，故在此不可见。
-  // `instantiate` 有 ES2022 的声明，且**顺带**得到 instance ——
-  // 但我们只取 `.module`（真正的实例化在下面按真实 import 表做）。
+  // ⚠️ `WebAssembly.compile` 的声明来自 DOM lib（本项目 `lib: ["ES2022"]` 不可见），
+  // 故下面对它做一次签名断言；运行时 Node / Workers 都有该函数。
   /**
    * ⚠️ 统一归一成 `Uint8Array` 而**不是** `ArrayBuffer`：`ArrayBufferView.buffer`
    * 的类型是 `ArrayBufferLike`（含 `SharedArrayBuffer`），而 `BufferSource`
@@ -97,25 +94,20 @@ async function compileWasm(raw: unknown): Promise<WebAssembly.Module> {
 
   if (bytes !== undefined) {
     /**
-     * ⚠️ **`WebAssembly.instantiate` 在两种 tsconfig 下解析到不同的重载**。
+     * 🔴 **只编译、不实例化**（真实缺陷：Node/VPS 部署 Qoder 恒失败）。
      *
-     * 本项目是 `lib: ["ES2022"]`（**无 DOM**），`WebAssembly` 的声明来自
-     * `@cloudflare/workers-types`；那里只暴露了
-     * `instantiate(module: Module, …) => Promise<Instance>` 这一个重载。
-     * 而这里传的是**字节**，运行时会走另一个重载并返回
-     * `{ module, instance }` —— 故 TS 报 `Property 'module' does not exist
-     * on type 'Instance'`（纯粹是声明缺失，不是行为问题）。
-     *
-     * 修法：**只对「被调用的函数」本身断言签名**，而不是对返回值做
-     * `as unknown as { module }` —— 后者会把 `Instance` 类型整个抹掉，
-     * 万一将来真传错参数（传了 Module 却取 `.module`）也检查不出来。
+     * 原写法 `instantiate(bytes, {})` 用**空 import 表**实例化 —— 这个 wasm
+     * 声明了 `./qoder_auth_wasm_bg.js` 的 import，空表必然抛
+     * `Import #0 "./qoder_auth_wasm_bg.js": module is not an object or function`。
+     * wrangler 给的是现成 Module、走不到这里，所以 Workers 上一直正常；
+     * 而 Node 构建（esbuild `binary` loader 给字节）**每次推理都在这里炸**，
+     * 网关只看到一句 `unknown: unexpected status 0`。
+     * 真正的实例化在下面按真实 import 表做，这里只要 Module。
      */
-    const instantiateFromBytes = WebAssembly.instantiate as unknown as (
-      bytes: BufferSource,
-      imports: Record<string, unknown>,
-    ) => Promise<{ module: WebAssembly.Module; instance: WebAssembly.Instance }>
-    const result = await instantiateFromBytes(bytes, {})
-    return result.module
+    const compile = (WebAssembly as unknown as {
+      compile: (bytes: BufferSource) => Promise<WebAssembly.Module>
+    }).compile
+    return await compile(bytes)
   }
 
   // ⚠️ 不静默降级：拿不到可编译的 wasm 就无法生成签名头，

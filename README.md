@@ -161,6 +161,7 @@ export OPENAI_API_KEY=<API_KEY 或子密钥>
 - `buddy` 是默认供应商。为了不抢走别家的凭据，它不参与自动识别。
 - `workbuddy` 没有签到接口，每日活跃积分要靠「跑完一条网页端 agent 会话」：定时器在 09:00、21:00 给当天还没打卡的国际版账号各跑一次 `Hi`，并钉到免费模型 `deepseek-v4.1-flash`（环境变量 `WORKBUDDY_DAILY_CHAT_MODEL` 可改）。`POST /admin/checkin/all`（`realm: "global"`）会把它们入队，结果在 `/admin/tasks/status` 查看。
 - `qodercn`（中国版）签到不需要设备身份头，导入凭据即可自动领取；`qoder`（国际版）签到需要真实设备身份，导入凭据时附带 `machineToken`、`machineType`（可选 `machineCode`），否则会如实报错。没有可领取的活动时也报错，不会谎报「今日已领」。
+- `qoder` / `qodercn` 的模型清单实时从官方目录拉取（含当前倍率与错峰促销价，缓存 10 分钟；国际版只列出当前账号套餐可用的模型），拉取失败时回退内置清单。`/v1/models` 的模型名带渠道和倍率，例如 `Qoder (中国版) · DeepSeek-Flash · ×0.1`。
 - `zcode` 的签到接口总是要求阿里云验证码，所以签到**大概率失败**，系统会如实报错；对话不受影响。
 - 每家的实际能力和「为什么不支持」由 `GET /admin/providers` 返回，面板也是按这个接口渲染的。
 
@@ -412,7 +413,7 @@ probe/             出口 IP 探针（独立 Worker）
 ## 致谢
 
 - [ardeyouxipianyi/workbuddy2api-hub](https://github.com/ardeyouxipianyi/workbuddy2api-hub)（MIT）：请求体修复（工具调用配对/孤儿清理、`tool_choice`/`tools`/`stop` 归一、DeepSeek `reasoning_content` 回填、客户端指纹清洗）、400 业务码分类，以及国际版网页端活跃打卡流程，移植自该项目，许可声明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
-- Qoder 签到的请求头与判定逻辑参考了 [Zhengyuuuui/qoder2api](https://github.com/Zhengyuuuui/qoder2api)、[L0NE-6/Qoder-Daily](https://github.com/L0NE-6/Qoder-Daily)（MIT）、[shuishuipingan/qoder2api-hub](https://github.com/shuishuipingan/qoder2api-hub)（MIT）的实测结论（未复制代码）。
+- Qoder 签到的请求头与判定逻辑、模型目录接口（`/algo/api/v2/model/list` 的 COSY 签名公式与过滤口径）参考了 [Zhengyuuuui/qoder2api](https://github.com/Zhengyuuuui/qoder2api)、[L0NE-6/Qoder-Daily](https://github.com/L0NE-6/Qoder-Daily)（MIT）、[shuishuipingan/qoder2api-hub](https://github.com/shuishuipingan/qoder2api-hub)（MIT）、[Ebony-Vinyl/dsh-our-free-model](https://github.com/Ebony-Vinyl/dsh-our-free-model)（MIT）的实测结论（未复制代码）。
 
 ## License
 

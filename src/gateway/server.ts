@@ -1831,6 +1831,12 @@ export async function handleProviderChat(input: {
       const isProviderErr = pe?.name === 'ProviderError'
       if (isProviderErr) {
         const c = classify(peStatus, message)
+        // ⚠️ **解析不出业务码时保留 provider 的原文**（实测缺陷）。
+        // `classify()` 在没有信封时只会给出 `upstream 403` / `unexpected status 0`
+        // 这种合成文案 —— 直接用它会把 ProviderError 里真正的原因（例如
+        // 「WASM 实例化失败：Import #0 …」）整句吞掉，用户只看到
+        // `unknown: unexpected status 0`，完全无从排查。
+        const detail = c.code === undefined && c.kind !== 'waf_blocked' ? message : (c.msg || message)
         const pm = mapErrorToPunishment(c.kind)
         const pcause = modelCauseFor(c.kind)
         if (pm.punish) {
@@ -1841,13 +1847,13 @@ export async function handleProviderChat(input: {
               now: Date.now(),
               ...(model !== '' ? { model } : {}),
               ...(pcause !== undefined ? { modelCause: pcause } : {}),
-              reason: `${c.kind}: ${(c.msg || message).slice(0, 180)}`,
+              reason: `${c.kind}: ${detail.slice(0, 180)}`,
             })
             .catch(logPoolError('applyFailure'))
         }
         lastError = {
           status: clientStatusFor(peStatus || 502, c.kind),
-          message: `${c.kind}: ${c.msg || message}`,
+          message: `${c.kind}: ${detail}`,
           kind: c.kind,
         }
         // 业务码判出来的「不可换号」类（如渠道拦截 / 参数错）立刻停，

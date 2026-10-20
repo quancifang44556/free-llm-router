@@ -827,7 +827,8 @@ test('🔴 qoder 排队必须有**总墙钟预算**（只有次数上限会让�
   assert.ok(budget >= 30_000, `总预算 ${budget}ms 太短，正常排队（20–25s）会被误判为繁忙`)
   // 循环里必须真的用上它
   const i = src.indexOf('async function chat(')
-  const block = src.slice(i, i + 3000)
+  // 取整个函数体（首帧窥探加进来后函数变长，固定 3000 字符会截不到排队分支）
+  const block = src.slice(i, src.indexOf('\n}\n', i))
   assert.ok(/DATE|Date\.now\(\) - queueStartedAt/.test(block), '要记录起始时刻')
   assert.ok(/overBudget/.test(block), '⚠️ 必须有超预算判据')
   // ⚠️ 排队超时要**如实说明是排队**，且标记为可重试（容量问题，换号/稍后有效）
@@ -880,14 +881,22 @@ test('🔴 qoder 单次推理必须有**自己的超时**（只透传 signal = �
   const ms = Number(m![1]!.replaceAll('_', ''))
   // 与参考实现的 `QODER_REQUEST_TIMEOUT_MS = 30_000` 一致
   assert.equal(ms, 30_000, '应与参考实现的 30s 一致')
-  // ⚠️ **发起推理的那次 fetch** 必须用上它（不能只是定义）
+  // ⚠️ 超时必须真的用上（不能只是定义），而且是**首帧超时**：
+  // 发请求 → 响应头 → 第一帧之间有界；首帧到了就撤计时器。
+  const c = src.indexOf('async function chat(')
+  const chatBlock = src.slice(c, src.indexOf('\n}\n', c))
+  assert.ok(/setTimeout\([\s\S]{0,300}?controller\.abort[\s\S]{0,80}?INFER_TIMEOUT_MS\)/.test(chatBlock),
+    '⚠️ chat() 必须用 INFER_TIMEOUT_MS 给「到首帧为止」计时')
+  assert.ok(/peekQoderFirstFrame[\s\S]{0,200}?clearTimeout\(timer\)/.test(chatBlock),
+    '⚠️ 首帧到达后必须撤掉计时器')
+  assert.ok(/request\.signal\.addEventListener\('abort'/.test(chatBlock),
+    '客户端取消也必须能掐断上游')
+  // 🔴 **推理 fetch 不得直接挂 AbortSignal.timeout**：fetch 的 signal 同样管着响应体，
+  // 30 秒一到会把正在输出的长回答拦腰截断（本地实测：流到一半抛 TimeoutError）。
   const i = src.indexOf('async function postQoderInfer')
   const j = src.indexOf('\n}', src.indexOf('return await fetch(', i))
-  const block = src.slice(i, j)
-  assert.ok(/AbortSignal\.timeout\(INFER_TIMEOUT_MS\)/.test(block),
-    '⚠️ 推理 fetch 必须带 AbortSignal.timeout(INFER_TIMEOUT_MS)')
-  assert.ok(/AbortSignal\.any\(\[request\.signal/.test(block),
-    '应与 request.signal 用 any 组合（客户端取消与超时都要生效）')
+  const code = src.slice(i, j).split('\n').filter((l) => !l.trim().startsWith('//')).join('\n')
+  assert.ok(!/AbortSignal\.timeout\(/.test(code), '🔴 推理 fetch 不得挂整流超时（会截断长回答）')
 })
 
 test('🔴 zcode 余额：`balances: []` **不是**异常，且要认顶层无 `data` 的形态', () => {

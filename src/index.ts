@@ -1043,15 +1043,29 @@ async function pollTraeLogin(
  * ⚠️ **只兜异常，不改行为**：正常路径一个字节都不受影响。
  */
 /**
- * 渠道归属前缀（`/v1/models` 的 `name` 用）。
+ * 渠道归属前缀（`/v1/models` 的 `name` 用）的**特例**。
  *
- * ⚠️ 只有这三家需要区分 —— 其余家（cline/qoder/gemini…）的 id 前缀本身
- * 已是可读的英文名，再套一层中文前缀只是噪音。
+ * 这三家用短中文标签；其余家一律用供应商展示名（`Provider.name`，
+ * 如 `Qoder (中国版)`），见 {@link channelLabelFor}。
+ *
+ * ⚠️ 早先只给这三家加前缀，理由是「其余家的 id 前缀已可读」—— 但客户端的
+ * 模型选择器**只显示 `name`、不显示 id**（用户实测：Qoder 的模型只显示
+ * `DeepSeek-Flash`，看不出是哪家、多少倍率；而多家都有同名模型）。
  */
 const CHANNEL_LABEL: Record<string, string> = {
   buddy: '国内',
   workbuddy: '国际',
   aggregate: '聚合',
+}
+
+/** `/v1/models` 名称里的渠道标签：特例表优先，否则用供应商展示名。 */
+function channelLabelFor(providerId: string): string | undefined {
+  return CHANNEL_LABEL[providerId] ?? findProvider(providerId)?.name
+}
+
+/** 倍率的展示形态：去掉浮点尾巴（`0.30000000000000004` → `0.3`）。 */
+function formatPriceFactor(value: number): string {
+  return String(Number(value.toFixed(4)))
 }
 
 /**
@@ -1094,7 +1108,7 @@ function annotateModelEntry(
   const isFree = entry.isFree === true
 
   // ── 路径 1：名称承载渠道 + 倍率 ──
-  const label = CHANNEL_LABEL[providerId]
+  const label = channelLabelFor(providerId)
   const rawName =
     typeof entry.name === 'string' && entry.name !== ''
       ? entry.name
@@ -1108,7 +1122,12 @@ function annotateModelEntry(
     // 上游的 credits 形如 `x0.21` 或 `x0.34 credits`，只取数值部分
     const mu =
       typeof entry.credits === 'string' ? entry.credits.match(/x\s*([0-9.]+)/i)?.[1] : undefined
-    if (mu !== undefined) parts.push(`×${mu}`)
+    if (mu !== undefined) {
+      parts.push(`×${mu}`)
+    } else if (typeof entry.priceFactor === 'number' && Number.isFinite(entry.priceFactor)) {
+      // 没有 `credits` 字符串的家（qoder / trae / lobsterai …）用数值倍率；0 = 免费
+      parts.push(entry.priceFactor === 0 ? '免费' : `×${formatPriceFactor(entry.priceFactor)}`)
+    }
   }
 
   const out: Record<string, unknown> = { ...entry, name: parts.join(' · ') }
@@ -4179,4 +4198,4 @@ export default {
 }
 
 // 未被使用的导出保留给后续步骤（第 6 步的网关需要），避免 tree-shaking 误删注释里的说明。
-export { cliChatHeaders, resolveUpstream }
+export { annotateModelEntry, cliChatHeaders, resolveUpstream }
