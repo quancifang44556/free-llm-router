@@ -1378,6 +1378,67 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
     return json({ ok: true, uid: body.uid, disabled: body.disabled, realm })
   }
 
+  /**
+   * 手动刷新余额快照（`POST /admin/accounts/balance`）。
+   *
+   * ## 为什么需要这个端点
+   *
+   * 余额由 cron **每小时**刷一次。但用户点开面板时想要的是**此刻**的数字，
+   * 而「刚签到完 / 刚充了额度 / 刚被扣了一大笔」这三种场景下等一小时太久。
+   *
+   * ⚠️ 与 cron 用**同一段逻辑**（`refreshAccountBalances`）：
+   * 两处各写一份必然慢慢分叉（本项目已吃过「只修一半」的亏多次）。
+   *
+   * ⚠️ 只读上游（`billing/meter/get-user-resource`），不改任何账号状态。
+   */
+  if (path === '/admin/accounts/balance' && request.method === 'POST') {
+    const body = (await request.json().catch(() => ({}))) as { realm?: string; uid?: string }
+    const now = Date.now()
+    const realms = typeof body.realm === 'string' && body.realm !== '' ? [body.realm] : ['cn', 'global']
+    const results: Array<{ uid: string; provider: string; ok: boolean; credits?: number; error?: string }> = []
+
+    for (const realm of realms) {
+      const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
+      const accounts = await pool.listAccounts(realm, now)
+      for (const account of accounts) {
+        if (typeof body.uid === 'string' && body.uid !== '' && account.uid !== body.uid) continue
+        const providerId = account.provider ?? DEFAULT_PROVIDER
+        // ⚠️ 同 cron：buddy 必须用绑定版（它的 balance 闭包依赖 env）。
+        const template = findProvider(providerId)
+        const provider = providerId === DEFAULT_PROVIDER ? bindBuddy(env) : template
+        // 没有余额端点的家如实跳过，不编造 0。
+        if (provider?.balance === undefined) {
+          results.push({ uid: account.uid, provider: providerId, ok: false, error: '该供应商无余额端点' })
+          continue
+        }
+        try {
+          const credential = (await pool.getCredential(account.uid)) as ProviderCredential | undefined
+          if (credential === undefined) {
+            results.push({ uid: account.uid, provider: providerId, ok: false, error: '凭据不可读' })
+            continue
+          }
+          const b = await provider.balance(credential, AbortSignal.timeout(20_000))
+          await pool.updateBalance(account.uid, now, {
+            credits: b.total,
+            expiring: b.expiring,
+            earliestExpiry: b.earliestExpiry,
+          })
+          results.push({ uid: account.uid, provider: providerId, ok: true, credits: b.total })
+        } catch (error) {
+          // ⚠️ 失败**不写 0**：查不到 ≠ 没钱了。
+          results.push({
+            uid: account.uid,
+            provider: providerId,
+            ok: false,
+            error: error instanceof Error ? error.message.slice(0, 160) : String(error).slice(0, 160),
+          })
+        }
+      }
+    }
+
+    return json({ ok: true, refreshed: results.filter((r) => r.ok).length, results })
+  }
+
   if (path === '/admin/accounts/remove' && request.method === 'POST') {
     const body = (await request.json().catch(() => ({}))) as { uid?: string; realm?: string; confirm?: boolean }
     if (typeof body.uid !== 'string' || body.uid === '') {
@@ -3783,6 +3844,88 @@ async function refreshExpiringCredentials(env: Env, now: number): Promise<void> 
   }
 }
 
+/**
+ * 刷新所有账号的**余额快照**（`credits` / `creditsExpiring` / `creditsEarliestExpiry`）。
+ *
+ * ## 🔴 为什么必须做（2026-10-20 实测确证）
+ *
+ * 这三个字段此前**只在 `revive()` 里写入**，正常流程无刷新入口 ⇒ 恒为 0。
+ * 实测：面板显示两个账号 `credits=0`，而直连上游
+ * `v2/billing/meter/get-user-resource` 拿到的是 **2870 / 3514**（充足）。
+ *
+ * 后果（不是显示问题，是行为错）：
+ *   1. **永久积分锁失效** —— 判据是 `credits > 0`，恒 0 就永不命中，
+ *      本该拦下的「只剩永久额度」账号照样被选中、照样烧不可撤回的积分；
+ *   2. `expiry` 策略（默认）按 `creditsExpiring` 排序 ⇒ 键全等 ⇒ 退化成 uid 轮转；
+ *   3. `random` 策略的加权退化成等权。
+ *
+ * ## 设计取舍
+ *
+ * - **逐个 try**：一个账号查余额失败不能中断整轮（与续期扫描同口径）。
+ * - **失败不写 0**：查不到就保持原值。把「查不到」写成「没钱了」是**有害**的
+ *   —— 会让永久积分锁误锁、也会让面板显示假的 0。
+ * - **跳过不支持的家**：`provider.balance === undefined` 直接跳过
+ *   （opencode 无余额端点）。
+ * - **停用账号也刷新**：用户可能只是临时停用，余额仍需准确（且不消耗请求配额
+ *   —— 这是只读端点）。但为省上游调用，**优先只刷启用中的**。
+ */
+async function refreshAccountBalances(env: Env, now: number): Promise<void> {
+  let refreshed = 0
+  let failed = 0
+  let skipped = 0
+
+  for (const realm of ['cn', 'global']) {
+    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
+    const accounts = await pool.listAccounts(realm, now)
+    for (const account of accounts) {
+      const providerId = account.provider ?? DEFAULT_PROVIDER
+      // ⚠️ **必须用绑定版**：`findProvider()` 返回的是未绑定的模板，
+      // 而 buddy（国内版）的 `balance()` 闭包捕获了 `env`（用来决定计费域）。
+      // 拿模板去调会抛 `Cannot read properties of undefined (reading 'UPSTREAM_CHAT_BASE')`
+      // —— 实测踩到：3 个 buddy 账号的余额刷新全部失败。
+      const template = findProvider(providerId)
+      const provider = providerId === DEFAULT_PROVIDER ? bindBuddy(env) : template
+      if (provider?.balance === undefined) {
+        skipped += 1
+        continue
+      }
+
+      let credential: ProviderCredential | undefined
+      try {
+        credential = (await pool.getCredential(account.uid)) as ProviderCredential | undefined
+      } catch {
+        skipped += 1
+        continue
+      }
+      if (credential === undefined) {
+        skipped += 1
+        continue
+      }
+
+      try {
+        const b = await provider.balance(credential, AbortSignal.timeout(20_000))
+        await pool.updateBalance(account.uid, now, {
+          credits: b.total,
+          expiring: b.expiring,
+          earliestExpiry: b.earliestExpiry,
+        })
+        refreshed += 1
+      } catch (error) {
+        // ⚠️ 如实记录，且**不写 0** —— 查不到 ≠ 没钱了。
+        failed += 1
+        console.warn(
+          `[cron] ${providerId} ${account.uid} 余额刷新失败（保持原值）：`,
+          error instanceof Error ? error.message : String(error),
+        )
+      }
+    }
+  }
+
+  if (refreshed + failed + skipped > 0) {
+    console.log(`[cron] 余额刷新完成：成功 ${refreshed} / 失败 ${failed} / 跳过 ${skipped}`)
+  }
+}
+
 async function scheduled(event: ScheduledController, env: Env): Promise<void> {
   const now = Date.now()
 
@@ -3807,6 +3950,20 @@ async function scheduled(event: ScheduledController, env: Env): Promise<void> {
     await refreshExpiringCredentials(env, now)
   } catch (error) {
     console.error('[cron] 主动续期整体失败：', error instanceof Error ? error.message : String(error))
+  }
+
+  // ⚠️ **余额快照也必须每个整点刷**（与续期同理，不能只在被调用时才更新）。
+  //
+  // 这两件事**必须都做**：续期管「凭据还能不能用」，余额管「还有多少额度」。
+  // 后者是永久积分锁与 `expiry` 策略的判据来源 —— 不刷新它们就等于
+  // 这两个功能从未生效（见 `refreshAccountBalances` 的注释）。
+  //
+  // ⚠️ 放在续期**之后**、`plan === undefined` 的 return **之前**：
+  // 这样即使某个整点没有任务，余额也保持新鲜。
+  try {
+    await refreshAccountBalances(env, now)
+  } catch (error) {
+    console.error('[cron] 余额刷新整体失败：', error instanceof Error ? error.message : String(error))
   }
 
   const hour = hourUtc8(now)

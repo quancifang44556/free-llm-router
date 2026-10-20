@@ -211,13 +211,13 @@ curl -N http://localhost:11451/v1/chat/completions \
 子密钥只能进 `/v1/*`，不能登录面板、不能改账号 —— 否则它能给自己扩容。子密钥可限制请求数、token 数、
 统计窗口、可用模型、来源 IP（支持 CIDR）与过期时刻。
 
-### 管理（`/admin/*`，共 42 个路径）
+### 管理（`/admin/*`，共 43 个路径）
 
 按用途分类，不逐个罗列：
 
 | 分类 | 代表路径 |
 |---|---|
-| 账号与凭据 | `accounts`、`accounts/toggle`、`accounts/remove`、`import`、`credentials`、`pool` |
+| 账号与凭据 | `accounts`、`accounts/toggle`、`accounts/remove`、`accounts/balance`（手动刷新余额）、`import`、`credentials`、`pool` |
 | 供应商与登录 | `providers`、`providers/login/{start,poll}`、`login/{start,poll}`、`providers/login/loomy/{sms,bind}`、`providers/settings` |
 | 模型目录 | `providers/models`、`providers/models/{toggle,bulk}`、`models/builtin`、`models/probe` |
 | 任务与签到 | `tasks/{scan,run,status,start}`、`tasks/daily-all`、`checkin/all` |
@@ -250,6 +250,11 @@ curl -N http://localhost:11451/v1/chat/completions \
 **永久积分锁**（配置页，逐供应商）：开启后，该供应商下「**只剩永久额度**」的账号不再参与选号。
 免费额度烧完后若继续用，消耗的是你花钱买的永久积分，且**不可撤回** —— 这个开关就是拦这件事。
 有临期额度的账号照常可用，因此它不是「停用该供应商」。
+
+> ⚠️ **开启前必读**：判据是 `credits > 0 && creditsExpiring === 0`，而 `creditsExpiring`
+> 只统计**7 天内到期**的额度。所以一个「有 2000 积分、但都在 30 天后到期」的账号，
+> 也会被判成「只剩永久额度」而被锁掉 —— 那通常不是你想要的。
+> 当前你的账号普遍属于这种情况，**建议先别开这个锁**，或把判据改成「按最早到期日判断」。
 
 **限时补偿积分**（任务中心）：上游偶尔发限时补偿（如服务抖动后补积分），过期作废。
 面板提供「查状态」（只读）与「领取」（一次性写操作）两个按钮。**刻意不接进 cron 与自动签到** ——
@@ -335,6 +340,23 @@ curl -N http://localhost:11451/v1/chat/completions \
 2. **`Retry-After` 标准头**（只有秒级粒度，作兜底）。
 3. **本地退避估算**（最后手段）。
 
+### 余额刷新
+
+`credits` / `creditsExpiring` / `creditsEarliestExpiry` 三个字段由两处维护，**共用同一段逻辑**：
+
+| 触发 | 时机 | 说明 |
+|---|---|---|
+| cron | 每小时整点 | 与凭据续期并列，在「无任务时点」也会跑 |
+| `POST /admin/accounts/balance` | 手动 | 面板想看**此刻**数字时用；只读上游，不改任何账号状态 |
+
+三条纪律：
+
+- **查不到 ≠ 没钱了**：失败时**保持原值**，绝不写 0。把「查不到」写成「0 积分」会让
+  永久积分锁误锁账号。
+- **只写额度三元组**：绝不动冷却 / 熔断 / 降权 —— 否则每次刷新都等于偷偷解冻所有账号。
+- **`buddy` 必须用绑定版 provider**：它的 `balance()` 闭包依赖 `env`，
+  拿 `findProvider()` 的未绑定模板会抛 `UPSTREAM_CHAT_BASE` 未定义（实测踩到过）。
+
 ---
 
 ## 使用边界
@@ -364,11 +386,10 @@ curl -N http://localhost:11451/v1/chat/completions \
 | **opencode 无余额端点** | 且 `fetch` 不支持 per-request 代理 ⇒ 多个匿名槽共享同一出口 IP，免费额度**无法靠多开扩容** |
 | **聚合路由不做缓存** | 每次请求现拉目录与到期时刻，刻意优先正确性（缓存新旧不一致会让「临期优先」选错） |
 | **聚合排序依赖各家 `balance()`** | 查不到余额的家（如 opencode）不参与排序 |
+| **`expiring` 只在「7 天内到期」时才非零** | `creditsExpiring` 的窗口是 7 天（对齐 Go 侧 `expiring_soon`）。所以「有额度但 7 天内不过期」时它恒为 0 —— 这不是 bug，但会让**永久积分锁**把这类账号误判成「只剩永久额度」。见下方说明 |
 | **IP 级 WAF 护栏是启发式推测** | 60 秒内 2 个不同账号接连 403 即暂停轮转；可能误判，故留了 `POST /admin/waf/clear` 人工纠正 |
 | **用量明细只留 500 条** | 更早的日键保留 90 天；明细淘汰后无法回答「某一笔长什么样」，但「用了多少」不受影响 |
 | **费用估算模块目前无生产消费者** | `src/gateway/cost-estimate.ts` 只有单测覆盖，尚未接进面板与用量统计。且它输出的是**无量纲相对值**，不是钱 —— 各家倍率不同基准，跨供应商相加没有意义 |
-| **账号 `credits` 字段不会自动刷新** | 该字段只在 `revive()` 写入，正常流程无刷新入口 ⇒ 面板上**普遍显示 0**，与上游真实余额无关。连带两个后果：① `random` 策略的加权退化成等权；② **永久积分锁**的判据 `credits > 0` 永不命中，等于未生效。真实余额可由 `/admin/accounts` 之外的途径核对（上游 `billing/meter/get-user-resource`） |
-| **`expiry` 策略实际退化为「按 uid 轮转」** | 它声称按「积分最快作废」排序，依赖 `creditsExpiring`；而该字段同 `credits` 一样恒为 0 ⇒ 排序键全等，最终按 uid 稳定排序。不会出错，但**没有实现它名字承诺的语义** |
 
 ### 关于「空回复」
 

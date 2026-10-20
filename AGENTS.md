@@ -3372,3 +3372,73 @@ HTTP 502 + {"code":11158,"msg":"model [x] is not allowed for user type [...]"}
 5. **验证方法本身也会错**。本轮我一度用 `buddy/grok-4.7` 去验 11158，
    而那个前缀走国内服、真实返回 11102 —— 差点把正确行为误判成 bug。
    验行为前先确认「这条请求真的走那条路径」。
+
+### 9.22 余额快照从不刷新（2026-10-20 晚，实测确诊并修复）
+
+#### 症状与发现路径
+
+查两个被限流账号的真实额度时，顺手看了面板：**全部显示 `credits=0`**。
+而直连上游 `v2/billing/meter/get-user-resource` 拿到的是 **2870 / 3514**（充足）。
+
+#### 根因
+
+`credits` / `creditsExpiring` / `creditsEarliestExpiry` 三个字段**只在 `revive()` 里写入**
+（那是「解冻账号」的路径），正常流程**没有任何刷新入口** ⇒ 它们永远停在
+`createAccountState()` 的初始值 0。
+
+#### 后果（不是显示问题，是行为错）
+
+1. **永久积分锁完全失效** —— 判据 `credits > 0 && creditsExpiring === 0`，
+   而 `credits` 恒 0 ⇒ 永不命中 ⇒ 本该拦下的「只剩永久额度」账号照样被选中，
+   照样烧掉**不可撤回**的永久积分。**这个开关从上线起就没生效过。**
+2. **`expiry` 策略（默认）退化** —— 它按 `creditsExpiring` 排序，
+   键全等 ⇒ 最终按 uid 稳定排序 ⇒ 实际是「按 uid 轮转」，
+   没有实现它名字承诺的「临期先烧」。
+3. `random` 策略的加权 `1 + credits/100` 退化成等权。
+
+#### 修法
+
+- **新增 `AccountPoolDO.updateBalance(uid, now, {credits, expiring, earliestExpiry})`**：
+  **只写额度三元组，绝不动惩罚态**。
+  ⚠️ 刻意不复用 `revive()` —— 那个方法会清空冷却/熔断/降权/模型冷却，
+  拿它同步余额等于**每次刷新都偷偷解冻所有账号**，熔断机制形同虚设。
+- **新增 `refreshAccountBalances(env, now)`**，接进 `scheduled` 的整点 cron
+  （放在续期之后、`plan === undefined` 的 return 之前 —— 这样无任务时点也刷）。
+- **新增 `POST /admin/accounts/balance`** 手动触发，**复用同一段逻辑**
+  （两处各写一份必然分叉，本项目已吃过多次「只修一半」的亏）。
+
+三条纪律：
+- **查不到 ≠ 没钱了**：失败保持原值，绝不写 0；
+- **只写额度三元组**，不碰惩罚态；
+- **`buddy` 必须用 `bindBuddy(env)` 的绑定版**。
+
+#### ⚠️ 修复过程中踩到的坑（值得记）
+
+`findProvider('buddy')` 返回的是**未绑定的模板**，而 buddy 国内版的 `balance()`
+闭包捕获了 `env`（用于决定计费域）。拿模板调会抛：
+
+```
+Cannot read properties of undefined (reading 'UPSTREAM_CHAT_BASE')
+```
+
+现象很有迷惑性：**8 个账号里 3 个 buddy 全失败，而 workbuddy / qodercn 正常**
+—— 因为只有 buddy 需要绑定 env。网关里早就有这个模式
+（`providerId === DEFAULT_PROVIDER ? bindBuddy(env) : provider`），新代码漏了。
+
+已加测试钉住：`findProvider('buddy').balance()` 必须**抛错**，
+而 `bindBuddy(env).balance()` 不得报 `UPSTREAM_CHAT_BASE` 缺失。
+
+#### ⚠️ 顺带发现的语义陷阱（未改，只记录）
+
+`creditsExpiring` 的窗口是**7 天**（对齐 Go 侧 `expiring_soon`）。
+所以「有 2000 积分、但都在 30 天后到期」的账号，`creditsExpiring === 0`
+⇒ 会被永久积分锁判成「只剩永久额度」⇒ **误锁**。
+
+实测当前 8 个账号**全部**处于这个状态（最早到期 9.2 天后），
+一旦开启该锁会把整池清空。已在 README 加显著警告：
+**开锁前先确认你的额度是否真的只在 7 天内到期**。
+
+更正确的判据应是「按最早到期日判断是否只剩永久额度」，但那需要区分
+「永久积分」与「有时效的赠送积分」的**来源**，而上游的 `get-user-resource`
+只给 `CapacityRemain` / `CycleCapacityRemain`，**没有来源标记** ——
+故这属于**上游数据不足以支撑**的语义，不是实现偷懒。

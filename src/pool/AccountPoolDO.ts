@@ -906,6 +906,50 @@ export class AccountPoolDO extends DurableObject<Env> {
     writeAccount(this.ctx.storage.sql, state.uid, state.realm, JSON.stringify(state), now)
   }
 
+  /**
+   * 更新账号的**余额快照**（只写额度三元组，**不碰任何惩罚态**）。
+   *
+   * ## 为什么不能用 `revive()` 代替
+   *
+   * `revive()` 的语义是「解冻」—— 它会清空冷却、熔断、降权、模型冷却。
+   * 拿它来同步余额会**顺手把惩罚态全清掉**，等于每次刷新都偷偷解冻所有账号，
+   * 熔断机制形同虚设。
+   *
+   * ## 为什么必须有这个方法
+   *
+   * `credits` / `creditsExpiring` / `creditsEarliestExpiry` 三个字段此前
+   * **只在 `revive()` 里写入**，正常流程无刷新入口 ⇒ 它们恒为初始值 0。后果：
+   *   1. 面板上所有账号都显示「0 积分」，与上游真实余额完全脱节；
+   *   2. `random` 策略的加权 `1 + credits/100` 退化成等权；
+   *   3. **永久积分锁**的判据 `credits > 0` 永不命中 ⇒ 锁形同虚设，
+   *      本该被拦下的「只剩永久额度」账号照样被选中、照样烧不可撤回的积分；
+   *   4. `expiry` 策略（默认）依赖 `creditsExpiring` 排序 ⇒ 键全等，
+   *      退化成按 uid 轮转，没有实现它名字承诺的「临期先烧」。
+   *
+   * @param credits   可用总额；`undefined` 表示本次没查到，**保持原值**（不清零）
+   * @param expiring  快过期子集（0 = 无）
+   * @param earliest  最早过期时刻（0 = 无）
+   */
+  async updateBalance(
+    uid: string,
+    now: number,
+    balance: { credits: number; expiring: number; earliestExpiry: number },
+  ): Promise<boolean> {
+    const raw = readAccount(this.ctx.storage.sql, uid)
+    if (raw === undefined) return false
+    const state = normalizeAccountState(JSON.parse(raw))
+    if (state === undefined) return false
+
+    // ⚠️ 只改这三个字段。**绝不动** until / breakerUntil / degradeUntil /
+    // modelCooldowns / disabled / fails —— 那是惩罚态，与余额无关。
+    state.credits = Math.max(0, Math.trunc(balance.credits))
+    state.creditsExpiring = Math.max(0, Math.trunc(balance.expiring))
+    state.creditsEarliestExpiry = Math.max(0, Math.trunc(balance.earliestExpiry))
+
+    writeAccount(this.ctx.storage.sql, state.uid, state.realm, JSON.stringify(state), now)
+    return true
+  }
+
   /** 解冻账号（面板「解冻」/ 签到后余额恢复）。清全部惩罚态，但不动 `disabled`。 */
   async revive(uid: string, now: number, credits?: number): Promise<boolean> {
     const raw = readAccount(this.ctx.storage.sql, uid)
