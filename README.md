@@ -6,6 +6,8 @@
 
 > ⚠️ **仅限本人授权账号自用。** 见 [使用边界](#使用边界)。
 
+![管理面板（深色）：供应商与账号](docs/screenshots/providers-dark.png)
+
 ---
 
 ## 目录
@@ -74,6 +76,9 @@
 
 两者**共用同一份 `fetch` 路由与全部业务代码**，Node 侧只是一层 HTTP / DO 桥接。
 故功能一致，差异只在存储后端与调度实现。
+
+桥接层会把对账号池 DO 的调用**逐个串行执行**，复现 Workers 上 DO 的 input gate 语义 ——
+不这样做，并发请求会在「读 → 改 → 写」之间互相覆盖（实测 50 个并发的用量记账只留下 1 次）。
 
 ---
 
@@ -231,7 +236,7 @@ curl -N http://localhost:11451/v1/chat/completions \
 
 ## 管理面板
 
-`/panel/`，**7 个视图**：
+`/panel/`，未登录时先进登录页。**7 个视图**：
 
 | 视图 | 内容 |
 |---|---|
@@ -242,6 +247,32 @@ curl -N http://localhost:11451/v1/chat/completions \
 | **模型** | 模型目录、启用 / 停用、单模型探测 |
 | **配置** | 接入指南、路由配置、**永久积分锁**开关、冷却清理 |
 | **日志** | 请求与任务日志，按类型过滤 |
+
+<table>
+  <tr>
+    <td width="50%"><img src="docs/screenshots/usage-light.png" alt="用量（浅色）"></td>
+    <td width="50%"><img src="docs/screenshots/config-light.png" alt="配置与接入指南（浅色）"></td>
+  </tr>
+  <tr>
+    <td align="center">用量（浅色）</td>
+    <td align="center">配置与接入指南（主密钥默认打码）</td>
+  </tr>
+  <tr>
+    <td width="50%"><img src="docs/screenshots/modal-dark.png" alt="账号管理弹窗（深色）"></td>
+    <td width="50%"><img src="docs/screenshots/mobile.png" alt="手机端"></td>
+  </tr>
+  <tr>
+    <td align="center">供应商弹窗：账号 / 模型 / 添加账号</td>
+    <td align="center">手机端</td>
+  </tr>
+</table>
+
+- **主题**：深色 / 浅色 / 跟随系统，右上角切换；首次打开跟随系统，选过之后记住。
+- **手机可用**：窄屏下导航横向滚动、统计卡片两列排布，弹窗变成底部抽屉。
+- **零外部依赖**：HTML / CSS / JS 全部打进产物，不加载任何 CDN、字体或统计脚本，配严格 CSP。
+- **主密钥默认打码**：配置页的 API Key 与 cURL 示例只显示打码后的值，「复制」拿到的仍是完整值 ——
+  截图、录屏、投屏都不会把口令带出去。
+- 顶栏版本号取自 `package.json`，不会再与实际版本对不上。
 
 页面本身免鉴权（不含数据），口令存在 `localStorage`、每个请求带 `Authorization` 头 ——
 刻意不用 cookie，避免额外引入 CSRF 面。
@@ -389,6 +420,7 @@ curl -N http://localhost:11451/v1/chat/completions \
 | **聚合排序依赖各家 `balance()`** | 查不到余额的家（如 opencode）不参与排序 |
 | **`expiring` 只在「7 天内到期」时才非零** | `creditsExpiring` 的窗口是 7 天（对齐 Go 侧 `expiring_soon`）。所以「有额度但 7 天内不过期」时它恒为 0 —— 这不是 bug，但会让**永久积分锁**把这类账号误判成「只剩永久额度」。见下方说明 |
 | **IP 级 WAF 护栏是启发式推测** | 60 秒内 2 个不同账号接连 403 即暂停轮转；可能误判，故留了 `POST /admin/waf/clear` 人工纠正 |
+| **子密钥限额可被小幅超出** | 限额是「请求前检查、完成后累加」：同时发出的多个请求会在累加前一起通过检查，超出量约等于并发数。token 限额本就要等响应结束才知道用量，单个请求也可能越线 |
 | **用量明细只留 500 条** | 更早的日键保留 90 天；明细淘汰后无法回答「某一笔长什么样」，但「用了多少」不受影响 |
 | **费用估算模块目前无生产消费者** | `src/gateway/cost-estimate.ts` 只有单测覆盖，尚未接进面板与用量统计。且它输出的是**无量纲相对值**，不是钱 —— 各家倍率不同基准，跨供应商相加没有意义 |
 

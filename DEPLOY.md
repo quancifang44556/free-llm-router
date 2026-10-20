@@ -57,7 +57,7 @@ EOF
 | `PORT` | `11451` | 监听端口 |
 | `HOST` | `0.0.0.0` | 监听地址（**只在本机反代时建议改 `127.0.0.1`**） |
 | `DATABASE_PATH` | `./data/router.db` | SQLite 文件路径 |
-| `API_KEY` | *（空）* | 面板与全部 API 的口令。**不设 = 任何人可访问** |
+| `API_KEY` | *（空）* | 面板与全部 API 的口令。**不设则任何请求 401**（fail-closed） |
 | `CREDENTIAL_KEY` | *（自动生成）* | 凭据 AES-GCM 加密密钥 |
 | `AUTO_TASK_CRON` | `true` | 每小时自动巡检（签到 / 成长任务）开关（`false` / `0` / `no` / `off` 关闭） |
 | `TRUST_PROXY` | `false` | 走反向代理时设为 `true`，否则子密钥的「来源 IP」会全部显示为反代地址（见 §1.6） |
@@ -140,7 +140,7 @@ node dist/server.mjs
 
 ### 1.5 打开面板
 
-浏览器访问 `http://<你的服务器IP>:11451/panel/`，把 `API_KEY` 填进右上角输入框。
+浏览器访问 `http://<你的服务器IP>:11451/panel/`，在登录页输入 `API_KEY` 即可进入。
 
 > `/` 根路径返回 **401**（需密钥）—— 刻意如此，避免被扫到。
 > 面板页面本身不含敏感数据，但所有数据接口都要 `Authorization`。
