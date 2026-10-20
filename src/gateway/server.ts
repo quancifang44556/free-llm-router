@@ -317,7 +317,17 @@ export function refineModelScoped(
   if (code === 6004 || code === 14003) return { dimension: 'model', code, resetAt }
   // ⚠️ 文案兜底（第二道腿）：上游换码值时仍能判对。只认「模型」语义的措辞，
   // **不得**匹配泛泛的 "too many requests"（那是真·账号级限流）。
+  //
+  // 🔴 必须同时认**中文**（2026-10-20 实测确证的真实缺陷）：
+  //   国内服 6004 的原文是
+  //   `您的使用量已超出频率限制，将在 … 重置，**您也可以切换其他模型继续使用**。`
+  //   这句「可以切换其他模型」明确说明是**模型级**（打个别的模型就能用）。
+  //   旧实现只认英文正则 ⇒ 判成 `soft`（账号级）⇒ **整个账号被关掉**，
+  //   而实际上只需换模型。用户体感正是「号是好的却用不了」。
   if (/model\s*busy|switch\s+(?:to\s+the\s+other|models?\b)|other model/i.test(bodyText)) {
+    return { dimension: 'model', code, resetAt }
+  }
+  if (/切换(?:其他|别的|其它)?模型|其他模型(?:继续)?(?:使用|可用)|换个模型/i.test(bodyText)) {
     return { dimension: 'model', code, resetAt }
   }
   return { dimension: 'soft', code, resetAt }
@@ -338,10 +348,37 @@ export function parseBusinessCode(bodyText: string): number | undefined {
  *
  * ⚠️ 时区必须按文案里的 `UTC+8` 偏移换算（**不能**用运行时本地时区：
  * Worker 跑在 UTC，直接 `new Date(str)` 会差 8 小时）。
- * 只认这一种实测到的格式；认不出就返回 undefined（回落到本地退避）。
+ *
+ * ## 🔴 必须同时认**中文**文案（2026-10-20 实测确证的真实缺陷）
+ *
+ * 上游对国内服下发的是**中文**：
+ *   `您的使用量已超出频率限制，将在 2026-10-21 13:16:46 UTC+8 重置，
+ *     您也可以切换其他模型继续使用。`
+ *
+ * 而旧实现只匹配英文 `reset at …` ⇒ 这类文案**从未被解析出来**，
+ * 于是国内服的限流一直走「自己猜的退避时长」：
+ *   - 猜短了：冷却结束时上游仍限流，白撞一次；
+ *   - 猜长了：上游早已恢复，账号却还被关着（用户体感正是「号是好的却用不了」）。
+ *
+ * 实测后果：`deepseek-v4.1-flash` 的上游重置时刻是 `21:37:05`，
+ * 而本地按 15s→90s 短退避反复探测，与真实窗口完全脱节。
+ *
+ * ⇒ 现在两种语言、多种措辞都认，且**优先级**为：
+ *   ① 文案里的绝对墙钟（最精确，含时区）
+ *   ② `Retry-After` 标准头（只有秒级粒度，作兜底）
+ *   ③ 本地退避估算（最后手段）
  */
 export function parseResetAt(bodyText: string): number | undefined {
-  const m = /reset at (\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})\s*UTC([+-])(\d{1,2})/.exec(bodyText)
+  // ⚠️ 关键：**不能**把措辞写死在正则里（`reset at` vs `将在 … 重置` 随时会变）。
+  // 只要报文里同时出现「日期时间 + UTC 偏移」，就按墙钟解析 —— 语义由上下文决定
+  // （本函数只在限流/冷却路径上被调用，不存在「普通正文里恰好有日期」的误判场景）。
+  const m =
+    // 英文：`reset at 2026-10-05 14:47:23 UTC+8`
+    /reset at (\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})\s*UTC([+-])(\d{1,2})/.exec(bodyText) ??
+    // 中文：`将在 2026-10-21 13:16:46 UTC+8 重置`
+    /将在\s*(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})\s*UTC([+-])(\d{1,2})/.exec(bodyText) ??
+    // 兜底：任何 `YYYY-MM-DD HH:MM:SS UTC±N`（措辞再变也不怕）
+    /(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})\s*UTC([+-])(\d{1,2})/.exec(bodyText)
   if (m === null) return undefined
   const [, y, mo, d, h, mi, sec, sign, offRaw] = m
   const offsetHours = Number.parseInt(offRaw ?? '0', 10) * (sign === '-' ? -1 : 1)
