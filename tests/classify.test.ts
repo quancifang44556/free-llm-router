@@ -17,7 +17,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { classify, isWafBlocked, parseEnvelope, shouldPunish, shouldRotate } from '../src/upstream/client.ts'
+import { classify, isWafBlocked, parseEnvelope, shouldPunish, shouldRotate, CHANNEL_BLOCKED_CODE } from '../src/upstream/client.ts'
 
 /** 真实抓到的 401 HTML（APISIX / openresty）。 */
 const HTML_401 =
@@ -94,7 +94,7 @@ test('parseEnvelope：认数字 code，也认**字符串 code**（渠道拦截�
   const FP = String.fromCharCode(0x31, 0x31, 0x2d, 0x31, 0x32, 0x38)
   const channelBody = JSON.stringify({ code: FP, msg: 'Illegal API invocation from an unapproved channel' })
   assert.notEqual(parseEnvelope(channelBody), undefined, '字符串渠道拦截码必须被认出')
-  assert.equal(String(parseEnvelope(channelBody)?.code), FP)
+  assert.equal(parseEnvelope(channelBody)?.code, CHANNEL_BLOCKED_CODE)
 
   // 畸形体：空串 / 纯空白 / 非字符串非数字 都**不是**信封
   assert.equal(parseEnvelope('{"code":""}'), undefined, '空串码不是信封')

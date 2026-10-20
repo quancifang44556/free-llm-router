@@ -753,15 +753,21 @@ export class AccountPoolDO extends DurableObject<Env> {
         pruneExpired(state, now, MODEL_COST_TTL_MS)
         const prev = state.modelCooldowns[model]
         const hits = (prev?.hits ?? 0) + 1
-        // 6004：对齐上游重置墙钟，未下发墙钟时按 60s 起步退避（频次超限短时退避）；
+        // 6004 / 14003：对齐上游重置墙钟，未下发墙钟时按 15s 起步退避（频次超限短时退避）；
         // 11102（无此模型）：6h 起指数退避，封顶 24h。
         const isNotAvailable =
           input.reason?.includes('11102') ||
           input.reason?.includes('service info not found') ||
           input.reason?.includes('not found')
+        // ⚠️ 6004/14003 这类「模型繁忙」的冷却**必须短**（2026-10-20 实测）。
+        //
+        // 原实现起步 60s、指数翻倍封顶 10 分钟；而国际服实测窗口是「约 8 秒一发就不撞」，
+        // 冷却 10 分钟等于把整池账号白白关掉（用户侧表现为「刚修好又全挂」）。
+        // 故起步 15s、封顶 90s —— 略高于实测安全间隔，又能快速自愈。
+        // 1 分钟这个量级是**上游真实提示**（`Wait about a minute`）的老口径，对 14003 不适用。
         const fallbackCooldown = isNotAvailable
           ? Math.min(6 * 60 * 60 * 1000 * 2 ** Math.min(hits - 1, 2), 24 * 60 * 60 * 1000)
-          : Math.min(60_000 * 2 ** Math.min(hits - 1, 3), 10 * 60 * 1000)
+          : Math.min(15_000 * 2 ** Math.min(hits - 1, 3), 90_000)
         const until =
           input.resetAt !== undefined && input.resetAt > now
             ? input.resetAt

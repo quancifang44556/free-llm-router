@@ -110,6 +110,128 @@ export const CODEBUDDY_CLIENT_VERSION = '1.106.1'
  */
 export const CLIENT_VERSION_INTL = '5.5.2'
 
+/**
+ * 国际服**桌面端** 5.8.4 的 UA（2026-10-16 抓包 + 2026-10-20 本机实测 200）。
+ *
+ * ## ⚠️ 中段是小写 `workbuddy-ai`，不再是旧的 `WorkBuddy AI`
+ *
+ * 旧值 `WorkBuddy/… WorkBuddy AI/…` 是 v0.1.1 时代照抄参考实现的形态，**已失效**：
+ * 上游 2026-10-20 起把国际服的渠道指纹判据换成了桌面端 5.8.4 的那一套，
+ * 用旧 UA 一律回 `11-128 request illegal`。UA 是这套判据的输入之一，
+ * 与账号是否有效无关（5 个账号用同一套头全部 11-128 已证实），
+ * 故这里逐字对齐抓包，连大小写都不能改。
+ */
+export const INTL_DESKTOP_UA = 'WorkBuddy/5.8.4 workbuddy-ai/5.8.4 CLI/2.161.0'
+/** 国际服桌面端版本号，必须与 `INTL_DESKTOP_UA` 自洽（同一请求里两个版本号就是露馅点）。 */
+export const INTL_DESKTOP_VERSION = '5.8.4'
+
+/**
+ * 国际服的**会话头族**（5 个）。
+ *
+ * ## ⚠️ 为什么这 5 个缺一不可
+ *
+ * 上游 2026-10-20 起给国际服加了会话头族强校验。实测单变量对照：
+ * 只补前 3 个仍 11-128（甚至退化成 429/14003），补到第 5 个才 200。
+ * 它属于**渠道指纹**的一部分，缺任意一个都判「不是官方客户端发的」。
+ *
+ * Base 与 chat 端点不同：`X-Conversation-ID` 在这里也要发，
+ * 而 `cliChatHeaders` 那套（国内口径）是「空则不发」——那是国内服的规矩，别混用。
+ *
+ * @param input 空值一律现生成：宁可退化也不缺头，缺头的代价是整条请求被拒。
+ */
+export function intlConversationHeaders(input: {
+  /** 会话 ID：同一会话恒定（上游据此把多轮归到一条会话）。 */
+  conversationId?: string
+  /** 轮级 ID：一次用户发送内恒定（重试复用，否则上游看到的是新的一轮）。 */
+  turnRequestId?: string
+}): HeaderMap {
+  const conversationId =
+    input.conversationId !== undefined && input.conversationId !== ''
+      ? input.conversationId
+      : crypto.randomUUID()
+  const turnRequestId =
+    input.turnRequestId !== undefined && input.turnRequestId !== '' ? input.turnRequestId : randomHex32()
+  // 消息级 ID 必须**每请求新生成**：它与轮级 ID 相等就等于承认「同一个请求重发了」
+  const messageId = randomHex32()
+  return {
+    'X-Conversation-ID': conversationId,
+    'X-Conversation-Request-ID': turnRequestId,
+    'X-Root-Request-ID': turnRequestId,
+    'X-Conversation-Message-ID': messageId,
+    // ⚠️ 与消息级 ID 同值（抓包实测如此），上游会交叉校验这两行的对应关系
+    'X-Request-ID': messageId,
+  }
+}
+
+/**
+ * 国际服的**设备头**（2 个）：`X-Machine-ID` + `X-Session-ID`。
+ *
+ * ## ⚠️ 为什么必须补（2026-10-20 二次实测）
+ *
+ * 会话头族补齐后，国际服又会按**设备维度**限流：实测同时用 3 个账号各发一条，
+ * 首条拿 200、后两条 429 `14003 Model busy`；串行重试时同一账号反复 14003。
+ * 而官方客户端一定带 `X-Machine-ID`（OS 硬件 UUID，每台设备恒定）。
+ *
+ * 网关是一个长驻进程同时冒充多台设备 —— 若在进程维度取一次，所有账号共用同一个
+ * machineId，那就是把整池账号关联到同一台机器上（比不发更糟）。故**按账号稳定派生**：
+ * 同一账号恒定、账号之间互不相同，等价于「每个账号一台虚拟设备」。
+ *
+ * 形态按抓包：`machineId` / `sessionId` 都是**带连字符的 UUID**。
+ * 用户若传了真实设备标识就用用户的（更贴近真实客户端），否则派生。
+ *
+ * ⚠️ 这里**不做** SHA-256（`crypto.subtle` 是异步的，构造函数必须是同步的）；
+ * 派生用同步的 FNV-1a 32 位四路混合，足以保证「同账号稳定 + 跨账号不撞」。
+ */
+export function intlDeviceHeaders(input: {
+  uid: string
+  /** 真实设备标识（可选）：来自凭据里的 machineId / deviceId，有则优先用。 */
+  machineId?: string
+  sessionId?: string
+}): HeaderMap {
+  const uid = input.uid
+  return {
+    'X-Machine-ID': input.machineId !== undefined && input.machineId !== ''
+      ? input.machineId
+      : deriveUuidLike(`machine:${uid}`),
+    'X-Session-ID': input.sessionId !== undefined && input.sessionId !== ''
+      ? input.sessionId
+      : deriveUuidLike(`session:${uid}`),
+  }
+}
+
+/**
+ * 由任意种子稳定派生一个**带连字符的 UUIDv4 形状**字符串（同步、无依赖）。
+ *
+ * 用于设备标识：同一账号每次得到同一个值，不同账号得到不同的值。
+ * 四段 FNV-1a 用不同盐跑，避免「不同种子撞在同一段前缀」。
+ */
+export function deriveUuidLike(seed: string, salt = ''): string {
+  /** FNV-1a 32 位 → 8 位 hex（分段用不同后缀，避免各段高度相关）。 */
+  const chunk = (suffix: string): string => {
+    let h = 0x811c9dc5
+    const text = `${salt}${seed}#${suffix}`
+    for (let i = 0; i < text.length; i += 1) {
+      h ^= text.charCodeAt(i)
+      h = Math.imul(h, 0x01000193) >>> 0
+    }
+    // ⚠️ 搅动必须写成 `h = (h ^ (h >>> 15)) >>> 0`。
+    // 这里曾误写成 `h ^= h >>> 15` —— 复合赋值把「右移结果」**赋回** h，
+    // 等价于 `h = h >>> 15`，高位全丢、尾部变短。
+    h = (h ^ (h >>> 15)) >>> 0
+    h = Math.imul(h, 0x2545f491) >>> 0
+    h = (h ^ (h >>> 13)) >>> 0
+    return h.toString(16).padStart(8, '0')
+  }
+  // ⚠️ 每个字段必须**精确按段宽**取字符（8-4-4-4-12）。
+  // 曾写过「把某个数组元素改成 `'4'`」的版本 —— 那会丢掉该字节的高半字节，
+  // 整串少一位，产出一个**不报错**的「假 UUID」。这里用纯字符串切片，长度天然守恒。
+  const hex = `${chunk('a')}${chunk('b')}${chunk('c')}${chunk('d')}`.slice(0, 32)
+  const versioned = `${hex.slice(0, 12)}4${hex.slice(13)}`
+  const variant = (Number.parseInt(versioned.slice(16, 18), 16) & 0x3f) | 0x80
+  const v = `${versioned.slice(0, 16)}${variant.toString(16).padStart(2, '0')}${versioned.slice(18)}`
+  return [v.slice(0, 8), v.slice(8, 12), v.slice(12, 16), v.slice(16, 20), v.slice(20)].join('-')
+}
+
 /** 桌面端 UA（`desktop.go:43`）。 */
 export function desktopUserAgent(): string {
   return `WorkBuddy/${DESKTOP_VERSION} WorkBuddy/${DESKTOP_VERSION} CLI/${DESKTOP_CLI_VERSION}`
@@ -230,33 +352,100 @@ export function cliCommonHeaders(input: {
  *
  * ⇒ 这里按**参考实现逐字对齐**：只发它发的那些。
  *
+ * ## ⚠️ 国际服分支已于 2026-10-20 换成「桌面端 5.8.4 + 会话头族」
+ *
+ * 上表的 11 个头仍能打**国内服**，但上游给国际服换了判据：只发这 11 个一律回
+ * `11-128 request illegal`（5 个账号同款结果 ⇒ 判的是请求头，不是账号）。
+ * 单变量实测：补上场会话头族即 200；只改 UA 或只改 `X-IDE-Version` 都还是 400。
+ * 故国际服分支按抓包逐字发 5.8.4 桌面端身份，并附 `intlConversationHeaders()`。
+ * 国内服分支**一个字都不动**——它的现行口径实测仍然 200。
+ *
  * @param input 与 `cliChatHeaders` 相同的输入（保留形参以便将来切换）
  */
 export function referenceChatHeaders(input: {
   uid: string
   accessToken: string
   variant?: 'buddy' | 'workbuddy'
+  /** 国际服会话 ID（同一会话恒定）。拿不到就省略，函数内部兜底生成。 */
+  conversationId?: string
+  /** 真实设备标识（凭据里带的 machineId / deviceId），有则优先于派生的稳定值。 */
+  machineId?: string
+  /** 真实会话标识（凭据里带的 sessionId）。 */
+  sessionId?: string
+  /** 国际服轮级 ID（重试须复用，否则上游视作新的一轮）。拿不到就省略。 */
+  turnRequestId?: string
 }): HeaderMap {
-  const intl = input.variant === 'workbuddy'
+  if (input.variant === 'workbuddy') return intlReferenceChatHeaders(input)
+
   const headers: HeaderMap = {
     Accept: 'text/event-stream',
     'Content-Type': 'application/json',
     // ⚠️ 与端点一致（参考实现 `buddy-adapter.ts:1969`）
-    'X-Domain': intl ? 'www.workbuddy.ai' : 'copilot.tencent.com',
-    'X-Product-Code': intl ? 'workbuddy' : 'codebuddy',
+    'X-Domain': 'copilot.tencent.com',
+    'X-Product-Code': 'codebuddy',
     'X-Agent-Purpose': 'conversation',
     // ⚠️ **归属名按变体切换**：国内版是 `CodeBuddy`，国际版是 `WorkBuddy`
     //（参考实现 `product.ts:311` 的 `attributionName`）。
     // 发错会让后台「使用端」归因错误。
-    'X-IDE-Name': intl ? 'WorkBuddy' : 'CodeBuddy',
-    'X-IDE-Type': intl ? 'WorkBuddy' : 'CodeBuddy',
-    'X-IDE-Version': intl ? CLIENT_VERSION_INTL : CODEBUDDY_CLIENT_VERSION,
-    'X-Product': intl ? 'WorkBuddy' : 'CodeBuddy',
+    'X-IDE-Name': 'CodeBuddy',
+    'X-IDE-Type': 'CodeBuddy',
+    'X-IDE-Version': CODEBUDDY_CLIENT_VERSION,
+    'X-Product': 'CodeBuddy',
     // ⚠️ UA 是**完全不同的格式**（不是同一个模板换段）：
-    // 国内版 `CodeBuddyIDE/1.106.1`，国际版 `WorkBuddy/… WorkBuddy AI/…`。
-    'User-Agent': intl ? cliUserAgentIntl() : CODEBUDDY_USER_AGENT,
+    // 国内版 `CodeBuddyIDE/1.106.1`，国际版 `WorkBuddy/… workbuddy-ai/…`。
+    'User-Agent': CODEBUDDY_USER_AGENT,
   }
   if (input.accessToken !== '') headers.Authorization = `Bearer ${input.accessToken}`
+  return headers
+}
+
+/**
+ * 国际服参考口径的 chat 头（桌面端 5.8.4 身份 + 会话头族）。
+ *
+ * 单独抽出来只是为了让 `referenceChatHeaders` 的两个变体各自可读；
+ * **判据依据见 `referenceChatHeaders` 上方那段实测记录**，这里不再重复。
+ */
+function intlReferenceChatHeaders(input: {
+  uid: string
+  accessToken: string
+  conversationId?: string
+  turnRequestId?: string
+  machineId?: string
+  sessionId?: string
+}): HeaderMap {
+  // ⚠️ 官方值就是 `SaaS`（部署类型），不是产品名 `WorkBuddy` ——
+  // 与 `X-IDE-Name` 分工不同，发成 `WorkBuddy` 会被判身份不自洽。
+  const headers: HeaderMap = {
+    Accept: 'text/event-stream',
+    'Content-Type': 'application/json',
+    'X-Agent-Intent': 'craft',
+    'X-Agent-Purpose': 'conversation',
+    'X-Agent-Type': 'main',
+    'X-IDE-Name': 'WorkBuddy',
+    'X-IDE-Type': 'WorkBuddy',
+    'X-IDE-Version': INTL_DESKTOP_VERSION,
+    'X-Private-Data': 'true',
+    'X-Product': 'SaaS',
+    'X-Domain': 'www.workbuddy.ai',
+    'User-Agent': INTL_DESKTOP_UA,
+    // ⚠️ 设备头（2026-10-20 二次实测：只补会话头族仍会被按设备维度 429 14003）
+    ...intlDeviceHeaders({
+      uid: input.uid,
+      ...(input.machineId === undefined ? {} : { machineId: input.machineId }),
+      ...(input.sessionId === undefined ? {} : { sessionId: input.sessionId }),
+    }),
+    ...intlConversationHeaders({
+      ...(input.conversationId === undefined ? {} : { conversationId: input.conversationId }),
+      ...(input.turnRequestId === undefined ? {} : { turnRequestId: input.turnRequestId }),
+    }),
+  }
+  if (input.accessToken !== '') {
+    headers.Authorization = `Bearer ${input.accessToken}`
+    // ⚠️ 抓包里的 `X-User-Id` 是**裸 uid**，不带 `workbuddy:` 前缀 ——
+    // 账号池里存的是带前缀的形态，直接透传会让「用户」与「令牌」对不上。
+    const uid = input.uid.replace(/^workbuddy:/, '')
+    if (uid !== '') headers['X-User-Id'] = uid
+  }
   return headers
 }
 
@@ -311,6 +500,19 @@ export function cliChatHeaders(input: {
   // ⚠️ 只有非空才发：空串会让上游误判为「显式要求空会话」
   if (input.conversationId !== undefined && input.conversationId !== '') {
     headers['X-Conversation-ID'] = input.conversationId
+  }
+
+  // ⚠️ 国际服还要补齐会话头族：上面的 4 个是**国内口径**，上游给国际服另加了一条校验，
+  // 缺 `X-Request-ID` 等头会回 `11-128 request illegal`（逐头累加实测：补到最后一个才 200）。
+  // 这一步**不改国内分支的任何值**，只在国际服上覆盖/补齐同名头。
+  if (input.variant === 'workbuddy') {
+    Object.assign(
+      headers,
+      intlConversationHeaders({
+        ...(input.conversationId === undefined ? {} : { conversationId: input.conversationId }),
+        turnRequestId: input.conversationRequestId,
+      }),
+    )
   }
 
   return headers

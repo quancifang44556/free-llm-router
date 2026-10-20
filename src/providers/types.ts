@@ -90,6 +90,8 @@ export interface ProviderCapabilities {
 }
 
 /** 对话请求（与 OpenAI 兼容，但由各供应商自行转换）。 */
+import type { ConversationContext } from './conversation.js'
+
 export interface ChatRequest {
   /** 模型 id（**不含** `provider/` 前缀）。 */
   model: string
@@ -97,6 +99,13 @@ export interface ChatRequest {
   body: Record<string, unknown>
   /** 客户端断开信号。 */
   signal: AbortSignal
+  /**
+   * 会话 / 轮级请求 id（可选）。
+   *
+   * ⚠️ 只有 WorkBuddy **国际服**在用它：上游强校验会话头族，缺了回 400 `11-128`。
+   * 其余 provider 不读这个字段（国内服实测不需要）。
+   */
+  conversation?: ConversationContext
 }
 
 /** 模型目录条目（统一形状）。 */

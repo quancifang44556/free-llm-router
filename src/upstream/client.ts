@@ -21,16 +21,7 @@ import type { HeaderMap } from './headers.js'
 
 /** 上游业务信封（所有端点统一形态）。 */
 export interface Envelope<T = unknown> {
-  /**
-   * 业务码。
-   *
-   * ⚠️ **不一定是数字**：渠道拦截返回的是字符串 `"11-128"`
-   * （报文原文 `{"code":"11-128","msg":"Illegal API invocation from an unapproved channel"}`）。
-   * 此前这里声明为 `code: number`，于是那个字符串码被当成 `NaN`，
-   * `channel_blocked` 分支**永远不会触发** —— 所有渠道拦截都落到 `unknown`，
-   * 进而被当成 waf/breaker 误罚账号。
-   */
-  code: number | string
+  code: number
   msg: string
   data?: T
 }
@@ -96,31 +87,21 @@ export class UpstreamError extends Error {
 }
 
 /**
- * 渠道拦截码（**字符串形态**）。
+ * 渠道校验失败（`"11-128"`）的归一化业务码。
  *
- * ⚠️ 用码点构造而非字面量：真实码是 `11-128`（ASCII 连字符 U+002D），
- * 而本项目源码里此前大面积写成无连字符形态，两者渲染几乎无法用肉分辨，
- * 一旦被编辑器/构建链归一化就会静默失效。
- */
-const CHANNEL_BLOCK_CODE = String.fromCharCode(0x31, 0x31, 0x2d, 0x31, 0x32, 0x38)
-
-/**
- * 把业务码归一成 `number | undefined`（供 `ErrorKind.code` 等数字字段使用）。
+ * ⚠️ 上游原码是**带连字符的字符串**，不是数字。JS 里没有「非数字但可比较」的码，
+ * 故归一成一个**不可能与真实业务码冲突**的负值，让 `CODE_KIND` 能正常查表。
  *
- * ⚠️ 非数字码（如字符串 `"11-128"`）在这里返回 `undefined` —— 它的语义已经由
- * `kind: 'channel_blocked'` 表达，不需要再塞进数字字段。
- * 硬转 `Number("11-128")` 会得到 `NaN`，而 `NaN` 参与任何比较都是 false，
- * 会制造出「看起来有值但判不中」的静默缺陷。
+ * ⚠️ 取值必须是**字面量负数**：写成 `-11-128` 会被 JS 求值成算术表达式 `-11 - 128`（= `-139`），
+ * 而 `-139` 是「看起来像业务码」的普通负值，日后极易与真码撞车且难以肉眼发现。
+ * 现用 `-108128`（把连字符两侧原样拼接）——上游业务码全为正整数，负值永不冲突。
  */
-function numericCode(code: number | string): number | undefined {
-  return typeof code === 'number' ? code : undefined
-}
+export const CHANNEL_BLOCKED_CODE = -108128
 
 /** 已知业务码 → 错误类别。数值来自 Go 侧实测。 */
 const CODE_KIND: Record<number, ErrorKind> = {
   6004: 'rate_limited',
   11102: 'model_unavailable',
-  // 14003 = WorkBuddy 国际版「模型繁忙」（实测原文见 server.ts 的 refineModelScoped）
   14003: 'rate_limited',
   14018: 'credit_exhausted',
   14017: 'rate_limited',
@@ -144,8 +125,7 @@ const CODE_KIND: Record<number, ErrorKind> = {
   // 两者都要「软冷却 + 不换号」，但 `waf_blocked` 还会触发**IP 级判定**
   //（`noteWaf`）—— 而 11128 与出口 IP **无关**，用它触发 IP 判定会**误报全局封锁**。
   // 这正是「有的软件能用、有的不能」的原因：凑够 2 个账号就整体停服 60 秒。
-  // ⚠️ 渠道拦截的 code 是**字符串** `"11-128"`（不是数字），见下方 `CHANNEL_BLOCK_CODE`。
-  // 它不能放进这张 `Record<number, ErrorKind>` —— 放进来就是永不命中的死键。
+  [CHANNEL_BLOCKED_CODE]: 'channel_blocked',
   // 幂等命中：签到已领（视为成功）
   10001: 'already_done',
   1001: 'already_done',
@@ -178,40 +158,27 @@ export function parseEnvelope(text: string): Envelope | undefined {
     if (value === null || typeof value !== 'object' || Array.isArray(value)) return undefined
     const obj = value as Record<string, unknown>
     const raw = obj.code
-    // ⚠️⚠️ **不能对字符串码做 `Number()` 转换**（2026-10-19 修复）。
-    //
-    // 上游渠道拦截返回的是 `{"code":"11-128","msg":"Illegal API invocation from an unapproved channel"}` ——
-    // 一个**非数字**字符串。而 `Number("11-128")` = `NaN`，`Number.isFinite(NaN)` = false，
-    // 于是这个信封被判成「不是信封」⇒ 返回 undefined ⇒ 走「无信封」分支，
-    // 而那里对 403 的判定是 **`waf_blocked`**。
-    //
-    // ⇒ 后果链：真实的「渠道指纹不被认可」被误判成「出口 IP 被封」，
-    //   进而触发 `noteWaf()` 的 **IP 级**判定 —— 凑够 2 个账号就让整个服务
-    //   停服 60 秒。这正是用户看到的「有的软件能用、有的不能」。
-    //
-    // 故：**保留原始值**（number 或 string 都认），只在需要数字的地方用 numericCode()。
-    // ⚠️⚠️ **不能接受任意字符串**（2026-10-19 红队实测发现）。
-    //
-    // 最初为了让渠道拦截码 `"11-128"` 能被认出，这里放宽成了「任何字符串都算」。
-    // 但那会带来一个真实缺陷：**任意畸形字符串**（如 `{"code":"abc"}`）
-    // 都会被当成合法业务信封 ⇒ 落进后面的分类分支。
-    //
-    // 实测后果：`403 + {"code":"abc"}` 原先（Number() 得 NaN）判 `waf_blocked`，
-    // 放宽后变成 `auth_error` —— 而 `auth_error` 的 `shouldRotate = true`，
-    // 会**白换号**，还可能触发不必要的凭据续期。而真实语义是「这不是信封」。
-    //
-    // ⇒ 收紧为：**数字**，或**形如错误码的字符串**（含连字符/为纯数字串）。
-    //   真实存在的字符串码只有 `11-128` 这一类（形如 `NN-NNN`），
-    //   纯数字串（如 `"6004"`）也照旧接受。别的形态一律当「没有业务码」。
-    const code = (() => {
-      if (typeof raw === 'number') return raw
-      if (typeof raw !== 'string') return undefined
-      const t = raw.trim()
-      if (t === '') return undefined
-      // 形如 11-128（错误码）或纯数字串
-      return /^\d+(-\d+)?$/.test(t) ? t : undefined
-    })()
-    if (code === undefined) return undefined
+    // ⚠️ 上游有两种码形态：数字（`6004`）与**带连字符的字符串**（`"11-128"`）。
+    // 后者是渠道校验失败的真实形态，`Number("11-128")` = NaN，
+    // 原实现直接 `return undefined` ⇒ 整条响应被当成「无信封的裸 400/429」，
+    // 分类与错误文案全部丢失（实测：网关只回一个含糊的 400）。
+    // 这里把 `NN-NNN` 归一成一个稳定的负值，让 `classify` 能认出来。
+    // ⚠️ 不能放宽成「任何字符串码都归一」：只有 `数字-数字` 形态才是 11-128 这一类；
+    // 其他字符串（如 `"6004"`）仍交给下面按数字解析，否则会把可识别的码误判成渠道拦截。
+    if (typeof raw === 'string' && /^\d+-\d+$/.test(raw.trim())) {
+      return {
+        code: CHANNEL_BLOCKED_CODE,
+        msg: typeof obj.msg === 'string' && obj.msg !== '' ? obj.msg : raw.trim(),
+        data: obj.data,
+      }
+    }
+    const code =
+      typeof raw === 'number'
+        ? raw
+        : typeof raw === 'string' && raw.trim() !== ''
+          ? Number(raw)
+          : Number.NaN
+    if (!Number.isFinite(code)) return undefined
     return {
       code,
       msg: typeof obj.msg === 'string' ? obj.msg : '',
@@ -256,32 +223,31 @@ export function classify(httpStatus: number, bodyText: string): { kind: ErrorKin
 
   // ── 2. 5xx ──
   if (httpStatus >= 500) {
-    return { kind: 'server', code: envelope ? numericCode(envelope.code) : undefined, msg: envelope?.msg ?? `upstream ${httpStatus}` }
+    return { kind: 'server', code: envelope?.code, msg: envelope?.msg ?? `upstream ${httpStatus}` }
   }
 
   // ── 3. 业务码（有信封时优先按码判） ──
   if (envelope !== undefined) {
-    // ⚠️ **必须先判字符串形态的渠道拦截码**：它不是数字，进不了 CODE_KIND。
-    // 且它必须归类为 channel_blocked（不是 waf_blocked）—— 后者会触发 IP 级判定，
-    // 把「渠道指纹不被认可」误报成「出口 IP 被封」（AGENTS.md §6.6 / client.ts 上方注释）。
-    if (String(envelope.code) === CHANNEL_BLOCK_CODE) {
-      return { kind: 'channel_blocked', code: undefined, msg: envelope.msg }
-    }
-    const mapped = typeof envelope.code === 'number' ? CODE_KIND[envelope.code] : undefined
+    const mapped = CODE_KIND[envelope.code]
     if (mapped !== undefined) {
-      return { kind: mapped, code: numericCode(envelope.code), msg: envelope.msg }
+      return { kind: mapped, code: envelope.code, msg: envelope.msg }
     }
+    // ── 3b. 码已归一但仍落在表外的兜底 ──
+    //
+    // ⚠️ 字符串形态的 `{"code":"11-128"}` 已在 `parseEnvelope` 里归一成 `CHANNEL_BLOCKED_CODE`，
+    // 走上面的 `CODE_KIND` 查表，**不需要**再嗅原始文本。我曾在此处按 `"11-128"` 正则兜底，
+    // 结果同一个码有两条判据（一条查表、一条正则），改一处漏一处；现已删除，保持单一来源。
     if (envelope.code === 0) {
       return { kind: 'unknown', code: 0, msg: envelope.msg }
     }
     // 有信封但码未知：按 HTTP 状态兜底（0 码以外的业务错误）
     if (httpStatus === 401 || httpStatus === 403) {
-      return { kind: 'auth_error', code: numericCode(envelope.code), msg: envelope.msg }
+      return { kind: 'auth_error', code: envelope.code, msg: envelope.msg }
     }
     if (httpStatus === 429) {
-      return { kind: 'rate_limited', code: numericCode(envelope.code), msg: envelope.msg }
+      return { kind: 'rate_limited', code: envelope.code, msg: envelope.msg }
     }
-    return { kind: 'unknown', code: numericCode(envelope.code), msg: envelope.msg }
+    return { kind: 'unknown', code: envelope.code, msg: envelope.msg }
   }
 
   // ── 4. 无信封：按状态码 ──

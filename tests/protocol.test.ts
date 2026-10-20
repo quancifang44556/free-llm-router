@@ -14,7 +14,7 @@ import assert from 'node:assert/strict'
 import { isMpTask, mergeTaskLists, parseClaim, parseTasks } from '../src/upstream/tasks.ts'
 import { parseBalance } from '../src/upstream/checkin.ts'
 import { sanitizeFingerprints, withFingerprint } from '../src/upstream/report.ts'
-import { classify, parseEnvelope } from '../src/upstream/client.ts'
+import { classify, parseEnvelope, CHANNEL_BLOCKED_CODE } from '../src/upstream/client.ts'
 import { isValidUid, needsRefresh, REFRESH_SKEW_MS } from '../src/upstream/auth.ts'
 import { cstDay } from '../src/upstream/travel.ts'
 
@@ -202,7 +202,7 @@ test("🔴 classify：真实渠道拦截码（字符串 11-128）必须归到 ch
   // ① 必须先能认出这个信封
   const env = parseEnvelope(body)
   assert.notEqual(env, undefined, "字符串码的信封必须被认出（否则下游全错）")
-  assert.equal(String(env.code), REAL, "必须保留原始字符串码")
+  assert.equal(env?.code, CHANNEL_BLOCKED_CODE, "字符串码归一为 CHANNEL_BLOCKED_CODE")
 
   // ② 归类必须是 channel_blocked
   const c = classify(403, body)

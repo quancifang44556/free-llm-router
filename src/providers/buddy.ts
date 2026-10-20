@@ -318,10 +318,18 @@ export function buildBuddyProvider(config: VariantConfig, env?: Env): Provider {
       // X-Conversation-Request-ID…），**在国际版端点上不被认可**。
       //
       // 唯一保留的额外头是 `Authorization`（参考实现也发）。
+      // ⚠️ 国际服要求会话头族；`conversation` 由网关在重试循环外算好传进来。
+      // 缺失时回落为「现生成」——能用但画像不理想，故不算错误路径。
       headers: referenceChatHeaders({
         uid: credential.uid,
         accessToken: credential.accessToken,
         variant: config.id,
+        ...(request.conversation === undefined
+          ? {}
+          : {
+              conversationId: request.conversation.conversationId,
+              turnRequestId: request.conversation.turnRequestId,
+            }),
       }),
       body,
       signal: request.signal,
