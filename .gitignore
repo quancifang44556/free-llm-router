@@ -23,6 +23,9 @@ AGENT_NOTES.md
 # 个人调试脚本（会读真实凭据，不提交）
 scripts/inspect-models.cjs
 scripts/inspect_models.js
+# 面板截图 / 交互冒烟脚本（依赖本地演示库与本机 Chromium 路径）
+web/shot.mjs
+web/interact.mjs
 
 # Playwright 临时测试快照与截图
 .playwright-mcp/

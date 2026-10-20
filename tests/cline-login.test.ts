@@ -503,45 +503,34 @@ test('⚠️ cline.ts 必须零 `node:` 导入（Workers 只认 Web 标准 API�
 
 // ─────────────────── ⑥ 面板：用户码式登录的渲染 ───────────────────
 
+const LOGIN_FLOW = 'web/src/pages/providers/LoginFlow.tsx'
+
 test('⚠️ 面板必须渲染 `userCode`（cline 是用户码式，只给链接用户会卡住）', () => {
-  const js = readFileSync('src/panel/assets/app.js.txt', 'utf8')
-  const start = js.indexOf('function renderLoginPrompt')
-  assert.ok(start > 0, '找不到 renderLoginPrompt')
-  const body = js.slice(start, start + 2600)
-
+  const src = readFileSync(LOGIN_FLOW, 'utf8')
   // ⚠️ 断言的是**分支判据**，不是「出现过 userCode」——
-  // 函数开头就有 `const userCode = body.userCode`，只查词存在的话
-  // 「把分支删掉、退回纯链接渲染」的坏实现照样能过（反向验证时实测到了）。
-  assert.match(body, /if \(typeof userCode === 'string' && userCode !== ''\)/,
-    '必须有专门处理 userCode 的分支（否则用户拿到链接却不知道要输什么码）')
-  assert.ok(body.includes("codeBox.className = 'user-code'"), '必须有一个专门展示用户码的容器')
-  // ⚠️ 用户码必须留在页面上：轮询只更新状态文字，不能覆盖整块内容
-  assert.ok(body.includes('el._loginStatus = status'), '轮询必须只更新状态文字（用户码不能被覆盖掉）')
+  // 只查词存在的话「把分支删掉、退回纯链接渲染」的坏实现照样能过。
+  assert.match(src, /\{start\.userCode \? \(/, '必须有专门处理 userCode 的分支（否则用户拿到链接却不知道要输什么码）')
+  assert.match(src, /<code[^>]*>\{start\.userCode\}<\/code>/, '必须有一个专门展示用户码的容器')
   // 链接优先用带 code 的完整 URL，没有才回落到基础 URL
-  assert.ok(body.includes('body.verificationUriComplete') && body.includes('body.verificationUri'),
+  assert.ok(src.includes('start.verificationUriComplete || start.verificationUri'),
     '链接必须优先用 verificationUriComplete，并回落到 verificationUri')
+  // ⚠️ 上游给的链接必须过协议白名单（防 javascript: 之类的伪协议）
+  assert.match(src, /safeHref\(start\.verificationUriComplete/, '授权链接必须经过 safeHref')
 })
 
-test('⚠️ 面板仍不得出现 innerHTML 赋值（XSS）', () => {
-  const js = readFileSync('src/panel/assets/app.js.txt', 'utf8')
-  const assignments = js.match(/\.innerHTML\s*=/g) ?? []
-  assert.equal(assignments.length, 0, `发现 ${assignments.length} 处 innerHTML 赋值`)
-})
-
-test('⚠️ 用户码样式必须白底深字且可整段选中（深色主题下要能看清/抄对）', () => {
-  const css = readFileSync('src/panel/assets/style.css.txt', 'utf8')
-  assert.ok(css.includes('.user-code'), '应有 .user-code 样式')
-  const start = css.indexOf('.user-code {')
-  const block = css.slice(start, css.indexOf('}', start))
-  assert.match(block, /background:\s*#fff/, '必须白底（深色主题下低对比会抄错码）')
-  assert.match(block, /user-select:\s*all/, '必须可整段选中（用户要复制它）')
-  assert.match(block, /ui-monospace/, '必须等宽字体（避免 0/O、1/I 看错）')
+test('⚠️ 用户码必须等宽、可整段选中且有复制按钮（要能看清/抄对）', () => {
+  const src = readFileSync(LOGIN_FLOW, 'utf8')
+  const m = /<code className="([^"]*)">\{start\.userCode\}<\/code>/.exec(src)
+  assert.ok(m, '应能找到用户码容器')
+  assert.match(m[1], /\bfont-mono\b/, '必须等宽字体（避免 0/O、1/I 看错）')
+  assert.match(m[1], /\bselect-all\b/, '必须可整段选中（用户要复制它）')
+  assert.match(src, /aria-label="复制代码"[^>]*onClick=\{\(\) => copy\(start\.userCode/, '应提供一键复制')
 })
 
 test('⚠️ cline 的登录方式标签必须写明是「用户码」而不是笼统的「设备码登录」', () => {
-  const js = readFileSync('src/panel/assets/app.js.txt', 'utf8')
-  const start = js.indexOf('const LOGIN_KIND_LABEL')
-  const line = js.slice(start, js.indexOf('\n', start))
-  assert.ok(line.includes("cline: '用户码登录'"),
+  const src = readFileSync(LOGIN_FLOW, 'utf8')
+  const start = src.indexOf('const KIND_LABEL')
+  const block = src.slice(start, src.indexOf('}', start))
+  assert.ok(block.includes("cline: '用户码登录'"),
     'cline 要用户手抄代码，标签必须提前说清（否则用户点开才发现要抄码）')
 })

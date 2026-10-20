@@ -111,7 +111,7 @@ export function planGrowth(options?: { includeRealChat?: boolean }): TaskStep[] 
     // 幂等，重复运行无副作用。
     { code: '_probe', action: 'acceptPending', delayMs: GAP.report },
     // ⚠️ **签到必须在本计划里**。面板与文档都承诺「签到 → 成长任务 → 领奖」
-    //（`src/panel/assets/index.html:50-53`、`src/index.ts:447`），
+    //（旧版面板任务说明、`src/index.ts:447`），
     // 但早期 `planGrowth` **没有这一步** —— 用户点「执行每日任务」时只跑了成长任务，
     // **从未签到**。实测证据（2026-10-04，线上 `/admin/tasks/status`）：
     // 该按钮对应的一次运行 `done` 里有 23 步、`chat_5`/`first_buddy`/… 全在，

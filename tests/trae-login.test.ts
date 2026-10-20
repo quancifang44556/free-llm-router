@@ -684,10 +684,10 @@ test('trae 的登录原语保留（协议已逆向，将来若上游支持远程
 })
 
 test('⚠️ 面板必须把 trae 标成「浏览器登录」（否则用户去找不存在的设备码）', () => {
-  const js = readFileSync('src/panel/assets/app.js.txt', 'utf8')
-  assert.ok(/LOGIN_KIND_LABEL\s*=\s*\{[^}]*trae:\s*'浏览器登录'/.test(js),
-    'LOGIN_KIND_LABEL 必须含 trae: 浏览器登录')
-  assert.ok(/providerId === 'trae'/.test(js), 'loginWaitHint 必须覆盖 trae（回跳式流程的等待文案不同）')
+  const src = readFileSync('web/src/pages/providers/LoginFlow.tsx', 'utf8')
+  assert.ok(/KIND_LABEL[^=]*=\s*\{[^}]*trae:\s*'浏览器登录'/.test(src), 'KIND_LABEL 必须含 trae: 浏览器登录')
+  // 回跳式流程的等待文案不同：要告诉用户「登录完会跳到本服务的提示页，回来等着就行」
+  assert.ok(/CALLBACK_HINT[^=]*=\s*\{[^}]*trae:/.test(src), 'CALLBACK_HINT 必须覆盖 trae')
 })
 
 test('⚠️ 零 node: 导入（Workers 只能跑纯 Web 标准）', () => {

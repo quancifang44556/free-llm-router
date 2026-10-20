@@ -1,0 +1,2 @@
+# 面板构建产物（npm run build:web 生成），在 GitHub 上折叠 diff、不计入语言统计
+src/panel/web/** linguist-generated=true

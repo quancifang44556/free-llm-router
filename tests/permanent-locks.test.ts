@@ -21,7 +21,6 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { createNodeRuntime } from '../src/server/env.js'
 import { createAccountState } from '../src/pool/state.js'
-import { panelAsset } from '../src/panel/index.js'
 import worker from '../src/index.js'
 
 test('AccountPoolDO：getPermanentLocks 与 setPermanentLock 独立存储与读写', async () => {
@@ -207,12 +206,11 @@ test('HTTP API：/admin/permanent-locks GET 与 POST 路由测试', async () => 
   }
 })
 
-test('面板静态资源：包含永久积分锁 DOM 与交互逻辑', () => {
-  const html = panelAsset('/panel/')?.body ?? ''
-  const js = panelAsset('/panel/app.js')?.body ?? ''
-
-  assert.ok(html.includes('id="perm-lock-panel"'), 'HTML 必须包含永久积分锁面板')
-  assert.ok(html.includes('id="perm-locks-list"'), 'HTML 必须包含永久积分锁网格容器')
-  assert.ok(js.includes('loadPermanentLocks'), 'JavaScript 必须实现 loadPermanentLocks')
-  assert.ok(js.includes('/admin/permanent-locks'), 'JavaScript 必须调用 /admin/permanent-locks 接口')
+test('面板：配置页包含永久积分锁开关并调用 /admin/permanent-locks', () => {
+  const cfg = fs.readFileSync('web/src/lib/config.ts', 'utf8')
+  const page = fs.readFileSync('web/src/pages/ConfigPage.tsx', 'utf8')
+  assert.ok(cfg.includes("'/admin/permanent-locks'"), '前端必须调用 /admin/permanent-locks 接口')
+  assert.match(cfg, /export function usePermanentLocks/, '应有读取 hook')
+  assert.match(cfg, /export function useSetPermanentLock/, '应有设置 hook')
+  assert.ok(page.includes('usePermanentLocks()') && page.includes('useSetPermanentLock()'), '配置页必须接入永久积分锁')
 })

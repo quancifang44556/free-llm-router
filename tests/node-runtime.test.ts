@@ -187,10 +187,18 @@ test('startServer：HTTP 服务端启动、健康检查与面板可访问性', a
     const html = await panelRes.text()
     assert.ok(html.includes('free-llm-router'))
 
-    // 3. /panel/style.css 正常返回 CSS
-    const cssRes = await fetch(`${baseUrl}/panel/style.css`)
+    // 3. 入口引用的样式表正常返回 CSS（文件名带哈希，从 HTML 里取）
+    const cssPath = /href="(\/panel\/assets\/[^"]+\.css)"/.exec(html)?.[1]
+    assert.ok(cssPath, '入口 HTML 应引用样式表')
+    const cssRes = await fetch(`${baseUrl}${cssPath}`)
     assert.equal(cssRes.status, 200)
     assert.ok(cssRes.headers.get('content-type')?.includes('text/css'))
+    assert.match(cssRes.headers.get('cache-control') ?? '', /immutable/)
+    // 3b. 旧登录页地址跳到面板；/panel/ 下不存在的文件 404（不是 401）
+    const loginRes = await fetch(`${baseUrl}/login`, { redirect: 'manual' })
+    assert.equal(loginRes.status, 302)
+    assert.equal(loginRes.headers.get('location'), '/panel/')
+    assert.equal((await fetch(`${baseUrl}/panel/nope.js`)).status, 404)
 
     // 4. /v1/models 无 Authorization 应返回 401
     const unauthRes = await fetch(`${baseUrl}/v1/models`)

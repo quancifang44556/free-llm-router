@@ -1,22 +1,14 @@
 // Wrangler Text 模块规则产出的 import 形状（都是字符串）。
-// 见 wrangler.jsonc 的 rules 配置。
+// 见 wrangler.jsonc 的 rules 配置；面板构建产物由 scripts/embed-web.mjs 改成这些后缀。
 declare module '*.html' {
   const content: string
   export default content
 }
-declare module '*.css' {
+declare module '*.js.txt' {
   const content: string
   export default content
 }
-declare module '*/assets/app.js' {
-  const content: string
-  export default content
-}
-declare module '*/assets/style.css.txt' {
-  const content: string
-  export default content
-}
-declare module '*/assets/app.js.txt' {
+declare module '*.css.txt' {
   const content: string
   export default content
 }
@@ -32,12 +24,4 @@ declare module '*/assets/app.js.txt' {
 declare module '*.wasm' {
   const mod: WebAssembly.Module
   export default mod
-}
-declare module '*/assets/login.html' {
-  const content: string
-  export default content
-}
-declare module '*/assets/login.js.txt' {
-  const content: string
-  export default content
 }

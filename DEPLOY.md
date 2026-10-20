@@ -34,7 +34,7 @@ git clone <repo> free-llm-router && cd free-llm-router
 #    peer 版本升到了 v5，与项目锁定的 v4 冲突。（VPS 构建其实不需要 wrangler，
 #    只用它带的 esbuild，但安装时 peer 冲突仍会报错。）
 npm install --legacy-peer-deps
-npm run build:node          # 产出 dist/server.mjs（约 1.5 MB 单文件）
+npm run build:node          # 产出 dist/server.mjs（约 2.3 MB 单文件，含已构建好的管理面板）
 ```
 
 ### 1.3 配置
@@ -140,10 +140,14 @@ node dist/server.mjs
 
 ### 1.5 打开面板
 
-浏览器访问 `http://<你的服务器IP>:11451/panel/`，在登录页输入 `API_KEY` 即可进入。
+浏览器访问 `http://<你的服务器IP>:11451/panel/`，在登录页输入 `API_KEY` 即可进入（旧地址 `/login` 会跳过来）。
 
 > `/` 根路径返回 **401**（需密钥）—— 刻意如此，避免被扫到。
 > 面板页面本身不含敏感数据，但所有数据接口都要 `Authorization`。
+>
+> 面板是 `web/` 下的 React 应用，**构建产物已随源码提交**（`src/panel/web/`），部署时不用装前端依赖。
+> 只有改了 `web/` 的源码，才需要先 `npm run build:web` 再 `npm run build:node`。
+> 带哈希的静态文件（`/panel/assets/*`）响应头是一年 `immutable`，入口页是 `no-store` —— 反代不要改写这两个头，升级后浏览器才能立即拿到新版。
 
 ### 1.6 反向代理 + HTTPS
 
@@ -323,8 +327,8 @@ npx wrangler delete workbuddy-egress-probe
 无论哪种形态，**首次部署后**都要：
 
 1. 打开 `/panel/`，用 `API_KEY` 登录；
-2. 在「供应商与账号」里**添加账号**（设备码登录 / 导入凭据）；
-3. 到「配置」页确认自动任务状态；
+2. 在「供应商与账号」里**添加账号**（面板登录 / 导入凭据）；
+3. 到「配置」页确认「路由与调度」（选号策略、失败换号次数、定时签到与自动续期开关）和「运行状态」（已存凭据数应等于账号数）；
 4. 调一次 `/v1/chat/completions` 验证协议连通。
 
 ## 4. 探针（可选）

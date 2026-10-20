@@ -1,0 +1,520 @@
+import { CalendarClock, Copy, Eye, EyeOff, Gauge, Lock, Route, ShieldAlert, ShieldCheck, Snowflake, Terminal } from 'lucide-react'
+import { useEffect, useMemo, useState, type ReactNode } from 'react'
+import { PageHeader } from '@/components/layout/PageHeader'
+import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
+import { Card, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
+import { Dialog } from '@/components/ui/dialog'
+import { Input, Switch } from '@/components/ui/input'
+import { ProviderAvatar, Segmented, Skeleton } from '@/components/ui/misc'
+import { auth } from '@/lib/api'
+import {
+  type RoutingConfig,
+  type Strategy,
+  useClearCooldowns,
+  useClearWaf,
+  useCredentialCount,
+  usePermanentLocks,
+  useRoutingConfig,
+  useSaveRouting,
+  useSetPermanentLock,
+  useWaf,
+} from '@/lib/config'
+import { useAccounts, usePool, useProviders } from '@/lib/queries'
+import { cn, fmtDateTime, fmtInt } from '@/lib/utils'
+import { copyText } from './ModelsPage'
+
+export function ConfigPage() {
+  return (
+    <>
+      <PageHeader title="配置" description="客户端接入方式、路由策略与运行状态。" />
+      <div className="grid gap-4 xl:grid-cols-5">
+        <div className="space-y-4 xl:col-span-3">
+          <ConnectCard />
+          <RoutingCard />
+        </div>
+        <div className="space-y-4 xl:col-span-2">
+          <StatusCard />
+          <LocksCard />
+        </div>
+      </div>
+    </>
+  )
+}
+
+function SectionIcon({ children }: { children: ReactNode }) {
+  return <span className="bg-muted text-muted-foreground grid size-8 shrink-0 place-items-center rounded-md [&_svg]:size-4">{children}</span>
+}
+
+function Head({ icon, title, desc, action }: { icon: ReactNode; title: string; desc?: ReactNode; action?: ReactNode }) {
+  return (
+    <CardHeader className="flex flex-row items-start gap-3">
+      <SectionIcon>{icon}</SectionIcon>
+      <div className="min-w-0 flex-1">
+        <CardTitle>{title}</CardTitle>
+        {desc && <CardDescription className="mt-0.5">{desc}</CardDescription>}
+      </div>
+      {action}
+    </CardHeader>
+  )
+}
+
+// ── 接入指南 ──
+
+type Snippet = 'curl' | 'python' | 'env'
+
+function ConnectCard() {
+  const [show, setShow] = useState(false)
+  const [snippet, setSnippet] = useState<Snippet>('curl')
+  const key = auth.get()
+  const masked = key.length > 16 ? `${key.slice(0, 4)}${'•'.repeat(12)}${key.slice(-4)}` : '•'.repeat(Math.max(key.length, 8))
+  const base = `${location.origin}/v1`
+  const code = useMemo(() => {
+    const k = show ? key : 'YOUR_API_KEY'
+    if (snippet === 'curl')
+      return `curl ${base}/chat/completions \\
+  -H "Authorization: Bearer ${k}" \\
+  -H "Content-Type: application/json" \\
+  -d '{"model":"aggregate/auto","messages":[{"role":"user","content":"你好"}]}'`
+    if (snippet === 'python')
+      return `from openai import OpenAI
+
+client = OpenAI(base_url="${base}", api_key="${k}")
+r = client.chat.completions.create(
+    model="aggregate/auto",
+    messages=[{"role": "user", "content": "你好"}],
+)
+print(r.choices[0].message.content)`
+    return `OPENAI_BASE_URL=${base}
+OPENAI_API_KEY=${k}`
+  }, [snippet, show, key, base])
+
+  return (
+    <Card>
+      <Head icon={<Terminal />} title="接入指南" desc="任何支持 OpenAI 接口的客户端都能直接用：/v1/models、/v1/chat/completions、/v1/responses。" />
+      <div className="space-y-3 px-5 pb-5">
+        <Field label="Base URL" value={base} onCopy={() => copyText(base, '已复制 Base URL')} />
+        <Field
+          label="主密钥"
+          value={show ? key : masked}
+          mono
+          onCopy={() => copyText(key, '已复制主密钥')}
+          extra={
+            <Button variant="ghost" size="icon-sm" onClick={() => setShow((v) => !v)} aria-label={show ? '隐藏' : '显示'}>
+              {show ? <EyeOff /> : <Eye />}
+            </Button>
+          }
+          hint="主密钥能登录控制台，给客户端用更推荐在「API Key」页签发子密钥。"
+        />
+        <div className="pt-1">
+          <div className="mb-2 flex items-center justify-between gap-2">
+            <Segmented<Snippet>
+              value={snippet}
+              onChange={setSnippet}
+              className="h-8 [&_button]:h-6 [&_button]:text-xs"
+              options={[
+                { value: 'curl', label: 'cURL' },
+                { value: 'python', label: 'Python' },
+                { value: 'env', label: '环境变量' },
+              ]}
+            />
+            <Button variant="ghost" size="sm" onClick={() => copyText(code.replace('YOUR_API_KEY', key), '已复制（含真实密钥）')}>
+              <Copy /> 复制
+            </Button>
+          </div>
+          <pre className="bg-muted/70 overflow-x-auto rounded-lg px-4 py-3 font-mono text-[12px] leading-relaxed">{code}</pre>
+        </div>
+        <ul className="text-muted-foreground space-y-1.5 pt-1 text-[12.5px] leading-relaxed">
+          <li>
+            <span className="text-foreground font-medium">模型怎么填：</span>
+            <code className="font-mono">aggregate/auto</code> 自动挑可用的模型；
+            <code className="font-mono">aggregate/&lt;模型&gt;</code> 在所有家里找同一个模型；
+            <code className="font-mono">&lt;供应商&gt;/&lt;模型&gt;</code> 只走这一家。完整列表见「模型」页。
+          </li>
+          <li>
+            <span className="text-foreground font-medium">临时指定账号：</span>
+            请求头加 <code className="font-mono">X-FLR-Account: &lt;uid&gt;</code>
+            ，只对这一次请求生效，且不换号。
+          </li>
+        </ul>
+      </div>
+    </Card>
+  )
+}
+
+function Field({
+  label,
+  value,
+  mono = true,
+  onCopy,
+  extra,
+  hint,
+}: {
+  label: string
+  value: string
+  mono?: boolean
+  onCopy: () => void
+  extra?: ReactNode
+  hint?: string
+}) {
+  return (
+    <div>
+      <div className="text-muted-foreground mb-1 text-xs">{label}</div>
+      <div className="flex items-center gap-1 rounded-lg border py-1 pr-1 pl-3">
+        <span className={cn('min-w-0 flex-1 truncate text-[13px]', mono && 'font-mono')}>{value}</span>
+        {extra}
+        <Button variant="ghost" size="icon-sm" onClick={onCopy} aria-label={`复制${label}`}>
+          <Copy />
+        </Button>
+      </div>
+      {hint && <div className="text-muted-foreground mt-1 text-[11.5px]">{hint}</div>}
+    </div>
+  )
+}
+
+// ── 路由与调度 ──
+
+const STRATEGIES: { value: Strategy; title: string; desc: string }[] = [
+  {
+    value: 'expiry',
+    title: '临期优先',
+    desc: '积分最早过期的账号先用，少浪费',
+  },
+  { value: 'roundrobin', title: '轮询', desc: '最久没用的账号先用，负载均匀' },
+  { value: 'random', title: '随机', desc: '每次随机挑一个可用账号' },
+]
+
+function RoutingCard() {
+  const q = useRoutingConfig()
+  const save = useSaveRouting()
+  const [form, setForm] = useState<RoutingConfig | null>(null)
+  useEffect(() => {
+    if (q.data) setForm(q.data)
+  }, [q.data])
+  const dirty = !!form && !!q.data && JSON.stringify(form) !== JSON.stringify(q.data)
+  const set = <K extends keyof RoutingConfig>(k: K, v: RoutingConfig[K]) => setForm((f) => (f ? { ...f, [k]: v } : f))
+  const retriesOk = !!form && Number.isInteger(form.maxRetries) && form.maxRetries >= 0 && form.maxRetries <= 10
+  const softOk = !!form && Number.isInteger(form.softCooldownSeconds) && form.softCooldownSeconds >= 10 && form.softCooldownSeconds <= 3600
+
+  return (
+    <Card>
+      <Head
+        icon={<Route />}
+        title="路由与调度"
+        desc="网关怎么在账号之间挑选、失败后怎么处理，以及定时任务开关。"
+        action={
+          form && (
+            <div className="flex gap-2">
+              {dirty && (
+                <Button variant="ghost" size="sm" onClick={() => q.data && setForm(q.data)}>
+                  还原
+                </Button>
+              )}
+              <Button size="sm" disabled={!dirty || !retriesOk || !softOk || save.isPending} onClick={() => save.mutate(form)}>
+                {save.isPending ? '保存中…' : '保存'}
+              </Button>
+            </div>
+          )
+        }
+      />
+      {!form ? (
+        <div className="space-y-3 px-5 pb-5">
+          <Skeleton className="h-20" />
+          <Skeleton className="h-16" />
+        </div>
+      ) : (
+        <div className="space-y-5 px-5 pb-5">
+          <div>
+            <div className="mb-2 text-[13px] font-medium">选号策略</div>
+            <div className="grid gap-2 sm:grid-cols-3" role="radiogroup" aria-label="选号策略">
+              {STRATEGIES.map((s) => (
+                <button
+                  key={s.value}
+                  role="radio"
+                  aria-checked={form.strategy === s.value}
+                  onClick={() => set('strategy', s.value)}
+                  className={cn(
+                    'cursor-pointer rounded-lg border px-3.5 py-3 text-left transition-colors',
+                    form.strategy === s.value ? 'border-primary bg-primary/[0.05] ring-primary/20 ring-2' : 'hover:bg-muted/60',
+                  )}
+                >
+                  <div className="text-[13px] font-medium">{s.title}</div>
+                  <div className="text-muted-foreground mt-0.5 text-xs leading-relaxed">{s.desc}</div>
+                </button>
+              ))}
+            </div>
+            <div className="text-muted-foreground mt-1.5 text-[11.5px]">面板里「指定账号」与永久积分锁优先于策略生效。</div>
+          </div>
+
+          <div className="grid gap-4 sm:grid-cols-2">
+            <NumField
+              label="失败换号次数"
+              hint="一次请求失败后最多再换几个账号重试（0–10）"
+              value={form.maxRetries}
+              min={0}
+              max={10}
+              ok={retriesOk}
+              onChange={(v) => set('maxRetries', v)}
+            />
+            <NumField
+              label="限流冷却起步（秒）"
+              hint="被限流的账号先歇这么久，连续限流翻倍，最长 30 分钟（10–3600）"
+              value={form.softCooldownSeconds}
+              min={10}
+              max={3600}
+              ok={softOk}
+              onChange={(v) => set('softCooldownSeconds', v)}
+            />
+          </div>
+
+          <div className="divide-y rounded-lg border">
+            <ToggleRow
+              title="自动签到与每日任务"
+              desc="北京时间 09:00、21:00 签到，01:00 跑完整每日任务（CodeBuddy 含成长任务与领奖）。关掉后仍会每小时刷新余额。"
+              checked={form.autoTaskCron}
+              onChange={(v) => set('autoTaskCron', v)}
+            />
+            <ToggleRow
+              title="自动续期登录凭据"
+              desc="定时检查快过期的登录凭据并自动刷新，避免账号突然掉线。"
+              checked={form.autoRefreshCredential}
+              onChange={(v) => set('autoRefreshCredential', v)}
+            />
+          </div>
+        </div>
+      )}
+    </Card>
+  )
+}
+
+function NumField({
+  label,
+  hint,
+  value,
+  min,
+  max,
+  ok,
+  onChange,
+}: {
+  label: string
+  hint: string
+  value: number
+  min: number
+  max: number
+  ok: boolean
+  onChange: (v: number) => void
+}) {
+  const id = `num-${label}`
+  return (
+    <div>
+      <label htmlFor={id} className="mb-1.5 block text-[13px] font-medium">
+        {label}
+      </label>
+      <Input
+        id={id}
+        type="number"
+        inputMode="numeric"
+        min={min}
+        max={max}
+        value={Number.isNaN(value) ? '' : value}
+        onChange={(e) => onChange(e.target.value === '' ? Number.NaN : Number(e.target.value))}
+        className={cn('tabular w-32', !ok && 'border-danger focus-visible:border-danger')}
+        aria-invalid={!ok}
+      />
+      <div className={cn('mt-1 text-[11.5px] leading-relaxed', ok ? 'text-muted-foreground' : 'text-danger')}>{hint}</div>
+    </div>
+  )
+}
+
+function ToggleRow({ title, desc, checked, onChange }: { title: string; desc: string; checked: boolean; onChange: (v: boolean) => void }) {
+  return (
+    <div className="flex items-center gap-4 px-4 py-3">
+      <div className="min-w-0 flex-1">
+        <div className="text-[13px] font-medium">{title}</div>
+        <div className="text-muted-foreground mt-0.5 text-xs leading-relaxed">{desc}</div>
+      </div>
+      <Switch label={title} checked={checked} onCheckedChange={onChange} />
+    </div>
+  )
+}
+
+// ── 运行状态 ──
+
+function StatusCard() {
+  const pool = usePool()
+  const waf = useWaf()
+  const creds = useCredentialCount()
+  const clearWaf = useClearWaf()
+  const clearCd = useClearCooldowns()
+  const [confirm, setConfirm] = useState(false)
+  const blocked = waf.data?.filter((w) => w.active) ?? []
+  const c = pool.data
+  const cooling = (c?.cooling ?? 0) + (c?.modelExempt ?? 0)
+
+  return (
+    <Card>
+      <Head icon={<Gauge />} title="运行状态" />
+      <div className="space-y-3 px-5 pb-5">
+        <div className="grid grid-cols-3 divide-x rounded-lg border">
+          {[
+            ['账号', c?.total],
+            ['可用', c?.healthy],
+            ['已存凭据', creds.data],
+          ].map(([k, v]) => (
+            <div key={k as string} className="px-3.5 py-2.5">
+              <div className="text-muted-foreground text-xs">{k}</div>
+              <div className="tabular mt-0.5 text-lg font-semibold">{v === undefined ? '—' : fmtInt(v as number)}</div>
+            </div>
+          ))}
+        </div>
+
+        {c && creds.data !== undefined && creds.data < c.total && (
+          <div className="text-warning bg-warning/10 rounded-md px-3 py-2 text-xs leading-relaxed">
+            有 {fmtInt(c.total - creds.data)} 个账号没有存下凭据，网关用不了它们，需要重新登录或导入。
+          </div>
+        )}
+        {blocked.length ? (
+          <div className="border-danger/30 bg-danger/[0.06] rounded-lg border px-3.5 py-3">
+            <div className="text-danger flex items-center gap-2 text-[13px] font-medium">
+              <ShieldAlert className="size-4" /> 出口 IP 被上游拦截
+            </div>
+            <div className="text-muted-foreground mt-1 text-xs leading-relaxed">
+              {blocked.map((w) => `${w.realm === 'cn' ? '国内版' : '国际版'}${w.until ? `，${fmtDateTime(w.until)} 自动恢复` : ''}`).join('；')}
+              。期间该分片的请求会直接失败，避免越试越封。确认已换 IP 可以提前解除。
+            </div>
+            <Button
+              size="sm"
+              variant="outline"
+              className="mt-2.5"
+              disabled={clearWaf.isPending}
+              onClick={() => clearWaf.mutate(blocked.map((w) => w.realm))}
+            >
+              立即解除
+            </Button>
+          </div>
+        ) : (
+          <Row
+            icon={<ShieldCheck className="text-success" />}
+            title="出口 IP 正常"
+            desc={waf.isLoading ? '检查中…' : '国内版、国际版都没有被上游 WAF 拦截'}
+          />
+        )}
+
+        <Row
+          icon={<Snowflake className={cooling ? 'text-warning' : 'text-muted-foreground'} />}
+          title={cooling ? `${fmtInt(cooling)} 个账号在冷却 / 限流` : '没有账号在冷却'}
+          desc="冷却到期会自动恢复；确认上游已恢复可以手动全部清空。"
+          action={
+            <Button size="sm" variant="outline" disabled={!cooling || clearCd.isPending} onClick={() => setConfirm(true)}>
+              全部清空
+            </Button>
+          }
+        />
+        <Row
+          icon={<CalendarClock className="text-muted-foreground" />}
+          title="定时器每小时触发一次"
+          desc="每小时刷新余额、续期凭据；北京时间 01 / 09 / 21 点另跑签到与每日任务。"
+        />
+        <Row
+          icon={<Lock className="text-muted-foreground" />}
+          title="凭据加密存储"
+          desc="账号凭据用 AES-GCM 加密后落盘，密钥是部署时配置的 CREDENTIAL_KEY。"
+        />
+      </div>
+      <Dialog
+        open={confirm}
+        onOpenChange={setConfirm}
+        title="清空全部冷却？"
+        description="所有账号立刻回到可选状态。如果上游仍在限流，它们会很快再次进入冷却。"
+        footer={
+          <>
+            <Button variant="outline" onClick={() => setConfirm(false)}>
+              取消
+            </Button>
+            <Button
+              onClick={() =>
+                clearCd.mutate(undefined, {
+                  onSuccess: () => setConfirm(false),
+                })
+              }
+              disabled={clearCd.isPending}
+            >
+              清空
+            </Button>
+          </>
+        }
+      />
+    </Card>
+  )
+}
+
+function Row({ icon, title, desc, action }: { icon: ReactNode; title: string; desc: string; action?: ReactNode }) {
+  return (
+    <div className="flex items-center gap-3 rounded-lg border px-3.5 py-3">
+      <span className="shrink-0 [&_svg]:size-4">{icon}</span>
+      <div className="min-w-0 flex-1">
+        <div className="text-[13px] font-medium">{title}</div>
+        <div className="text-muted-foreground mt-0.5 text-xs leading-relaxed">{desc}</div>
+      </div>
+      {action}
+    </div>
+  )
+}
+
+// ── 永久积分锁 ──
+
+function LocksCard() {
+  const providers = useProviders()
+  const accounts = useAccounts()
+  const locks = usePermanentLocks()
+  const setLock = useSetPermanentLock()
+  const [all, setAll] = useState(false)
+  const used = new Set((accounts.data ?? []).map((a) => a.provider))
+  const list = (providers.data?.providers ?? []).filter((p) => all || used.has(p.id) || locks.data?.[p.id])
+  const hidden = (providers.data?.providers.length ?? 0) - list.length
+
+  return (
+    <Card>
+      <Head icon={<Lock />} title="永久积分锁" desc="开启后，这家「只剩永久积分」的账号不再参与选号，免得免费额度用完后悄悄烧掉花钱买的积分。" />
+      <div className="px-5 pb-5">
+        {!locks.data || !providers.data ? (
+          <Skeleton className="h-24" />
+        ) : (
+          <div className="divide-y rounded-lg border">
+            {list.map((p) => {
+              const on = !!locks.data[p.id]
+              return (
+                <div key={p.id} className="flex items-center gap-3 px-3.5 py-2.5">
+                  <ProviderAvatar id={p.id} name={p.name} size="sm" />
+                  <div className="min-w-0 flex-1">
+                    <div className="truncate text-[13px] font-medium">{p.name}</div>
+                    <div className="text-muted-foreground text-[11.5px]">{on ? '已锁定，永久积分受保护' : '未锁定，可能消耗永久积分'}</div>
+                  </div>
+                  {on && <Badge tone="success">已锁</Badge>}
+                  <Switch
+                    label={`${p.name} 永久积分锁`}
+                    checked={on}
+                    disabled={setLock.isPending}
+                    onCheckedChange={(v) =>
+                      setLock.mutate({
+                        provider: p.id,
+                        name: p.name,
+                        locked: v,
+                      })
+                    }
+                  />
+                </div>
+              )
+            })}
+            {!list.length && <div className="text-muted-foreground px-3.5 py-5 text-center text-[13px]">还没有账号</div>}
+          </div>
+        )}
+        {(hidden > 0 || all) && (
+          <button className="text-muted-foreground hover:text-foreground mt-2 cursor-pointer text-xs" onClick={() => setAll((v) => !v)}>
+            {all ? '只看有账号的供应商' : `显示其余 ${hidden} 家没有账号的供应商`}
+          </button>
+        )}
+      </div>
+    </Card>
+  )
+}

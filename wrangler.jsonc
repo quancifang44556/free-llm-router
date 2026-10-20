@@ -110,11 +110,11 @@
    *（表现为「域名解析不了」，与 Worker 本身无关）。
    */
 
-  // 面板静态资源以**字符串**形式 import（见 src/panel/index.ts 的说明）。
-  // 用 Text 模块规则而不是 Workers Static Assets：本项目只有 3 个文件，
-  // 且必须挂在 /panel/* 下并统一加安全头 —— Text import 更直接。
+  // 面板静态资源（web/ 的构建产物，由 npm run build:web 嵌入 src/panel/web/）以**字符串**形式 import
+  //（见 src/panel/index.ts 的说明）。不用 Workers Static Assets：面板必须挂在 /panel/* 下
+  // 并统一加安全头 —— Text import 更直接，部署时也不需要装前端依赖。
   "rules": [
-    { "type": "Text", "fallthrough": true, "globs": ["src/panel/assets/*.js.txt", "src/panel/assets/*.css.txt"] }
+    { "type": "Text", "fallthrough": true, "globs": ["src/panel/**/*.js.txt", "src/panel/**/*.css.txt"] }
   ],
 
   "vars": {

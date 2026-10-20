@@ -180,7 +180,7 @@ import {
   TRAE_LOGIN_CALLBACK_PATH,
   TRAE_LOGIN_STATE_TTL_MS,
 } from './providers/trae.js'
-import { panelAsset, securityHeaders, loginSecurityHeaders } from './panel/index.js'
+import { panelAsset, securityHeaders } from './panel/index.js'
 
 // DO 类必须从入口导出，否则 wrangler 找不到绑定目标。
 export { AccountPoolDO, TaskRunnerDO }
@@ -1171,14 +1171,20 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
   // 刻意不用 cookie（cookie 会自动附带，需要额外 CSRF 防护；Authorization 头不会）。
   const asset = panelAsset(path)
   if (asset !== undefined) {
-    // ⚠️ 登录页有自己的 CSP：它含一个真实 `<form>`，而 `form-action 'none'`
-    // 会把提交拦下并在控制台报错（见 `CSP_LOGIN` 的说明）。
-    const isLoginPage = path === '/login' || path === '/login/'
-    const headers = isLoginPage ? loginSecurityHeaders() : securityHeaders()
     return new Response(asset.body, {
       status: 200,
-      headers: { ...headers, 'content-type': asset.contentType },
+      headers: { ...securityHeaders(), 'content-type': asset.contentType, 'cache-control': asset.cacheControl },
     })
+  }
+  // 旧版独立登录页已并入单页面板（未登录时面板自己显示登录表单）——旧书签直接跳过去。
+  if (path === '/login' || path === '/login/') {
+    return new Response(null, { status: 302, headers: { ...securityHeaders(), location: '/panel/' } })
+  }
+  // `/panel/*` 下不存在的文件直接 404（面板用 hash 路由，不需要服务端回落到 index.html）。
+  // ⚠️ 不能落进下面的鉴权分支：那会对一个静态路径返回 401 JSON，让人误以为是密钥问题。
+  // 只拦带尾斜杠的子路径；`/panel` 本身在下面 302 到 `/panel/`。
+  if (path.startsWith('/panel/')) {
+    return new Response('Not Found', { status: 404, headers: { ...securityHeaders(), 'content-type': 'text/plain; charset=utf-8' } })
   }
 
   // ── /favicon.ico：显式返回 204 ──

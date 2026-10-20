@@ -1151,7 +1151,7 @@ export class AccountPoolDO extends DurableObject<Env> {
    * ## ⚠️ 为什么必须有这个方法
    *
    * `AccountState.lastCheckinDay` 早就存在（`state.ts:133`），面板也在读它
-   *（`src/panel/assets/app.js.txt:307` 的「签到 YYYY-MM-DD」）——
+   *（账号列表的「签到 YYYY-MM-DD」标签）——
    * 但**从来没有代码写过它**，于是那个标签永远不显示。
    *
    * 这与 Go 侧的能力不对等：Go 在签到成功与幂等两条分支后都调
