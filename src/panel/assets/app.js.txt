@@ -3379,8 +3379,9 @@ async function loadConfig() {
 
   const baseUrl = window.location.origin + '/v1'
   const key = apiKey() || '（请在面板填入有效密钥）'
-  // ⚠️ 主密钥只脱敏显示（前 4 位 + 圆点），复制按钮复制完整值 —— 配置页常被截图分享
-  const maskedKey = apiKey() ? key.slice(0, 4) + '••••••••' + (key.length > 12 ? key.slice(-2) : '') : key
+  // ⚠️ 主密钥只脱敏显示，复制按钮复制完整值 —— 配置页常被截图分享。
+  // 短于 16 位的口令整段打码：露前 4 位对短口令等于露掉大半（"demo" 会被原样显示）。
+  const maskedKey = !apiKey() ? key : key.length >= 16 ? key.slice(0, 4) + '••••••••' + key.slice(-2) : '••••••••'
 
   // 1. 客户端接入指南卡片
   const clientCard = document.createElement('div')
