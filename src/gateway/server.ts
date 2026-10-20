@@ -53,6 +53,18 @@ import type { AccountPoolDO } from '../pool/AccountPoolDO.js'
 import { healthyForModel } from '../pool/state.js'
 
 /**
+ * 账号池后台写入（处罚 / 记账 / 粘性绑定）的错误处理：不打断主流程，但**必须留日志**。
+ *
+ * ⚠️ 此前这些调用都是 `.catch(() => {})`：写入失败时冷却、熔断、用量**静默丢失**，
+ * 表现为「账号明明坏了还在被选」「对话成功但用量为 0」，且没有任何日志可查。
+ */
+function logPoolError(op: string): (error: unknown) => void {
+  return (error: unknown) => {
+    console.error(`[pool] ${op} 写入失败：`, error instanceof Error ? `${error.name}: ${error.message}` : String(error))
+  }
+}
+
+/**
  * 将 API 请求摘要记录到日志环形缓冲（供管理面板「日志」Tab 实时展示）。
  */
 export function recordLog(
@@ -506,9 +518,9 @@ function clearSessionBinding(
 ): void {
   if (sessionKey === '') return
   if (ctx !== undefined && typeof ctx.waitUntil === 'function') {
-    ctx.waitUntil(pool.unbindSession(sessionKey).catch(() => {}))
+    ctx.waitUntil(pool.unbindSession(sessionKey).catch(logPoolError('unbindSession')))
   } else {
-    void pool.unbindSession(sessionKey).catch(() => {})
+    void pool.unbindSession(sessionKey).catch(logPoolError('unbindSession'))
   }
 }
 
@@ -888,7 +900,7 @@ export async function handleChatCompletions(
             ...(msg !== '' ? { reason: `${kind}: ${msg}`.slice(0, 200) } : {}),
             ...(cause !== undefined ? { modelCause: cause } : {}),
           })
-          .catch(() => {})
+          .catch(logPoolError('applyFailure'))
       }
 
       clearSessionBinding(pool, sessionKey, ctx)
@@ -937,7 +949,7 @@ export async function handleChatCompletions(
           resetAt: Date.now() + ZERO_OUTPUT_COOLDOWN_MS,
           reason: `buddy/${model} zero-output (finish_reason=length, ${screenedBuddy.probe.frames}f)`,
         })
-        .catch(() => {})
+        .catch(logPoolError('applyFailure'))
 
       // ⚠️ §7.2「失败必须显式」：改道必须留痕（日志 + 面板日志双写）
       console.warn(`[zero-output] ${describeZeroOutputHit(DEFAULT_PROVIDER, model, screenedBuddy.probe)} uid=${candidate.uid}`)
@@ -972,14 +984,14 @@ export async function handleChatCompletions(
         clientGone: () => request.signal.aborted,
         onFirstChunk: () => {
           // 首帧到达即算成功（清熔断/降权）
-          const okTask = pool.noteSuccess(candidate.uid, Date.now(), undefined, model).catch(() => {})
+          const okTask = pool.noteSuccess(candidate.uid, Date.now(), undefined, model).catch(logPoolError('noteSuccess'))
           if (ctx !== undefined) ctx.waitUntil(okTask)
           else void okTask
         },
         onFinish: (usage) => {
           // 记账用量（面板的「用量」视图靠它）
           //
-          // ⚠️ 这里**不能**静默吞错误：第一版写成 `.catch(() => {})`，
+          // ⚠️ 这里**不能**静默吞错误：第一版写成 `.catch(logPoolError('noteSuccess'))`，
           // 结果线上「对话成功但用量恒为 0」，且没有任何日志可查
           // （正是本项目一直在警告的「静默失败」形态）。
           const record = {
@@ -1031,7 +1043,7 @@ export async function handleChatCompletions(
               now: Date.now(),
               reason: message.slice(0, 200),
             })
-            .catch(() => {})
+            .catch(logPoolError('applyFailure'))
 
           recordLog(
             pool,
@@ -1611,18 +1623,18 @@ export async function handleProviderChat(input: {
                 //（否则用户的取消动作会熔断健康账号，见 `nonStreamingResponse` 的说明）。
                 clientGone: () => request.signal.aborted,
                 onFirstChunk: () => {
-                  const t = pool.noteSuccess(picked.uid, Date.now(), undefined, model).catch(() => {})
+                  const t = pool.noteSuccess(picked.uid, Date.now(), undefined, model).catch(logPoolError('noteSuccess'))
                   if (ctx !== undefined) ctx.waitUntil(t)
                   // ⚠️ 首帧到达即绑定会话 —— 此后同一会话优先落这个账号，
                   // 从第二轮起命中上游 prompt cache（更快、更省）。
                   if (sessionKey !== '' && ctx !== undefined) {
-                    ctx.waitUntil(pool.bindSession(sessionKey, picked.uid, Date.now()).catch(() => {}))
+                    ctx.waitUntil(pool.bindSession(sessionKey, picked.uid, Date.now()).catch(logPoolError('bindSession')))
                   }
                 },
                 onError: (m) => {
                   const t = pool
                     .applyFailure({ uid: picked.uid, kind: 'breaker', now: Date.now(), reason: m.slice(0, 200) })
-                    .catch(() => {})
+                    .catch(logPoolError('applyFailure'))
                   if (ctx !== undefined) ctx.waitUntil(t)
                   recordLog(
                     pool,
@@ -1646,7 +1658,7 @@ export async function handleProviderChat(input: {
                       input: usage?.input ?? 0, output: usage?.output ?? 0, ok: true,
                       ms: Date.now() - startedAt2,
                     })
-                    .catch(() => {})
+                    .catch(logPoolError('recordUsage'))
                   if (ctx !== undefined) ctx.waitUntil(t)
                   recordLog(
                     pool,
@@ -1710,7 +1722,7 @@ export async function handleProviderChat(input: {
               ...(pcause !== undefined ? { modelCause: pcause } : {}),
               reason: `${c.kind}: ${(c.msg || message).slice(0, 180)}`,
             })
-            .catch(() => {})
+            .catch(logPoolError('applyFailure'))
         }
         lastError = {
           status: clientStatusFor(peStatus || 502, c.kind),
@@ -1761,11 +1773,11 @@ export async function handleProviderChat(input: {
             return {
               response: await streamResponse(retry.body, {
                 onFirstChunk: () => {
-                  const t = pool.noteSuccess(picked.uid, Date.now(), undefined, model).catch(() => {})
+                  const t = pool.noteSuccess(picked.uid, Date.now(), undefined, model).catch(logPoolError('noteSuccess'))
                   if (ctx !== undefined) ctx.waitUntil(t)
                   // 会话粘性：首帧到达即绑定，后续轮次优先落同一账号
                   if (sessionKey !== '' && ctx !== undefined) {
-                    ctx.waitUntil(pool.bindSession(sessionKey, picked.uid, Date.now()).catch(() => {}))
+                    ctx.waitUntil(pool.bindSession(sessionKey, picked.uid, Date.now()).catch(logPoolError('bindSession')))
                   }
                 },
                 // ⚠️ 诊断用：区分「客户端断开」与「上游中断」
@@ -1778,7 +1790,7 @@ export async function handleProviderChat(input: {
                       now: Date.now(),
                       reason: message.slice(0, 200),
                     })
-                    .catch(() => {})
+                    .catch(logPoolError('applyFailure'))
                   if (ctx !== undefined) ctx.waitUntil(t)
                   recordLog(
                     pool,
@@ -1802,7 +1814,7 @@ export async function handleProviderChat(input: {
                       input: usage?.input ?? 0, output: usage?.output ?? 0, ok: true,
                       ms: Date.now() - startedAt2,
                     })
-                    .catch(() => {})
+                    .catch(logPoolError('recordUsage'))
                   if (ctx !== undefined) ctx.waitUntil(t)
                   recordLog(
                     pool,
@@ -1905,7 +1917,7 @@ export async function handleProviderChat(input: {
           ...(resolvedResetAt !== undefined ? { resetAt: resolvedResetAt } : {}),
           reason: `${providerId} http=${upstream.status}: ${text.slice(0, 160)}`,
         })
-        .catch(() => {})
+        .catch(logPoolError('applyFailure'))
       // ⚠️ 同上：不原样透传上游状态码（避免把网关故障伪装成客户端的 400）
       lastError = {
         status: clientStatusFor(upstream.status, 'unknown'),
@@ -1954,7 +1966,7 @@ export async function handleProviderChat(input: {
             reason: `${providerId} sse: ${(msg || errText).slice(0, 160)}`,
             ...(cause !== undefined ? { modelCause: cause } : {}),
           })
-          .catch(() => {})
+          .catch(logPoolError('applyFailure'))
       }
 
       clearSessionBinding(pool, sessionKey, ctx)
@@ -2004,7 +2016,7 @@ export async function handleProviderChat(input: {
           resetAt: Date.now() + ZERO_OUTPUT_COOLDOWN_MS,
           reason,
         })
-        .catch(() => {})
+        .catch(logPoolError('applyFailure'))
 
       // ⚠️ §7.2「失败必须显式」：改道**必须留痕**，不能静默。
       // 日志 + 面板日志双写，否则用户/排查者无法把这次改道与网络故障区分开
@@ -2039,7 +2051,7 @@ export async function handleProviderChat(input: {
         //（否则用户的取消动作会熔断健康账号，见 `nonStreamingResponse` 的说明）。
         clientGone: () => request.signal.aborted,
         onFirstChunk: () => {
-          const t = pool.noteSuccess(picked.uid, Date.now(), undefined, model).catch(() => {})
+          const t = pool.noteSuccess(picked.uid, Date.now(), undefined, model).catch(logPoolError('noteSuccess'))
           if (ctx !== undefined) ctx.waitUntil(t)
         },
         onError: (message) => {
@@ -2050,7 +2062,7 @@ export async function handleProviderChat(input: {
               now: Date.now(),
               reason: message.slice(0, 200),
             })
-            .catch(() => {})
+            .catch(logPoolError('applyFailure'))
           if (ctx !== undefined) ctx.waitUntil(t)
           recordLog(
             pool,
