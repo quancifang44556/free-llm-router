@@ -1,18 +1,26 @@
 services:
   free-llm-router:
+    # Dockerfile 只拷贝构建产物：先在宿主机执行 npm run build:node
     build:
       context: .
       dockerfile: Dockerfile
+    image: free-llm-router:latest
     container_name: free-llm-router
     restart: unless-stopped
     ports:
+      # 前面有本机反向代理时改成 "127.0.0.1:11451:11451"，不要把端口直接暴露到公网
       - "11451:11451"
     environment:
+      # 容器内固定值：HOST 必须是 0.0.0.0，端口映射才能连通
       - PORT=11451
       - HOST=0.0.0.0
       - DATABASE_PATH=/app/data/router.db
+      # 以下从同目录的 .env 读取
       - API_KEY=${API_KEY:-}
       - CREDENTIAL_KEY=${CREDENTIAL_KEY:-}
-      - AUTO_TASK_CRON=true
+      - AUTO_TASK_CRON=${AUTO_TASK_CRON:-true}
+      - TRUST_PROXY=${TRUST_PROXY:-false}
+      - PUBLIC_URL=${PUBLIC_URL:-}
     volumes:
+      # 账号凭据与用量都在这里，务必持久化（宿主目录需归 uid 1000 所有）
       - ./data:/app/data

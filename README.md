@@ -1,92 +1,142 @@
+<div align="center">
+
 # free-llm-router
 
-**把多个大模型供应商的账号池，聚合成一个 OpenAI 兼容的 API** —— 外加账号自动化（签到 / 成长任务 / 领奖）。
+**把多家大模型供应商的账号池，汇成一个 OpenAI 兼容 API。**
 
-一份代码，两种运行形态：Cloudflare Workers，或自有 VPS 上的单个 Node 进程。
+自动选号 · 冷却与容灾 · 签到与每日任务自动跑 · 自带管理面板<br>
+部署到 Cloudflare Workers，或在 VPS 上跑一个 Node 进程
 
-> ⚠️ **仅限本人授权账号自用。** 见 [使用边界](#使用边界)。
+![OpenAI 兼容](https://img.shields.io/badge/API-OpenAI%20%E5%85%BC%E5%AE%B9-412991)
+![15 家供应商](https://img.shields.io/badge/%E4%BE%9B%E5%BA%94%E5%95%86-15%20%E5%AE%B6-orange)
+![运行环境](https://img.shields.io/badge/%E8%BF%90%E8%A1%8C-Workers%20%7C%20Node%20%E2%89%A5%2022.13-f38020)
+![License MIT](https://img.shields.io/badge/license-MIT-blue)
 
-![管理面板（深色）：供应商与账号](docs/screenshots/providers-dark.png)
+</div>
 
----
+> [!WARNING]
+> **仅限本人授权的账号自用。** 不支持、也不鼓励批量注册、账号出租或转售 API，详见 [使用边界](#使用边界)。
+
+![管理面板：供应商与账号（深色）](docs/screenshots/providers-dark.png)
 
 ## 目录
 
-- [它能做什么](#它能做什么)
-- [两种运行形态](#两种运行形态)
+- [特性](#特性)
+- [快速开始](#快速开始)
+- [接入客户端](#接入客户端)
 - [支持的供应商](#支持的供应商)
-- [快速上手](#快速上手)
-- [主要端点](#主要端点)
 - [管理面板](#管理面板)
-- [选号与冷却策略](#选号与冷却策略)
-- [使用边界](#使用边界)
+- [工作原理](#工作原理)
+- [API 一览](#api-一览)
+- [本地开发](#本地开发)
 - [已知限制](#已知限制)
-- [License](#license)
+- [使用边界](#使用边界)
 
----
+## 特性
 
-## 它能做什么
+- **一个入口**：`/v1/models`、`/v1/chat/completions`、`/v1/responses`，支持流式、非流式和工具调用。凡是能填自定义 Base URL 的 OpenAI 客户端都能直接接。
+- **15 家供应商**：Buddy、WorkBuddy、Cline、MiniMax、Qoder、TRAE、ZCode、Loomy、Gemini 等。账号可以在面板里用设备码、扫码、短信登录，也可以粘贴凭据导入，系统会自动识别是哪一家。
+- **账号池自动调度**：默认先用积分最早到期的账号。失败时按上游错误类型决定换号、罚号还是只冷却某个模型；国内版账号全部不可用时自动切到国际版。
+- **聚合模型**：`aggregate/<模型名>` 把多家的同一个模型归到一起，优先走积分最快作废的渠道，失败自动换下一家。
+- **账号自动化**：定时签到、跑每日任务、刷新余额、续期凭据；限时补偿积分可在面板一键领取。
+- **子密钥**：给不同工具或设备各发一把 Key，可限制请求数、token 数、可用模型、来源 IP（CIDR）和过期时间。
+- **管理面板**：7 个视图，深浅主题，手机可用；不加载任何外部资源，配严格 CSP。
+- **部署简单**：Cloudflare Workers 的 Free 计划即可运行；在 VPS 上则是一个约 2.3 MB 的单文件加一个 SQLite 库，不依赖外部数据库。
 
-**1. 一个 OpenAI 兼容入口，背后是一池账号**
+## 快速开始
 
-`GET /v1/models`、`POST /v1/chat/completions`、`POST /v1/responses` 三个端点，
-流式与非流式、工具调用都支持。模型名用 `provider/model` 前缀路由；裸模型名回落到默认供应商，保证旧客户端不改代码也能用。
+### 方式 A：VPS / Node（Docker Compose）
 
-价值在于：**你只需要记一个 base URL 和一把 key**，不必为每家供应商各写一套适配。
+```bash
+git clone https://github.com/quancifang44556/free-llm-router.git && cd free-llm-router
+npm install --legacy-peer-deps      # 必须带这个参数：wrangler 与 workers-types 的 peer 版本冲突
+npm run build:node                  # 产出 dist/server.mjs（已包含管理面板）
 
-**2. 选号、冷却、熔断、会话粘性都是自动的**
+echo "API_KEY=$(openssl rand -hex 24)" > .env && cat .env   # 面板与 API 的口令，记下来
+mkdir -p data && sudo chown -R 1000:1000 data                # 容器内以 uid 1000 运行
+docker compose up -d --build
+```
 
-账号池按「健康度 → 排除已试 → 防惊群 → 排序」选号；失败按上游错误语义分层处置（账号级 / 模型级 / 不罚号），
-同一会话在 30 分钟内粘在同一账号上以复用 prompt cache。
+不用 Docker 的话，直接运行 `node --env-file=.env dist/server.mjs`（需要 Node.js ≥ 22.13）。
 
-**模型级限流不会连坐整个账号** —— 换个模型即可继续。这一点有三个配套保证：
+### 方式 B：Cloudflare Workers
 
-- **区分「模型忙」与「模型不存在」**：`6004/14003`（繁忙）走 15s→90s 短退避；
-  `11102`（后端无此模型）与 `11158`（账号档位不支持）是不同类别，后者换号**有意义**。
-- **优先采用上游给的重置时刻**，而不是自己猜：解析文案里的绝对墙钟（英文与中文都认），
-  其次 `Retry-After` 标准头，最后才退回本地退避。
-- **验证式冷却**：一次「模型不存在」**只锁 2 分钟**（观察窗），真坐实才逐级升到
-  30min → 2h → 6h → 24h。旧做法是一次锁 6 小时 —— 一个模型名前缀写错就能把整模型拉黑半天，
-  用户看到的就是「账号明明是好的却用不了」。
+```bash
+git clone https://github.com/quancifang44556/free-llm-router.git && cd free-llm-router
+npm install --legacy-peer-deps
+npx wrangler login
+npm run deploy
 
-**3. 聚合路由：同一个模型，挑最该先烧的那个渠道**
+KEY=$(openssl rand -hex 24); echo "API_KEY=$KEY"             # 记下来，secret 写入后无法再读出
+echo "$KEY" | npx wrangler secret put API_KEY
+openssl rand -base64 32 | npx wrangler secret put CREDENTIAL_KEY   # 不设则拒绝保存账号凭据
+```
 
-同一个真实模型在各家叫法不同、积分到期时间也不同。`aggregate/<规范名>` 把各家同一个模型归到一起，
-按**积分最快作废**自动选渠道（临期的先烧、长期的留着），失败自动换下一家。
-`aggregate/auto` 则不指定模型，在所有渠道里挑。
+### 然后
 
-**4. 账号自动化：签到、成长任务、自动领奖、补偿领取**
+1. 打开 `http://<服务器>:11451/panel/`（Workers 是 `https://<worker 名>.<子域>.workers.dev/panel/`），用 `API_KEY` 登录。
+2. 在「供应商与账号」里点「添加账号」：可以面板登录（9 家支持），也可以粘贴凭据 JSON（15 家都支持）。
+3. 发一个请求试试：
 
-任务引擎拆成「状态机 + 定时步进」，跑在每账号一个的 Durable Object 上，中途被回收也能恢复。
-反风控间隔照抄实测值（不是性能参数，调小会让任务白跑）。
-**会真实消耗配额的任务默认不入队**，必须显式开启。
+```bash
+curl -N http://localhost:11451/v1/chat/completions \
+  -H "Authorization: Bearer $API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"aggregate/auto","stream":true,"messages":[{"role":"user","content":"你好"}]}'
+```
 
----
+systemd、HTTPS 反向代理、备份迁移、自定义域名和常见问题，都在 **[DEPLOY.md](DEPLOY.md)**。
 
-## 两种运行形态
+## 接入客户端
 
-| | **Cloudflare Workers** | **VPS / Node** |
-|---|---|---|
-| 入口 | `src/index.ts` | `src/server/index.ts` → `dist/server.mjs` |
-| 状态存储 | Durable Objects + SQLite | `node:sqlite` 单文件（`data/router.db`） |
-| 后台任务 | DO alarm 自我续期 | 进程内定时器 + 启动时恢复未决任务 |
-| 产物 | 由 `wrangler deploy` 上传 | 约 1.7 MB 单文件，`node dist/server.mjs` 直接跑 |
-| 外部依赖 | 无（Free 计划即可） | Node.js ≥ 22、无外部数据库 |
-| 适合 | 不想维护服务器 | 想完全掌控数据与出口 |
+| 项 | 填什么 |
+|---|---|
+| Base URL | `http(s)://<你的地址>/v1` |
+| API Key | `API_KEY`（主密钥），或面板里签发的子密钥 |
+| 模型 | 以 `GET /v1/models` 的返回为准 |
 
-两者**共用同一份 `fetch` 路由与全部业务代码**，Node 侧只是一层 HTTP / DO 桥接。
-故功能一致，差异只在存储后端与调度实现。
+**模型命名**
 
-桥接层会把对账号池 DO 的调用**逐个串行执行**，复现 Workers 上 DO 的 input gate 语义 ——
-不这样做，并发请求会在「读 → 改 → 写」之间互相覆盖（实测 50 个并发的用量记账只留下 1 次）。
+| 写法 | 含义 |
+|---|---|
+| `<供应商>/<模型>`，如 `qoder/<模型>` | 指定供应商，在这一家的账号池里选号 |
+| `aggregate/<模型>` | 同一个模型跨多家挑渠道，积分最快作废的先用。目前开放 `deepseek-v4-1-flash`、`glm-5-3-flash` |
+| `aggregate/auto` | 不指定模型，在上面所有聚合渠道里挑 |
+| 不带前缀的模型名 | 交给默认供应商 `buddy`，兼容旧客户端 |
 
----
+`/v1/models` 只列出**有可用账号且未停用**的供应商，模型 ID 都带前缀。
+
+**Python（openai SDK）**
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:11451/v1", api_key="<API_KEY 或子密钥>")
+
+stream = client.chat.completions.create(
+    model="aggregate/auto",
+    messages=[{"role": "user", "content": "用一句话介绍你自己"}],
+    stream=True,
+)
+for chunk in stream:
+    if chunk.choices:
+        print(chunk.choices[0].delta.content or "", end="", flush=True)
+```
+
+**环境变量**（OpenAI 生态的大多数工具都会读取）
+
+```bash
+export OPENAI_BASE_URL=http://localhost:11451/v1
+export OPENAI_API_KEY=<API_KEY 或子密钥>
+```
+
+**几个实用技巧**
+
+- **复用 prompt cache**：请求里带一个稳定的 `user` 字段（或 `conversation_id`），同一会话 30 分钟内会固定用同一个账号。不带就按常规轮转。
+- **临时指定账号**：加请求头 `X-FLR-Account: <uid>`，只对这一次请求生效；这个号不可用时直接返回 503，不会换号。
+- **现成片段**：面板「配置 → 接入指南」里有填好你地址的 cURL、Python 和环境变量示例，可以直接复制。
 
 ## 支持的供应商
-
-**共 15 家**（含腾讯国内版 / 国际版、Qoder 国际版 / 中国版两组同源变体）。
-
-「登录」= 能否**从本服务发起**登录流程；不能的并非不能用 —— 它们全部支持**粘贴凭据导入**。
 
 | id | 名称 | 面板登录 | 每日签到 |
 |---|---|---|---|
@@ -106,168 +156,59 @@
 | `gemini` | Gemini（Cloud Code Assist） | ✕ | ✕ |
 | `meoo` | Meoo（秒悟） | ✕ | ✅ |
 
-`buddy` 是**默认供应商**（裸模型名的兜底），它排在第一项且不参与自动识别，避免抢走别家的凭据。
+- **「面板登录」指能不能从本服务发起登录。** 打 ✕ 的一样能用：15 家都支持粘贴凭据导入（单个、数组或 `{"accounts":[...]}` 批量），可以自动识别供应商，也可以用 `"provider":"<id>"` 显式指定。
+- **签到和对话是两回事**：没有签到的供应商照样能正常对话。
+- `buddy` 是默认供应商。为了不抢走别家的凭据，它不参与自动识别。
+- `zcode` 的签到接口总是要求阿里云验证码，所以签到**大概率失败**，系统会如实报错；对话不受影响。
+- 每家的实际能力和「为什么不支持」由 `GET /admin/providers` 返回，面板也是按这个接口渲染的。
 
-**打 ✕ 的都能正常对话**，签到与登录是独立能力。不能发起登录的原因都在上游协议侧，不是本服务的缺失：
+<details>
+<summary>为什么有 6 家不能在面板里登录</summary>
 
-- **codearts / lobsterai**：授权回调被强制指向本机 `127.0.0.1` 端口，服务器收不到（codearts 的跳转链还会在服务端绕回登录页）。
-- **trae**：授权页对回调地址有硬编码正则，只认 `http://127.0.0.1:<端口>/authorize`。
-- **gemini**：Google 对原生应用只允许 loopback 重定向（RFC 8252）。
-- **meoo**：官方 CLI 在 `127.0.0.1` 起本地 HTTP 服务收 OAuth 回调。
-- **opencode**：上游本就没有登录流程，只有 API key 与匿名通道。
+问题都出在上游的登录协议上：
 
-`zcode` 的 ⚠️ 是如实的：签到接口始终索要阿里云验证码，本服务**大概率签到失败并如实报错**（推理不受影响）。
+- **codearts / lobsterai**：授权回调被强制指向本机 `127.0.0.1`，服务器收不到。
+- **trae**：授权页用正则校验回调地址，只认 `http://127.0.0.1:<端口>/authorize`。
+- **gemini**：Google 只允许原生应用使用 loopback 回调（RFC 8252）。
+- **meoo**：官方 CLI 在本机起 HTTP 服务接收 OAuth 回调。
+- **opencode**：上游本来就没有登录流程，只有 API Key 和匿名通道。
 
-能力矩阵不是写死的表 —— `GET /admin/providers` 返回真实的能力声明与**每项不可用的具体原因**，
-面板也据此渲染。新增一家只需实现 `Provider` 接口并注册，网关不认识具体供应商。
-
-> 另有**虚拟供应商** `aggregate`：它没有账号、没有凭据，只是把上面各家的模型归到一起再挑一个发出去。
-
----
-
-## 快速上手
-
-### 1. 构建
-
-```bash
-git clone <repo> free-llm-router && cd free-llm-router
-npm install --legacy-peer-deps   # wrangler 与 workers-types 的 peer 版本冲突，必须带这个参数
-npm run build:node               # 产出 dist/server.mjs
-```
-
-### 2. 配置
-
-```bash
-cat > .env <<'EOF'
-PORT=11451
-HOST=0.0.0.0
-DATABASE_PATH=./data/router.db
-API_KEY=<你的口令，建议 openssl rand -base64 24 生成>
-# CREDENTIAL_KEY=<可选：固定凭据加密密钥，便于迁移>
-AUTO_TASK_CRON=true
-EOF
-```
-
-| 变量 | 默认值 | 说明 |
-|---|---|---|
-| `PORT` | `11451` | 监听端口 |
-| `HOST` | `0.0.0.0` | 监听地址（本机反代时建议改 `127.0.0.1`） |
-| `DATABASE_PATH` | `./data/router.db` | SQLite 文件路径 |
-| `API_KEY` | *（空）* | 面板与全部 API 的口令。**不设则任何请求 401**（fail-closed） |
-| `CREDENTIAL_KEY` | *（自动生成）* | 凭据 AES-GCM 加密密钥；不设则首次启动生成并持久化到库里 |
-| `AUTO_TASK_CRON` | `true` | 每小时巡检开关。`false` / `0` / `no` / `off` 均可关闭 |
-| `TRUST_PROXY` | `false` | 前面有自己的反代（nginx / Caddy / cloudflared）时设为 `true`：按 `X-Forwarded-For` 最右一项取客户端 IP。不设则用 TCP 对端地址 |
-| `PUBLIC_URL` | *（空）* | 可选，仅用于启动 banner 显示 |
-| `UPSTREAM_CHAT_BASE` / `UPSTREAM_BILLING_BASE` / `UPSTREAM_WEB_BASE` | 内置默认 | 高级：覆盖上游端点 |
-
-> ⚠️ **迁移服务器时**：若原部署用的是自动生成的 `CREDENTIAL_KEY`，必须从旧库导出后再迁移，
-> 否则新库会生成新密钥、旧凭据全部解不开。
-
-### 3. 启动
-
-```bash
-node dist/server.mjs
-```
-
-打开 `http://localhost:11451/panel/`，用 `API_KEY` 登录。
-
-### 4. 加账号
-
-面板「供应商与账号」→「添加账号」，两种方式：
-
-- **面板登录**（9 家支持）：设备码 / 用户码 / 扫码 / 短信，按提示完成授权；
-- **粘贴凭据 JSON**（所有供应商可用）：系统按各家的判别式**自动识别**是哪一家，
-  也接受显式 `"provider":"codearts"` 覆盖，以及数组或 `{"accounts":[...]}` 批量导入。
-
-### 5. 调用
-
-```bash
-curl -N http://localhost:11451/v1/chat/completions \
-  -H "Authorization: Bearer $API_KEY" \
-  -H 'content-type: application/json' \
-  -d '{"model":"buddy/<模型名>","messages":[{"role":"user","content":"你好"}]}'
-```
-
-`GET /v1/models` 里列出的模型**一律带 `provider/` 前缀**，且只列「有账号」的供应商 ——
-列出必然失败的模型只会让客户端挑错。
-
-部署到 Cloudflare Workers，以及反向代理 / HTTPS / 备份迁移 / 排障的详细步骤，见 [DEPLOY.md](DEPLOY.md)。
-
----
-
-## 主要端点
-
-### 免鉴权
-
-| 路径 | 说明 |
-|---|---|
-| `GET /healthz` | 存活探针，不含任何敏感信息 |
-| `GET /panel/` | 管理面板静态资源（页面本身不含数据） |
-| `GET /login/codearts/callback`、`GET /login/trae/callback` | 浏览器登录回跳，安全性由一次性 `state` 保证 |
-
-### OpenAI 兼容（`/v1/*`）
-
-| 路径 | 说明 |
-|---|---|
-| `GET /v1/models` | 模型目录（带 `provider/` 前缀 + `aggregate/` 虚拟模型） |
-| `POST /v1/chat/completions` | 对话，流式 / 非流式，含工具调用 |
-| `POST /v1/responses` | Responses API，内部复用 Chat 路径 |
-
-`/v1/*` 接受**两种** Key：主密钥（`API_KEY`）与面板签发的**子密钥**。
-子密钥只能进 `/v1/*`，不能登录面板、不能改账号 —— 否则它能给自己扩容。子密钥可限制请求数、token 数、
-统计窗口、可用模型、来源 IP（支持 CIDR）与过期时刻。
-
-### 管理（`/admin/*`，共 44 个路径）
-
-按用途分类，不逐个罗列：
-
-| 分类 | 代表路径 |
-|---|---|
-| 账号与凭据 | `accounts`、`accounts/toggle`、`accounts/remove`、`accounts/balance`（手动刷新余额）、`pins`（指定账号）、`import`、`credentials`、`pool` |
-| 供应商与登录 | `providers`、`providers/login/{start,poll}`、`login/{start,poll}`、`providers/login/loomy/{sms,bind}`、`providers/settings` |
-| 模型目录 | `providers/models`、`providers/models/{toggle,bulk}`、`models/builtin`、`models/probe` |
-| 任务与签到 | `tasks/{scan,run,status,start}`、`tasks/daily-all`、`checkin/all` |
-| 补偿与积分锁 | `compensation`、`compensation/claim`、`permanent-locks` |
-| 用量与日志 | `usage`、`usage/clear`、`logs`、`logs/clear`、`packages` |
-| 子密钥 | `apikeys`、`apikeys/{update,reset,reset-usage,remove}` |
-| 运维 | `config/routing`、`cooldowns/clear`、`waf`、`waf/clear` |
-
----
+</details>
 
 ## 管理面板
 
-`/panel/`，未登录时先进登录页。**7 个视图**：
+访问 `/panel/`，用 `API_KEY` 登录。
 
-| 视图 | 内容 |
+| 视图 | 能做什么 |
 |---|---|
-| **供应商与账号** | 账号池统计、账号表（搜索 / 按状态筛选）、供应商列表（健康条、拖动排序）；账号菜单可停用 / 启用、刷新余额、清除冷却、删除 |
-| **供应商详情** | 点开任一家：启用 / 停用整家、**指定账号**（只用它 / 优先用它）、该家账号列表、模型逐个开关与一键全开 / 全关、面板登录或粘贴凭据 |
-| **任务中心** | 全部供应商一键签到（国内 / 国际两个分片都跑，不支持的会说明原因）、Buddy 每日任务与进度、限时补偿积分查询 / 领取 |
-| **用量** | 今日 / 近 7 天 / 近 30 天 / 全部 四个窗口；请求趋势、Token 消耗、按模型 / 按账号排名；明细最近 500 条，按天聚合保留 90 天 |
-| **API Key** | 子密钥的创建、改名与限额、清零窗口用量、重新生成、吊销（明文只在生成时出现一次） |
-| **模型** | 对外模型目录：搜索、按供应商 / 免费筛选、一键复制 ID；**资费检测**（单个或批量真实请求一次，确认是否扣积分，结果存在本机浏览器） |
-| **配置** | 接入指南（Base URL、cURL / Python / 环境变量片段）、**路由与调度**（见下文）、运行状态（WAF 拦截与解除、清空冷却、凭据数核对）、**永久积分锁** |
-| **日志** | 国内 / 国际分片合并、按类型筛选、清空 |
+| **供应商与账号** | 账号池统计；账号表支持搜索、按状态筛选；供应商列表带健康条，可拖动排序；单个账号可以停用、启用、刷新余额、清除冷却、删除 |
+| **供应商详情** | 启用或停用整家；指定账号（只用它 / 优先用它）；逐个或一键开关模型；面板登录或导入凭据 |
+| **任务中心** | 全部供应商一键签到；Buddy 每日任务进度；查询和领取限时补偿积分 |
+| **用量** | 今日、近 7 天、近 30 天、全部四个时间窗口；请求趋势、Token 消耗、按模型和按账号排名 |
+| **API Key** | 创建子密钥、改名、设限额、清零用量、重新生成、吊销（明文只在生成时显示一次） |
+| **模型** | 搜索、按供应商或「免费」筛选、复制 ID；资费检测：真实请求一次，确认是否扣积分 |
+| **配置** | 接入指南；路由与调度；运行状态（WAF 拦截、清空冷却、凭据数核对）；永久积分锁 |
+| **日志** | 国内和国际分片合并显示，可按类型筛选、清空 |
 
 <table>
   <tr>
-    <td width="50%"><img src="docs/screenshots/usage-light.png" alt="用量（浅色）"></td>
-    <td width="50%"><img src="docs/screenshots/config-light.png" alt="配置与接入指南（浅色）"></td>
+    <td width="50%"><img src="docs/screenshots/usage-light.png" alt="用量"></td>
+    <td width="50%"><img src="docs/screenshots/config-light.png" alt="配置与接入指南"></td>
   </tr>
   <tr>
-    <td align="center">用量（浅色）</td>
-    <td align="center">配置与接入指南（主密钥默认打码）</td>
+    <td align="center">用量</td>
+    <td align="center">接入指南（主密钥默认打码）</td>
   </tr>
   <tr>
-    <td width="50%"><img src="docs/screenshots/provider-sheet-dark.png" alt="供应商详情（深色）"></td>
-    <td width="50%"><img src="docs/screenshots/models-light.png" alt="模型与资费检测（浅色）"></td>
+    <td width="50%"><img src="docs/screenshots/provider-sheet-dark.png" alt="供应商详情"></td>
+    <td width="50%"><img src="docs/screenshots/models-light.png" alt="模型与资费检测"></td>
   </tr>
   <tr>
-    <td align="center">供应商详情：账号 / 模型 / 添加账号</td>
+    <td align="center">供应商详情</td>
     <td align="center">模型目录与资费检测</td>
   </tr>
   <tr>
-    <td width="50%"><img src="docs/screenshots/tasks-light.png" alt="任务中心（浅色）"></td>
+    <td width="50%"><img src="docs/screenshots/tasks-light.png" alt="任务中心"></td>
     <td width="50%"><img src="docs/screenshots/mobile.png" alt="手机端"></td>
   </tr>
   <tr>
@@ -276,215 +217,193 @@ curl -N http://localhost:11451/v1/chat/completions \
   </tr>
 </table>
 
-- **主题**：深色 / 浅色 / 跟随系统，右上角切换；首次打开跟随系统，选过之后记住。
-- **手机可用**：窄屏下侧栏收进菜单、统计卡片两列排布，供应商详情全屏展开。
-- **零外部依赖**：HTML / CSS / JS 全部打进产物，不加载任何 CDN、字体或统计脚本，配严格 CSP（无内联脚本）。
-- **主密钥默认打码**：配置页的 API Key 与 cURL 示例只显示打码后的值，「复制」拿到的仍是完整值 ——
-  截图、录屏、投屏都不会把口令带出去。
-- 顶栏版本号取自 `package.json`，不会再与实际版本对不上。
+- **主题**：浅色、深色、跟随系统三种，选过之后会记住。
+- **安全**：HTML、CSS、JS 全部打进产物，不加载任何 CDN、字体或统计脚本，配严格 CSP（不允许内联脚本）。口令存在浏览器 `localStorage`，通过 `Authorization` 头发送，不用 cookie，也就没有 CSRF 风险。
+- **主密钥默认打码**：截图、录屏或投屏时不会泄露口令；点「复制」拿到的仍是完整值。
 
-页面本身免鉴权（不含数据），口令存在 `localStorage`、每个请求带 `Authorization` 头 ——
-刻意不用 cookie，避免额外引入 CSRF 面。
+## 工作原理
 
-### 面板源码与构建
+### 一次请求怎么选号
 
-面板是 `web/` 下的 React + Vite 单页应用。构建产物**随源码提交**在 `src/panel/web/`，
-所以部署（`wrangler deploy` / `npm run build:node`）**不需要**装前端依赖。只有改了 `web/` 才需要：
+| 步骤 | 做什么 |
+|---|---|
+| 1. WAF 闸门 | 判断出口 IP 正被上游拦截时，直接失败，一个号都不试，避免一次请求放大成 N 次撞墙 |
+| 2. 健康过滤 | 去掉停用、冷却中、熔断中的账号，以及这个模型正在冷却的账号 |
+| 3. 排除已试 | 本次请求已经失败过的号不再选，避免在两个号之间来回 |
+| 4. 永久积分锁 | 开启后，只剩永久积分的号不参与选号 |
+| 5. 指定账号 | 设置了指定账号且它通过前四步，就直接用它 |
+| 6. 排序 | 按选号策略排序（见下表） |
 
-```bash
-npm run build:web     # = cd web && npm ci && npm run build，再把产物嵌进 src/panel/web/
-```
+此外还有两条规则：同一账号 3 秒内被选过会优先避开，防止并发请求挤在同一个号上（上游会踢掉同一个号上更早的流）；同一会话的请求会尽量用同一个号，以便命中 prompt cache。
 
-本地开发：先把网关跑起来（`node dist/server.mjs`，默认 11451 端口），再 `cd web && npm install && npm run dev`，
-Vite 会把 `/admin`、`/v1` 转发到网关（端口不同用 `PANEL_API=http://127.0.0.1:<端口>` 指定）。
-旧版独立登录页 `/login` 现在直接跳到 `/panel/`。
+### 路由与调度
 
-### 三个值得一提的开关
+在面板「配置 → 路由与调度」里修改，保存后立即生效：
 
-**永久积分锁**（配置页，逐供应商）：开启后，该供应商下「**只剩永久额度**」的账号不再参与选号。
-免费额度烧完后若继续用，消耗的是你花钱买的永久积分，且**不可撤回** —— 这个开关就是拦这件事。
-有临期额度的账号照常可用，因此它不是「停用该供应商」。
-
-> ⚠️ **开启前必读**：判据是 `credits > 0 && creditsExpiring === 0`，而 `creditsExpiring`
-> 只统计**7 天内到期**的额度。所以一个「有 2000 积分、但都在 30 天后到期」的账号，
-> 也会被判成「只剩永久额度」而被锁掉 —— 那通常不是你想要的。
-> 若你的赠送额度大多在 7 天以后才到期，**建议先别开这个锁**。
-
-**限时补偿积分**（任务中心）：上游偶尔发限时补偿（如服务抖动后补积分），过期作废。
-面板提供「查状态」（只读）与「领取」（一次性写操作）两个按钮。**刻意不接进 cron 与自动签到** ——
-一次性动作误触没有第二次机会，必须由人显式触发。
-
-**零输出熔断**（自动，无开关）：部分上游虚报上下文窗口，按虚高窗口打包就会越墙 ——
-上游「收下请求但吐 0 个字符」并回 `finish_reason=length`。判据要求**同时**满足「零输出」，
-因为 `length` + **有输出** 是「答到半截撞输出上限」，此时换目标会丢掉已产出的正文。
-命中后把该（账号, 模型）目标冷却 10 分钟并改道重发；工具调用与客户端主动取消都不算命中。
-
----
-
-## 选号与冷却策略
-
-这一节说明「一次请求落到哪个号、失败后怎么处置」的完整顺序。**顺序即语义**，不可调换。
-
-### 选号六步
-
-| 步 | 动作 | 说明 |
+| 项 | 默认 | 说明 |
 |---|---|---|
-| ① | **WAF 闸门** | IP 级拦截激活期内直接放弃，一个号都不试 —— 继续轮转只会把一次请求放大成 N 次撞墙 |
-| ② | **健康过滤** | 账号级（`disabled` / 冷却 / 熔断 / 降权）+ 模型级（该模型的冷却）+ 供应商匹配（不会拿 A 家凭据打 B 家端点） |
-| ③ | **排除已试** | `tried` 集合**跨重试保留**，否则会在两个号之间无限来回 |
-| ④ | **永久积分锁** | 只剩永久额度的号不参与选号（见下文开关说明） |
-| ⑤ | **指定账号** | 设了指定且它通过了前四步 ⇒ 直接用它；「只用它」模式下它不可用就报错（见下文） |
-| ⑥ | **排序** | `expiry`（默认）/ `roundrobin` / `random` 三选一，见下方「路由与调度」 |
+| 选号策略 | `expiry` | `expiry`：积分最早到期的先用；`roundrobin`：最久没用的先用；`random`：按积分加权随机 |
+| 失败换号次数 | 3 | 一次请求最多换几个号（总共尝试 1 + N 次），范围 0–10 |
+| 限流冷却起步 | 60 秒 | 上游限流又没给重置时间时，第一次冷却的时长；之后逐次翻倍，最长 30 分钟 |
+| 定时签到与每日任务 | 开 | 关闭后，定时器只刷新余额和续期凭据 |
+| 自动续期凭据 | 开 | 关闭后不再提前续期；请求时遇到 401 仍会按需续期 |
 
-### 路由与调度（面板「配置」页，`/admin/config/routing`）
+定时器每小时刷新余额、续期快过期的凭据；每天北京时间 01:00、09:00、21:00 签到并跑每日任务。
 
-| 项 | 默认 | 作用 |
-|---|---|---|
-| 选号策略 | `expiry` | `expiry`：积分最早到期的号先用（查不到到期时刻的排在后面，彼此按最久未用轮换）；`roundrobin`：最久没用的先用，负载均匀；`random`：按积分加权随机 |
-| 失败换号次数 | 3 | 一次请求最多换几个号（共尝试 1 + N 次），0 = 不换号 |
-| 限流冷却起步 | 60 秒 | 上游限流（429 等）且没给重置时刻时，第一次冷却多久；之后按次数指数退避 |
-| 定时签到与每日任务 | 开 | 关掉后定时器只刷新余额，不再自动签到 / 跑任务 |
-| 自动续期凭据 | 开 | 关掉后定时器不再主动刷新快过期的凭据（请求时遇到过期仍会按需续期） |
+> [!TIP]
+> 环境变量 `AUTO_TASK_CRON=false` 会关掉**整个**每小时定时器，余额刷新和凭据续期也会停。只想停签到，用面板里的开关。
 
-保存后立即生效，国内 / 国际两个分片同步。
+### 失败了怎么办
 
-### 会话粘性（复用 prompt cache）
+- **按错误类型处理**：限流、模型不可用这类问题只冷却「账号 + 模型」，换个模型这个号还能用；额度耗尽的号冷却到次日 04:00；401 只续期凭据，不算账号的错；请求本身有问题（如上下文超长）时，既不换号也不罚号。
+- **冷却时长尽量听上游的**：先用上游文案里的重置时间（中英文都能识别），其次用 `Retry-After` 头，最后才用本地退避。
+- **验证式冷却**：一次「模型不存在」只冷却 2 分钟用于观察，确认后才逐级升到 30 分钟、2 小时、6 小时、24 小时。拼错一个模型名，不会把这个模型锁上半天。
+- **跨渠道容灾**：`buddy`（国内版）全部不可用时，自动转到 `workbuddy`（国际版）。
+- **IP 级 WAF 护栏**：60 秒内有 2 个不同账号接连收到裸 403，就判断为出口 IP 被拦截，暂停轮转。可在面板或 `POST /admin/waf/clear` 手动解除。
+- **零输出熔断**：上游收下请求却输出 0 个字，并返回 `finish_reason=length`（通常是虚报了上下文窗口）时，把这个账号和模型冷却 10 分钟，再换号重发。
+- **只在开始输出前换号**：流式输出一旦开始就不再换号，否则会把两个模型的半截回答拼在一起。
+- **不用空回复掩盖失败**：上游没有正文、没有思考内容、也没有可识别的错误时，返回 502 `upstream_error` 并附上游原文片段（只调用工具的响应除外）。
 
-只认客户端**显式**声明的会话标识，**绝不从内容推断**：
+<details>
+<summary>错误处置矩阵</summary>
 
-1. `user` 字段（排除 `default` / `chatbox` / `nextchat` 等通用占位值）；
-2. `conversation_id` / `conversationId`。
+| 类别（上游错误码） | 换号 | 罚号 | 说明 |
+|---|---|---|---|
+| `rate_limited`（6004 / 14003 / 429） | ✅ | ✅ | 模型级冷却 |
+| `model_unavailable`（11102，后端没有这个模型） | ✅ | ✅ | 模型级，验证式冷却 |
+| `model_denied`（11158，账号档位不支持） | ✅ | ✅ | 模型级 |
+| `credit_exhausted`（402 / 14018） | ✅ | ✅ | 冷却到次日 04:00 |
+| `waf_blocked`（没有错误信封的 403） | ✅ | ✅ | 账号级，同时参与 IP 级判定 |
+| `server`（5xx） | ✅ | ✅ | 熔断 |
+| `session_dead`（12153） | ✅ | ✅ | 连续 3 次才禁用 |
+| `auth_error`（401） | ✅ | ❌ | 续期凭据即可 |
+| `channel_blocked`（11128） | ❌ | ✅ | 软冷却；换号也会撞上同一堵墙 |
+| `request_illegal`（11140） | ❌ | ✅ | 换号只会重放同样的非法请求 |
+| `context_exceeded` / `image_invalid` | ❌ | ❌ | 请求本身的问题 |
+| `network` / `not_found` / `unknown` | ❌ | ❌ | 偶发抖动，不能说明号坏了 |
 
-命中后绑定 30 分钟（滚动续期），且**只在首轮生效** —— 换号后还粘回去会死循环。
-绑定账号失败时异步解绑，防止下次死锁在坏号上。
+`channel_blocked` 和 `waf_blocked` 刻意分开：前者是带业务码的拦截，与出口 IP 无关；后者是裸 403，可能是 IP 级。混为一类会把每个账号的 11128 都算成 IP 级命中，很快误判为全局封锁。
 
-⚠️ 两者都没有 ⇒ **不做粘性**，回落到常规轮转。
-「不粘」只是少了缓存命中；而「错误地粘」会把独立请求全压到一个号上、
-被上游踢掉流（表现为长回答中途停止）。两害相权取前者。
+</details>
 
-### 指定账号
+### 会话粘性与指定账号
 
-想固定用某个号（排查问题、专门烧某个号的额度、保证同一个号的上下文缓存）时用。两种入口：
+**会话粘性**只认客户端显式给出的标识：`user` 字段（`default`、`chatbox`、`nextchat` 这类通用占位值除外），或 `conversation_id` / `conversationId`。命中后绑定 30 分钟（滚动续期），只在首次选号时生效；绑定的号失败后会自动解绑。两者都没有就不粘：不粘只是少了缓存命中，粘错却会把独立请求全压到一个号上。
+
+**指定账号**适合排查问题、专门消耗某个号的额度，或固定上下文缓存：
 
 | 入口 | 作用范围 | 模式 |
 |---|---|---|
-| 面板：供应商详情顶部的「指定账号」，或账号菜单 | 该供应商的**所有**请求 | 「只用它」或「优先用它」，可随时切换/取消 |
-| 请求头 `X-FLR-Account: <uid>` | 只这一次请求 | 恒为「只用它」，优先于面板指定 |
+| 面板：供应商详情顶部，或账号菜单 | 这家供应商的所有请求 | 「只用它」或「优先用它」 |
+| 请求头 `X-FLR-Account: <uid>` | 仅这一次请求 | 固定为「只用它」，优先于面板设置 |
 
-- **只用它**：它不可用时**不换号**，直接回 503 并说明原因（已停用 / 冷却中约几分钟 / 该模型限流 / 被永久积分锁挡住 / 已被删除），
-  同时也**不做跨渠道容灾**。它请求失败时回它的真实错误，不会悄悄换到别的号。
-- **优先用它**：它可用就用它（优先级高于会话粘性），不可用时自然回落到常规选号。
-- 指定**不绕过**健康检查：冷却中的号不会被强行使用。每个供应商最多指定一个号；删除账号时连带清掉指向它的指定。
+- **只用它**：它不可用时返回 503 并说明原因（已停用、冷却中、模型限流、被永久积分锁挡住、已删除），不换号，也不做跨渠道容灾。
+- **优先用它**：它可用就用它（优先于会话粘性），不可用时按常规选号。
+- 指定账号不会绕过健康检查。每家供应商最多指定一个号，删除账号时会一并清除。
 
-管理接口：`GET /admin/pins` 列出全部指定；`POST /admin/pins` 带 `{ "realm": "cn", "uid": "…", "mode": "only" | "prefer" }` 设置，
-带 `{ "realm": "cn", "provider": "buddy", "uid": "" }` 取消。
+### 积分相关
 
-### 防惊群
+- **永久积分锁**（面板「配置」，按供应商开关）：开启后，只剩永久积分的账号不再参与选号，避免免费额度用完后悄悄消耗你花钱买的、无法撤回的永久积分。还有临期额度的账号照常使用。
 
-同一账号 3 秒内被选过就优先排除，避免并发请求扎堆。
-依据是上游对**同号并发流**不友好：后来者会把先前的流踢掉。
-排除后若一个不剩，回落到全部候选（**绝不因此报无可用账号**）。
+  > [!CAUTION]
+  > 判据是 `credits > 0 && creditsExpiring === 0`，而 `creditsExpiring` 只统计 **7 天内**到期的额度。如果你的赠送额度大多在 7 天以后才到期，这些账号也会被锁住，这种情况下建议先别开。
 
-### 错误处置矩阵
+- **限时补偿积分**（任务中心）：上游偶尔发放有时效的补偿积分。面板提供「查询」和「领取」两个按钮；领取是一次性操作，所以刻意不接入定时任务，必须手动触发。
+- **余额刷新**：每小时自动刷新一次，也可以在账号菜单里手动刷新。查询失败时保留原值，不会写成 0；刷新只更新额度字段，不会顺手解除冷却或熔断。
 
-| 类别 | 换号 | 罚号 | 维度 |
-|---|---|---|---|
-| `rate_limited`（6004 / 14003 / 429） | ✅ | ✅ | 模型级（`refineModelScoped` 判） |
-| `model_unavailable`（11102 后端无此模型） | ✅ | ✅ | 模型级 |
-| `model_denied`（11158 档位不支持） | ✅ | ✅ | 模型级 |
-| `credit_exhausted`（402 / 14018） | ✅ | ✅ | 硬冷却至次日 04:00 |
-| `waf_blocked`（403 无信封） | ✅ | ✅ | 账号级 + IP 级判定 |
-| `server`（5xx） | ✅ | ✅ | 熔断 |
-| `session_dead`（12153） | ✅ | ✅ | **连续 3 次**才禁用 |
-| `auth_error`（401） | ✅ | ❌ | 续期凭据即可，不罚号 |
-| `channel_blocked`（11128 / 11‑128） | ❌ | ✅ | 软冷却 —— 换号撞的是同一堵墙 |
-| `request_illegal`（11140） | ❌ | ✅ | 换号会重放同样的非法请求 |
-| `context_exceeded` / `image_invalid` | ❌ | ❌ | 请求本身的问题 |
-| `network` / `not_found` / `unknown` | ❌ | ❌ | 抖动量，不构成「号坏了」的证据 |
+## API 一览
 
-⚠️ **`channel_blocked` 与 `waf_blocked` 刻意分开**：前者是业务码响应（与出口 IP 无关），
-后者是裸 403（可能是 IP 级）。混为一类会让每个账号的 11128 都被记成「IP 级命中」，
-很快凑够阈值 ⇒ **误报全局封锁并停服**。
+**免鉴权**
 
-### 跨渠道容灾
+| 路径 | 说明 |
+|---|---|
+| `GET /healthz` | 存活探针，返回 `{"ok":true,"service":"free-llm-router"}` |
+| `GET /panel/` | 管理面板静态页面（不含数据；`/login` 会跳转到这里） |
+| `GET /login/codearts/callback`、`GET /login/trae/callback` | 浏览器登录回跳，由一次性 `state` 保护 |
 
-`buddy`（国内）全部不可用时，探测 `workbuddy`（国际）是否真有可用号，有则无缝转过去。
-用 `failoverDepth` 防 `buddy→workbuddy→buddy` 的无限递归。
+**OpenAI 兼容**（主密钥或子密钥）
 
-### 冷却时长从哪来
+| 路径 | 说明 |
+|---|---|
+| `GET /v1/models` | 模型目录（带供应商前缀，含 `aggregate/` 虚拟模型） |
+| `POST /v1/chat/completions` | 对话，支持流式、非流式和工具调用 |
+| `POST /v1/responses` | Responses API |
 
-优先级：
+子密钥只能访问 `/v1/*`，不能登录面板，也不能改账号或给自己提额。
 
-1. **上游文案里的绝对墙钟** —— 最精确。中英文都认：
-   - 英文 `your usage will reset at 2026-10-05 14:47:23 UTC+8`
-   - 中文 `您的使用量已超出频率限制，将在 2026-10-21 13:16:46 UTC+8 重置`
+**管理**（`/admin/*`，仅主密钥，共 44 个路径）
 
-   实现刻意**不把措辞写死**：只要报文里出现「日期时间 + UTC 偏移」就按墙钟解析。
-   措辞随时会变，而这个结构是稳定的。
-2. **`Retry-After` 标准头**（只有秒级粒度，作兜底）。
-3. **本地退避估算**（最后手段）。
+| 分类 | 路径 |
+|---|---|
+| 账号与凭据 | `accounts`、`accounts/toggle`、`accounts/remove`、`accounts/balance`、`pins`、`import`、`credentials`、`pool` |
+| 供应商与登录 | `providers`、`providers/login/{start,poll}`、`login/{start,poll}`、`providers/login/loomy/{sms,bind}`、`providers/settings` |
+| 模型 | `providers/models`、`providers/models/{toggle,bulk}`、`models/builtin`、`models/probe` |
+| 任务与签到 | `tasks/{scan,run,status,start}`、`tasks/daily-all`、`checkin/all` |
+| 补偿与积分锁 | `compensation`、`compensation/claim`、`permanent-locks` |
+| 用量与日志 | `usage`、`usage/clear`、`logs`、`logs/clear`、`packages` |
+| 子密钥 | `apikeys`、`apikeys/{update,reset,reset-usage,remove}` |
+| 运维 | `config/routing`、`cooldowns/clear`、`waf`、`waf/clear` |
 
-### 余额刷新
+账号池分为 `cn`（国内）和 `global`（国际，WorkBuddy 账号在这里）两个分片，多数管理接口用 `?realm=cn|global` 选择分片。例如指定账号：`POST /admin/pins`，请求体 `{"realm":"cn","uid":"…","mode":"only"}`（或 `"prefer"`）；取消则发 `{"realm":"cn","provider":"buddy","uid":""}`。
 
-`credits` / `creditsExpiring` / `creditsEarliestExpiry` 三个字段由两处维护，**共用同一段逻辑**：
+## 本地开发
 
-| 触发 | 时机 | 说明 |
-|---|---|---|
-| cron | 每小时整点 | 与凭据续期并列，在「无任务时点」也会跑 |
-| `POST /admin/accounts/balance` | 手动 | 面板想看**此刻**数字时用；只读上游，不改任何账号状态 |
+```text
+src/
+├── index.ts       Workers 入口与 HTTP 路由
+├── gateway/       OpenAI 兼容层：鉴权、流式、Responses、聚合、零输出检测
+├── pool/          账号池 Durable Object：选号、冷却、熔断、用量
+├── providers/     各供应商适配（实现 Provider 接口）
+├── taskrunner/    任务引擎 Durable Object：签到、每日任务状态机
+├── upstream/      上游客户端：登录、签到、补偿、事件解析
+├── store/         凭据加密、子密钥、用量、SQLite 封装
+├── server/        Node 运行时：HTTP 服务、DO 与 SQLite 桥接
+└── panel/         面板路由；panel/web/ 是构建产物，不要手改
+web/               管理面板源码（React + Vite）
+tests/             单元测试
+probe/             出口 IP 探针（独立 Worker）
+```
 
-三条纪律：
+| 命令 | 作用 |
+|---|---|
+| `npm test` | 运行单元测试 |
+| `npm run typecheck` | TypeScript 类型检查 |
+| `npm run dev` | 本地运行 Workers 版（`wrangler dev`，密钥写在 `.dev.vars`） |
+| `npm run build:node` | 打包 Node 单文件 `dist/server.mjs` |
+| `npm run build:web` | 构建面板并嵌入 `src/panel/web/` |
+| `npm run build:check` | Workers 打包预检，不上传 |
+| `npm run deploy` / `npm run tail` | 部署到 Workers / 查看线上实时日志 |
 
-- **查不到 ≠ 没钱了**：失败时**保持原值**，绝不写 0。把「查不到」写成「0 积分」会让
-  永久积分锁误锁账号。
-- **只写额度三元组**：绝不动冷却 / 熔断 / 降权 —— 否则每次刷新都等于偷偷解冻所有账号。
-- **`buddy` 必须用绑定版 provider**：它的 `balance()` 闭包依赖 `env`，
-  拿 `findProvider()` 的未绑定模板会抛 `UPSTREAM_CHAT_BASE` 未定义（实测踩到过）。
+**两种形态共用同一套路由和业务代码。** Node 版只是一层 HTTP 与 Durable Object 的桥接：用 `node:sqlite` 实现 DO 存储，用进程内定时器代替 DO alarm，并把对账号池的调用串行执行，复现 Workers 的 input gate 语义（否则并发请求会互相覆盖记账）。
 
----
+**面板开发**：面板构建产物随源码提交，部署时不需要装前端依赖；改了 `web/` 才需要运行 `npm run build:web`。开发时先把网关跑在 11451 端口，再执行 `cd web && npm install && npm run dev`。Vite 会把 `/admin` 和 `/v1` 转发到网关；网关在别的地址时用 `PANEL_API=http://127.0.0.1:<端口>` 指定。
 
-## 使用边界
-
-本项目**仅限本人授权账号自用**，明确反对：
-
-- 批量注册小号 / 收购账号；
-- 账号池出租、对外提供付费 API、二次加壳售卖。
-
-技术方案不阻止这些用法，但**本项目的开发意图不包含它们**。
-批量注册与转售接口配额违反目标平台服务条款。
-
----
+**新增供应商**：在 `src/providers/` 实现 `Provider` 接口并注册即可。网关本身不感知具体是哪家供应商。
 
 ## 已知限制
 
-已修掉的不再列在这里；下面全部是**当前仍然存在**的。
-
 | 项 | 影响 |
 |---|---|
-| **6 家不能从本服务发起登录** | codearts / lobsterai / trae / gemini / meoo 的回调被上游限制在本机端口，opencode 上游无登录流程 ⇒ 只能导入凭据 |
-| **流内换号未实现** | 只在「还没开始输出」时换号。一旦开始流式输出就固定，否则会把两个模型的半截回答拼成乱码 |
-| **zcode 签到大概率失败** | 上游强制阿里云验证码，需 headful 浏览器；本服务如实报错，不谎报已领。推理不受影响 |
-| **zcode 签到受上游风控** | 间歇性返回风控错误（账号/IP 级），非本服务缺陷 |
-| **5 家没有每日签到** | workbuddy（上游无此接口）、cline（端点扫描无命中）、raccoon（服务端按日自动发放）、gemini（额度是配额比例不是可领积分）、opencode（无积分体系） |
-| **3 家不能自动续期** | zcode（凭据静态）、loomy（无续期端点）、opencode（匿名通道无凭据）—— 不给它们写假续期，否则 UI 会显示「可自动续期」 |
-| **opencode 无余额端点** | 且 `fetch` 不支持 per-request 代理 ⇒ 多个匿名槽共享同一出口 IP，免费额度**无法靠多开扩容** |
-| **聚合路由不做缓存** | 每次请求现拉目录与到期时刻，刻意优先正确性（缓存新旧不一致会让「临期优先」选错） |
-| **聚合排序依赖各家 `balance()`** | 查不到余额的家（如 opencode）不参与排序 |
-| **`expiring` 只在「7 天内到期」时才非零** | `creditsExpiring` 的窗口是 7 天（对齐 Go 侧 `expiring_soon`）。所以「有额度但 7 天内不过期」时它恒为 0 —— 这不是 bug，但会让**永久积分锁**把这类账号误判成「只剩永久额度」。见下方说明 |
-| **IP 级 WAF 护栏是启发式推测** | 60 秒内 2 个不同账号接连 403 即暂停轮转；可能误判，故留了 `POST /admin/waf/clear` 人工纠正 |
-| **子密钥限额可被小幅超出** | 限额是「请求前检查、完成后累加」：同时发出的多个请求会在累加前一起通过检查，超出量约等于并发数。token 限额本就要等响应结束才知道用量，单个请求也可能越线 |
-| **用量明细只留 500 条** | 更早的日键保留 90 天；明细淘汰后无法回答「某一笔长什么样」，但「用了多少」不受影响 |
-| **费用估算模块目前无生产消费者** | `src/gateway/cost-estimate.ts` 只有单测覆盖，尚未接进面板与用量统计。且它输出的是**无量纲相对值**，不是钱 —— 各家倍率不同基准，跨供应商相加没有意义 |
+| 6 家不能在面板登录 | codearts、lobsterai、trae、gemini、meoo、opencode 只能导入凭据，原因见[支持的供应商](#支持的供应商) |
+| 流式输出开始后不换号 | 只在输出开始前换号；输出中途上游出错，不会自动换号续写 |
+| zcode 签到大概率失败 | 上游强制阿里云验证码，还会间歇触发风控；对话不受影响 |
+| 5 家没有每日签到 | workbuddy（上游无此接口）、cline（没找到接口）、raccoon（服务端每日自动发放）、gemini（额度按配额比例，不是可领积分）、opencode（没有积分体系） |
+| 3 家不能自动续期 | zcode（凭据是静态的）、loomy（没有续期接口）、opencode（匿名通道没有凭据） |
+| opencode 没有余额接口 | 多个匿名槽共用同一个出口 IP，免费额度不能靠多开来扩容；也不参与聚合排序 |
+| 聚合路由不缓存 | 每次请求都实时拉目录和到期时间，换取「临期优先」的准确性 |
+| `creditsExpiring` 只统计 7 天内到期 | 会让永久积分锁误锁「额度都在 7 天以后才到期」的账号 |
+| IP 级 WAF 护栏是启发式判断 | 可能误判，可在面板或 `POST /admin/waf/clear` 手动解除 |
+| 子密钥限额可能小幅超出 | 先检查后累加：并发请求会一起通过检查；token 用量要等响应结束才知道 |
+| 用量明细只留最近 500 条 | 按天汇总的数据保留 90 天，总用量统计不受影响 |
 
-### 关于「空回复」
+## 使用边界
 
-本服务**绝不用空回复掩盖失败**：上游若返回没有正文、没有思考内容、也没有可识别错误帧的响应，
-会明确报 502 `upstream_error` 并附上游原文片段。
-（唯一例外是**只调用工具**的响应 —— 那时正文本来就是空的。）
+本项目**仅供个人使用自己合法拥有、经授权的账号**，明确反对：
 
-同理，「查不到」与「没有」严格区分：查不到补偿活动就显示「查不到」，不会编成「没有」。
+- 批量注册小号、收购账号；
+- 出租账号池、对外提供付费 API、二次封装转售。
 
----
+技术上无法阻止这些用法，但它们不在本项目的设计意图之内，并且违反目标平台的服务条款。
 
 ## License
 

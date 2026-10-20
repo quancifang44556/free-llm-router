@@ -282,7 +282,7 @@ export function startServer(options: ServerOptions = {}) {
   ▸ 控制面板: http://${host}:${port}/panel/
   ▸ 运行平台: Node.js ${process.version} (${process.arch} - ${process.platform})
   ▸ 数据库  : ${process.env.DATABASE_PATH || './data/router.db'}
-  ▸ 鉴权密钥: ${env.API_KEY ? '已配置 (Bearer ****)' : '未设置 (任何人可访问)'}
+  ▸ 鉴权密钥: ${env.API_KEY ? '已配置 (Bearer ****)' : '未设置 (所有请求都会返回 401)'}
   ▸ 自动任务: ${autoCron ? '已启用 (每小时巡检与自动签到)' : '已禁用'}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 `)
