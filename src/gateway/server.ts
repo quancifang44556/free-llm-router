@@ -49,7 +49,7 @@ import {
 } from './aggregate.js'
 import { splitModelName, type ProviderCredential } from '../providers/types.js'
 import type { LoginCredential } from '../upstream/auth.js'
-import type { AccountPoolDO } from '../pool/AccountPoolDO.js'
+import type { AccountPoolDO, PickResult } from '../pool/AccountPoolDO.js'
 import { healthyForModel } from '../pool/state.js'
 
 /**
@@ -478,6 +478,46 @@ async function sha256Hex(text: string): Promise<string> {
   return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('')
 }
 
+/**
+ * 请求级指定账号：请求头 `X-FLR-Account: <uid>`（语义恒为「只用它」）。
+ *
+ * 空串 = 未指定（走面板里的指定或自动选号）。
+ */
+export function requestedAccount(request: Request): string {
+  return (request.headers.get('x-flr-account') ?? '').trim()
+}
+
+/**
+ * 「只用指定账号」但它不可用时给用户看的说明。
+ *
+ * ⚠️ 必须说清三件事：指定了**谁**、它**为什么**不可用、**怎么解除** ——
+ * 否则用户只会看到「请求失败」，想不起来自己设过指定。
+ */
+export function describePinBlocked(
+  picked: Pick<PickResult, 'pinnedUid' | 'pinnedLabel' | 'pinnedReason'>,
+  fromHeader: boolean,
+  /** 指定账号在本次请求里的真实失败原因（若它已经试过）。 */
+  lastFailure?: string,
+): string {
+  const uid = picked.pinnedUid ?? ''
+  const nick = picked.pinnedLabel ?? ''
+  const label = nick !== '' && nick !== uid ? `${nick}（${uid}）` : uid
+  const head = fromHeader ? `请求头 X-FLR-Account 指定了账号「${label}」` : `已指定只用账号「${label}」`
+  const why = lastFailure !== undefined && lastFailure !== ''
+    ? `它这次请求失败了：${lastFailure}`
+    : `但它当前不可用：${picked.pinnedReason ?? '原因未知'}`
+  const fix = fromHeader
+    ? '去掉该请求头即可恢复自动选号'
+    : '可在面板「供应商与账号」里取消指定，或改为「优先用它」（不可用时自动换号）'
+  return `${head}，${why}。${fix}。`
+}
+
+/** 选号被「只用指定账号」挡住（网关据此直接报错，不换号、不跨渠道容灾）。 */
+interface PinBlocked {
+  pinBlocked: true
+  picked: PickResult
+}
+
 async function pickCandidate(
   pool: DurableObjectStub<AccountPoolDO>,
   realm: string,
@@ -487,11 +527,17 @@ async function pickCandidate(
   provider: string,
   /** 会话粘性的优先账号（仅首轮传；见 `deriveSessionKey` 的说明）。 */
   preferred?: string,
-): Promise<Candidate | undefined> {
+  /** 请求级指定账号（`X-FLR-Account`）。 */
+  pinned?: string,
+): Promise<Candidate | PinBlocked | undefined> {
   const result = await pool.pick({
     realm, provider, model, exclude, now,
     ...(preferred !== undefined && preferred !== '' ? { preferred } : {}),
+    ...(pinned !== undefined && pinned !== '' ? { pinned } : {}),
   })
+  if (result !== undefined && result.pinnedUnavailable === true) {
+    return { pinBlocked: true, picked: result }
+  }
   // ── 永久积分锁：把「锁了」翻译成**用户可见的明确错误** ──
   //
   // ⚠️ 这条分支是 §7.2「失败必须显式」的落地：若静默返回 undefined，
@@ -706,6 +752,7 @@ export async function handleChatCompletions(
   // 非人类特征。
   const turnRequestId = newTurnRequestId()
   let conversationId = sessionKey === '' ? crypto.randomUUID() : ''
+  const pinnedHeader = requestedAccount(request)
 
   for (let attempt = 0; attempt <= MAX_ROTATE; attempt += 1) {
     const now = Date.now()
@@ -717,7 +764,18 @@ export async function handleChatCompletions(
     const candidate = await pickCandidate(
       pool, realm, model, tried, now, DEFAULT_PROVIDER,
       buddyPreferred === undefined ? '' : buddyPreferred,
+      pinnedHeader,
     )
+    // ── 只用指定账号但它不可用：直接报它的原因（不换号、不跨渠道容灾）──
+    if (candidate !== undefined && 'pinBlocked' in candidate) {
+      return {
+        response: jsonError(
+          lastError?.status ?? 503,
+          describePinBlocked(candidate.picked, pinnedHeader !== '', lastError?.message),
+          lastError?.kind ?? 'pinned_account_unavailable',
+        ),
+      }
+    }
     if (candidate === undefined) {
       // ⚠️ 国内版（buddy）所有可用账号已尝试或全部处于限流/冷却中。
       // 跨渠道智能容灾：如果用户配置了国际版（workbuddy）账号且**真的可选**，
@@ -1527,6 +1585,17 @@ export async function handleProviderChat(input: {
     }
   }
 
+  // 请求头指定的账号若在另一个分片，跟着它走（否则只会报「指定账号不存在」）
+  const headerPin = requestedAccount(request)
+  if (headerPin !== '' && providerId !== 'workbuddy') {
+    const here = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(activeRealm))
+    if ((await here.getAccount(headerPin)) === undefined) {
+      const other = activeRealm === 'cn' ? 'global' : 'cn'
+      const there = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(other))
+      if ((await there.getAccount(headerPin)) !== undefined) activeRealm = other
+    }
+  }
+
   const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(activeRealm))
   // ⚠️ 与 WorkBuddy 路径同理：请求体里的 `model` 必须换成**去前缀**的裸名。
   // 各 provider 的 `chat()` 会把它直接放进上游请求，带前缀会被上游判为
@@ -1543,6 +1612,9 @@ export async function handleProviderChat(input: {
   // 放在循环内会让每次重试都变成「另一轮」。
   const providerTurnRequestId = newTurnRequestId()
   let providerConversationId = sessionKey === '' ? crypto.randomUUID() : ''
+  const pinnedHeader = requestedAccount(request)
+  /** 是否被「只用指定账号」挡住（挡住时不做跨渠道容灾 —— 用户要的就是这个号）。 */
+  let pinBlocked = false
 
   for (let attempt = 0; attempt <= MAX_ROTATE; attempt += 1) {
     const now = Date.now()
@@ -1553,7 +1625,21 @@ export async function handleProviderChat(input: {
     // `preferred` 只是「排到最前」，不可用时自然回落 —— 不会因为它挂了就报「无可用账号」。
     // ⚠️ 只在**首轮**（`tried` 为空）用粘性：已经在换号了还粘回去会死循环。
     const preferred = tried.length === 0 ? (sessionKey === '' ? '' : await pool.getSession(sessionKey, now)) : ''
-    const picked = await pool.pick({ realm: activeRealm, provider: providerId, model, exclude: tried, now, ...(preferred !== undefined && preferred !== '' ? { preferred } : {}) })
+    const picked = await pool.pick({
+      realm: activeRealm, provider: providerId, model, exclude: tried, now,
+      ...(preferred !== undefined && preferred !== '' ? { preferred } : {}),
+      ...(pinnedHeader !== '' ? { pinned: pinnedHeader } : {}),
+    })
+    // ── 只用指定账号但它不可用：显式报原因，**不换号、不跨渠道容灾** ──
+    if (picked !== undefined && picked.pinnedUnavailable === true) {
+      pinBlocked = true
+      lastError = {
+        status: lastError?.status ?? 503,
+        message: describePinBlocked(picked, pinnedHeader !== '', lastError?.message),
+        kind: lastError?.kind ?? 'pinned_account_unavailable',
+      }
+      break
+    }
     // ── 永久积分锁：同第一消费点，锁定必须显式报错（不许静默 break）──
     if (picked !== undefined && (picked as { lockedByPermanent?: true }).lockedByPermanent === true) {
       const skipped = (picked as { lockedSkipped?: number }).lockedSkipped ?? 0
@@ -2124,7 +2210,7 @@ export async function handleProviderChat(input: {
   //    必须用 `rawBody` 重建一个**全新** Request。
   // ⚠️ 重建时把 `model` 换成**裸名**（去掉 `workbuddy/` 前缀）：否则
   //    `splitModelName` 会再次路由回 workbuddy，形成自我循环。
-  if (providerId === 'workbuddy' && failoverDepth === 0 && model !== '') {
+  if (providerId === 'workbuddy' && failoverDepth === 0 && model !== '' && !pinBlocked) {
     try {
       const cnPool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn'))
       const now = Date.now()

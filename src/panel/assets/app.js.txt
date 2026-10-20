@@ -2257,6 +2257,13 @@ async function loadModalAccounts() {
     p.textContent = '该供应商下还没有账号。切到「添加账号」页导入或登录。'
     box.appendChild(p); return
   }
+  // 指定账号表（realm|provider → { uid, mode }）；拉不到时当作「都没指定」，不挡列表
+  const pinRes = await api('/admin/pins')
+  const pinMap = new Map()
+  if (pinRes.ok && pinRes.body && Array.isArray(pinRes.body.pins)) {
+    for (const p of pinRes.body.pins) pinMap.set(p.realm + '|' + p.provider, p)
+  }
+  if (loadSeq !== modalAccountsSeq) return
   for (const a of mine) {
     const card = document.createElement('div'); card.className = 'card'
     const left = document.createElement('div'); left.className = 'grow'
@@ -2270,6 +2277,40 @@ async function loadModalAccounts() {
     else if (cooling) { tag.className = 'tag warn'; tag.textContent = '冷却中' }
     else { tag.className = 'tag ok'; tag.textContent = '正常' }
     card.appendChild(tag)
+
+    // ── 指定账号 ──
+    // 「只用它」：该供应商的请求只走这个号，它不可用就报错（不换号）；
+    // 「优先用它」：可用就用它，不可用时自动换号。
+    const realmOf = a.realm || 'cn'
+    const providerOf = a.provider || 'buddy'
+    const pin = pinMap.get(realmOf + '|' + providerOf)
+    const pinMode = pin && pin.uid === a.uid ? pin.mode : ''
+    if (pinMode !== '') {
+      // 放在昵称旁边（而不是右侧操作区），免得操作按钮被挤到第二行
+      const pt = document.createElement('span'); pt.className = 'tag info pin-tag'
+      pt.textContent = pinMode === 'only' ? '已指定·只用它' : '已指定·优先'
+      nm.appendChild(pt)
+    }
+    const pinSel = document.createElement('select'); pinSel.className = 'pin-select'
+    for (const [v, label] of [['', '自动选号'], ['only', '只用它'], ['prefer', '优先用它']]) {
+      const o = document.createElement('option'); o.value = v; o.textContent = label
+      pinSel.appendChild(o)
+    }
+    pinSel.value = pinMode
+    pinSel.title = '指定该供应商使用这个账号。只用它：它不可用时直接报错，不换号；优先用它：不可用时自动换号。'
+    pinSel.onchange = async () => {
+      const v = pinSel.value
+      const body = v === ''
+        ? { realm: realmOf, provider: providerOf, uid: '' }
+        : { realm: realmOf, uid: a.uid, mode: v }
+      const r = await api('/admin/pins', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      })
+      if (!r.ok) alert('指定失败：' + JSON.stringify(r.body))
+      loadModalAccounts()
+    }
+    card.appendChild(pinSel)
 
     const m = document.createElement('span'); m.className = 'metrics'
     m.textContent = '成功 ' + a.successCount + ' · 错误 ' + a.errTotal
@@ -2311,7 +2352,8 @@ async function loadModalAccounts() {
       if (!confirm('删除账号 ' + a.uid + '（含凭据）？不可恢复。')) return
       const r = await api('/admin/accounts/remove', {
         method: 'POST', headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ uid: a.uid, realm: 'cn', confirm: true }),
+        // ⚠️ 用账号自己的分片：写死 cn 会让国际版（global）账号「删除成功」却还在
+        body: JSON.stringify({ uid: a.uid, realm: a.realm || 'cn', confirm: true }),
       })
       if (!r.ok) alert('删除失败：' + JSON.stringify(r.body))
       invalidatePackagesCache()

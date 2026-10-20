@@ -2435,7 +2435,63 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
     if (typeof body.locked !== 'boolean') return jsonError(400, 'locked 必须是 boolean', 'invalid_request_error')
     const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn'))
     const locks = await pool.setPermanentLock(provider, body.locked)
+    // ⚠️ **必须镜像到 global 分片**（真实缺陷）：`pick()` 读的是**账号所在分片**
+    // 自己的存储，而 WorkBuddy 国际版的账号在 global —— 只写 cn 时国际版的锁
+    // 永远不生效，照样烧永久积分。cn 仍是权威（GET 读它），这里整表覆盖同步，
+    // 顺带修复旧版本只写了 cn 的历史数据（任意切换一次锁即同步）。
+    const globalPool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('global'))
+    await globalPool.replacePermanentLocks(locks)
     return json({ ok: true, provider, locked: body.locked, locks })
+  }
+
+  // ── 指定账号（per-provider，存在账号所在分片） ──
+  //
+  // GET  /admin/pins                         → { pins: [{ realm, provider, uid, mode, nickname }] }
+  // POST /admin/pins { realm, uid, mode }     → 把该账号设为其供应商的指定账号
+  // POST /admin/pins { realm, provider, uid: '' } → 取消该供应商的指定
+  if (path === '/admin/pins' && request.method === 'GET') {
+    const requested = url.searchParams.get('realm') ?? ''
+    const realms = requested === '' ? ['cn', 'global'] : [requested]
+    const out: Array<{ realm: string; provider: string; uid: string; mode: string; nickname: string }> = []
+    for (const realm of realms) {
+      const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
+      const pins = await pool.getPins()
+      for (const [provider, pin] of Object.entries(pins)) {
+        const account = await pool.getAccount(pin.uid)
+        out.push({ realm, provider, uid: pin.uid, mode: pin.mode, nickname: account?.nickname ?? '' })
+      }
+    }
+    return json({ pins: out })
+  }
+
+  if (path === '/admin/pins' && request.method === 'POST') {
+    const body = (await request.json().catch(() => ({}))) as {
+      realm?: unknown; provider?: unknown; uid?: unknown; mode?: unknown
+    }
+    const realm = typeof body.realm === 'string' && body.realm !== '' ? body.realm : 'cn'
+    if (realm !== 'cn' && realm !== 'global') return jsonError(400, 'realm 只能是 cn 或 global', 'invalid_request_error')
+    const uid = typeof body.uid === 'string' ? body.uid.trim() : ''
+    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
+    if (uid === '') {
+      const provider = typeof body.provider === 'string' ? body.provider : ''
+      if (provider === '') return jsonError(400, '取消指定需要 provider', 'invalid_request_error')
+      const pins = await pool.clearPin(provider)
+      return json({ ok: true, realm, provider, pinned: null, pins })
+    }
+    const mode = body.mode === undefined ? 'only' : body.mode
+    if (mode !== 'only' && mode !== 'prefer') {
+      return jsonError(400, 'mode 只能是 only（只用它）或 prefer（优先用它）', 'invalid_request_error')
+    }
+    // 调用方带了 provider 时由 DO 校验一致（不一致**不写入**），
+    // 防止「以为指定给 A 家、其实落到 B 家」
+    const expected = typeof body.provider === 'string' ? body.provider : undefined
+    const result = await pool.setPin(uid, mode, expected)
+    if (!result.ok) {
+      return result.code === 'not_found'
+        ? jsonError(404, `${result.error}（realm=${realm}）`, 'not_found')
+        : jsonError(400, result.error, 'invalid_request_error')
+    }
+    return json({ ok: true, realm, provider: result.provider, pinned: { uid, mode }, pins: result.pins })
   }
 
   // ── 限时补偿积分（wb 面板上那个「立即领取」按钮） ──

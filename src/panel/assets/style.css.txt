@@ -1268,3 +1268,7 @@ html[data-theme='light'] .toast { background: #1d2030; color: #f3f4f8; border-co
     scroll-behavior: auto !important;
   }
 }
+
+/* 账号卡里的「指定账号」下拉：与 ghost 按钮同高，不抢视觉 */
+.card .pin-select { width: auto; min-width: 7.5em; padding-top: 4px; padding-bottom: 4px; font-size: 12px; }
+.card .pin-tag { margin-left: 8px; vertical-align: 1px; font-weight: 500; }

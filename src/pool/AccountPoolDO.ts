@@ -119,6 +119,17 @@ const API_KEY_USAGE_KEY = 'apiKeyUsage'
 const PERMANENT_LOCKS_KEY = 'permanentLocks'
 
 /**
+ * **指定账号**（per-provider）的存储键，形如 `{ buddy: { uid, mode } }`。
+ *
+ * ⚠️ 与 {@link PERMANENT_LOCKS_KEY} 同一纪律：独立 key，不放进账号主状态，
+ * 免得任何一次「读改写」把它静默抹掉。
+ *
+ * 只存在**账号所在分片**的 DO 里 —— `pick()` 读的是自身存储，
+ * 存到别的分片等于没设（永久积分锁曾因此在 global 分片失效）。
+ */
+const ACCOUNT_PINS_KEY = 'accountPins'
+
+/**
  * 规范化一条用量记录（读库时用）。
  *
  * ⚠️ 字段缺失不能抛错、也不能算出 `NaN`：`NaN` 会让面板显示 `NaN`
@@ -232,6 +243,12 @@ export interface PickRequest {
    * 粘性不该让一个正在冷却的账号被强行使用。
    */
   preferred?: string
+  /**
+   * **请求级**指定账号（来自请求头 `X-FLR-Account`），语义恒为「只用它」。
+   *
+   * 优先级高于面板里给该供应商设的指定账号。
+   */
+  pinned?: string
   /** 已尝试过的 uid，必须排除（跨重试保留，否则会在账号间无限来回）。 */
   exclude: string[]
   now: number
@@ -251,6 +268,81 @@ export interface PickResult {
   lockedByPermanent?: true
   /** 因锁被滤掉的候选数（仅供错误信息展示）。 */
   lockedSkipped?: number
+  /** 「只用指定账号」但它不可用（见 {@link PinnedUnavailable}）。 */
+  pinnedUnavailable?: true
+  pinnedUid?: string
+  pinnedLabel?: string
+  pinnedReason?: string
+}
+
+/**
+ * 指定账号的模式。
+ *
+ * - `only`：**只用它**。它不可用时直接报错（说明原因），不换别的号 ——
+ *   用户明确要求「就用这个号」，静默换号会让人误以为指定生效了。
+ * - `prefer`：**优先用它**。它不可用时自然回落到其余候选（同会话粘性）。
+ */
+export type PinMode = 'only' | 'prefer'
+
+/** 某供应商的指定账号。 */
+export interface AccountPin {
+  uid: string
+  mode: PinMode
+}
+
+/**
+ * 「只用指定账号」但它此刻不可用时 `pick()` 的返回（uid 为空、state 缺省）。
+ *
+ * ⚠️ 网关必须把它翻译成**用户可见的明确错误**（带 {@link reason}），
+ * 不能回落换号，也不能报含糊的「无可用账号」。
+ */
+export interface PinnedUnavailable {
+  pinnedUnavailable: true
+  pinnedUid: string
+  /** 账号昵称（找不到账号时为空串）。 */
+  pinnedLabel: string
+  /** 人话原因，如「已停用」「冷却中，约 3 分钟后恢复」。 */
+  pinnedReason: string
+}
+
+function isPinMode(v: unknown): v is PinMode {
+  return v === 'only' || v === 'prefer'
+}
+
+/** 剩余时间的人话（≥1 分钟）。 */
+function minutesLeft(until: number, now: number): string {
+  const mins = Math.max(1, Math.round((until - now) / 60_000))
+  return mins >= 120 ? `约 ${Math.round(mins / 60)} 小时` : `约 ${mins} 分钟`
+}
+
+/**
+ * 某账号此刻为什么**不能**被选（可选时返回空串）。
+ *
+ * ⚠️ 判据与 `pick()` 的候选过滤**逐条对应**，只用于给「指定账号不可用」生成说明；
+ * 顺序与 `healthy()` 一致，先报最根本的原因（停用 > 冷却 > 模型限流）。
+ */
+function unavailableReason(
+  state: AccountState,
+  now: number,
+  model: string,
+  opts: { excluded: boolean; permLocked: boolean },
+): string {
+  if (opts.excluded) return '这次请求里它已经失败过'
+  if (state.disabled) return '已停用'
+  const cool = Math.max(
+    isActive(state.until, now) ? state.until : 0,
+    isActive(state.breakerUntil, now) ? state.breakerUntil : 0,
+    isActive(state.degradeUntil, now) ? state.degradeUntil : 0,
+  )
+  if (cool > 0) return `冷却中，${minutesLeft(cool, now)}后恢复`
+  if (model !== '') {
+    const mc = state.modelCooldowns[model]
+    if (mc !== undefined && !mc.auditOnly && isActive(mc.until, now)) {
+      return `模型 ${model} 在它上面限流中，${minutesLeft(mc.until, now)}后恢复`
+    }
+  }
+  if (opts.permLocked) return '只剩永久积分，且已被「永久积分锁」保护'
+  return ''
 }
 
 /** 账号池的对外 RPC 面（Worker 通过 stub 调用）。 */
@@ -358,6 +450,17 @@ export class AccountPoolDO extends DurableObject<Env> {
     this.credentialCache.delete(uid)
     deleteAccount(this.ctx.storage.sql, uid)
     this.ctx.storage.sql.exec('DELETE FROM sessions WHERE uid = ?', uid)
+    // ⚠️ 连带清掉指向它的「指定账号」：否则「只用它」会让该供应商永远报
+    // 「指定的账号不存在」，而用户已经不记得设过指定了。
+    const pins = await this.getPins()
+    let changed = false
+    for (const [provider, pin] of Object.entries(pins)) {
+      if (pin.uid === uid) {
+        delete pins[provider]
+        changed = true
+      }
+    }
+    if (changed) await this.ctx.storage.put(ACCOUNT_PINS_KEY, pins)
   }
 
   /**
@@ -394,16 +497,42 @@ export class AccountPoolDO extends DurableObject<Env> {
     const permLocks = await this.getPermanentLocks()
     let permLockSkipped = 0
 
+    // ── 指定账号 ──
+    //
+    // 请求级（`X-FLR-Account`，恒为「只用它」）优先于面板里给该供应商设的指定。
+    // ⚠️ 面板指定按 provider 存，`wantProvider` 为空（不限供应商）时不适用。
+    const requestPin = (request.pinned ?? '').trim()
+    const configPin = wantProvider === '' ? undefined : (await this.getPins())[wantProvider]
+    const pin: AccountPin | undefined =
+      requestPin !== '' ? { uid: requestPin, mode: 'only' } : configPin
+    /** 指定账号不在候选里的原因（找到该账号才会被赋值）。 */
+    let pinReason: string | undefined
+    let pinLabel = ''
+
     const candidates: AccountState[] = []
     for (const raw of raws) {
       const state = normalizeAccountState(JSON.parse(raw))
       // ⚠️ 解析失败（数据损坏）时跳过该条，而不是让整个列表 500
       if (state === undefined) continue
+      const isPin = pin !== undefined && state.uid === pin.uid
       // 供应商不匹配的直接跳过（不同家的凭据/协议完全不同）
-      if (wantProvider !== '' && (state.provider ?? 'buddy') !== wantProvider) continue
-      if (excludeSet.has(state.uid)) continue
+      if (wantProvider !== '' && (state.provider ?? 'buddy') !== wantProvider) {
+        if (isPin) {
+          pinLabel = state.nickname
+          pinReason = `它属于供应商「${state.provider ?? 'buddy'}」，不是这次请求的「${wantProvider}」`
+        }
+        continue
+      }
+      if (isPin) pinLabel = state.nickname
+      if (excludeSet.has(state.uid)) {
+        if (isPin) pinReason = unavailableReason(state, now, model, { excluded: true, permLocked: false })
+        continue
+      }
       pruneExpired(state, now, MODEL_COST_TTL_MS)
-      if (!healthyForModel(state, now, model)) continue
+      if (!healthyForModel(state, now, model)) {
+        if (isPin) pinReason = unavailableReason(state, now, model, { excluded: false, permLocked: false })
+        continue
+      }
 
       // ── 永久积分锁过滤 ──
       //
@@ -415,10 +544,35 @@ export class AccountPoolDO extends DurableObject<Env> {
       // 不是「只剩永久」—— 混淆会把真正的额度耗尽误报成锁。
       if (permLocks[state.provider ?? 'buddy'] === true && state.credits > 0 && state.creditsExpiring === 0) {
         permLockSkipped += 1
+        if (isPin) pinReason = unavailableReason(state, now, model, { excluded: false, permLocked: true })
         continue
       }
 
       candidates.push(state)
+    }
+
+    // ── 指定账号命中 / 不可用 ──
+    //
+    // ⚠️ 放在「候选为空」判断**之前**：「只用它」时即便别的号全挂了，
+    // 只要它可用就该用它；它不可用时也要报**它**的原因，而不是笼统的「无可用账号」。
+    // 只在候选**内**命中 —— 指定不绕过任何健康检查（冷却中的号不会被强行使用）。
+    if (pin !== undefined) {
+      const hit = candidates.find((s) => s.uid === pin.uid)
+      if (hit !== undefined) {
+        this.notePicked(hit.uid, now)
+        return { uid: hit.uid, state: hit }
+      }
+      if (pin.mode === 'only') {
+        const unavailable: PinnedUnavailable = {
+          pinnedUnavailable: true,
+          pinnedUid: pin.uid,
+          pinnedLabel: pinLabel,
+          pinnedReason: pinReason ?? '账号不存在（可能已被删除，或不在这个分片）',
+        }
+        // ⚠️ 同 lockedByPermanent：独立判别类型，经 PickResult 的可选字段透出
+        return unavailable as unknown as PickResult
+      }
+      // prefer：自然回落到下面的常规选号
     }
 
     if (candidates.length === 0) {
@@ -1514,6 +1668,78 @@ export class AccountPoolDO extends DurableObject<Env> {
     else delete locks[provider]
     await this.ctx.storage.put(PERMANENT_LOCKS_KEY, locks)
     return locks
+  }
+
+  // ─────────────────────── 指定账号 ───────────────────────
+
+  /**
+   * 读本分片的指定账号表（per-provider）。
+   *
+   * @returns 形如 `{ buddy: { uid, mode: 'only' } }`；未配置过返回空对象（缺省 = 不指定）。
+   */
+  async getPins(): Promise<Record<string, AccountPin>> {
+    const raw = await this.ctx.storage.get<unknown>(ACCOUNT_PINS_KEY)
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return {}
+    const out: Record<string, AccountPin> = {}
+    for (const [provider, v] of Object.entries(raw as Record<string, unknown>)) {
+      if (v === null || typeof v !== 'object') continue
+      const o = v as Record<string, unknown>
+      // 损坏条目跳过，而不是让整个表失效
+      if (typeof o.uid !== 'string' || o.uid === '' || !isPinMode(o.mode)) continue
+      out[provider] = { uid: o.uid, mode: o.mode }
+    }
+    return out
+  }
+
+  /**
+   * 把某账号设为**其所属供应商**的指定账号（每个供应商最多一个）。
+   *
+   * ⚠️ 供应商从账号本身取，不信调用方传的 —— 把 A 家的号指定给 B 家
+   * 只会让 B 家永远报「指定账号不属于该供应商」。
+   *
+   * @returns 成功时带更新后的整张表；账号不存在时 `ok: false`。
+   */
+  async setPin(
+    uid: string,
+    mode: PinMode,
+    /** 调用方以为的供应商（可选）；与账号实际所属不一致时拒绝，**不写入**。 */
+    expectedProvider?: string,
+  ): Promise<
+    | { ok: true; provider: string; pins: Record<string, AccountPin> }
+    | { ok: false; error: string; code: 'invalid' | 'not_found' }
+  > {
+    if (!isPinMode(mode)) return { ok: false, error: 'mode 只能是 only 或 prefer', code: 'invalid' }
+    const account = await this.getAccount(uid)
+    if (account === undefined) return { ok: false, error: `账号 ${uid} 不存在`, code: 'not_found' }
+    const provider = account.provider ?? 'buddy'
+    if (expectedProvider !== undefined && expectedProvider !== '' && expectedProvider !== provider) {
+      return { ok: false, error: `账号 ${uid} 属于供应商「${provider}」，不是「${expectedProvider}」`, code: 'invalid' }
+    }
+    const pins = await this.getPins()
+    pins[provider] = { uid, mode }
+    await this.ctx.storage.put(ACCOUNT_PINS_KEY, pins)
+    return { ok: true, provider, pins }
+  }
+
+  /** 取消某供应商的指定账号（未设过也返回成功，幂等）。 */
+  async clearPin(provider: string): Promise<Record<string, AccountPin>> {
+    const pins = await this.getPins()
+    if (pins[provider] !== undefined) {
+      delete pins[provider]
+      await this.ctx.storage.put(ACCOUNT_PINS_KEY, pins)
+    }
+    return pins
+  }
+
+  /**
+   * 整张替换永久积分锁表（跨分片同步用）。
+   *
+   * ⚠️ 只给管理接口做「cn 是权威、其余分片镜像」的同步，不做合并。
+   */
+  async replacePermanentLocks(locks: Record<string, boolean>): Promise<void> {
+    const clean: Record<string, boolean> = {}
+    for (const [k, v] of Object.entries(locks)) if (v === true) clean[k] = true
+    await this.ctx.storage.put(PERMANENT_LOCKS_KEY, clean)
   }
 
   async listApiKeys(): Promise<ApiKeyRecord[]> {

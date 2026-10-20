@@ -875,9 +875,14 @@ export async function handleResponses(
 
   // ⚠️ 复用 Chat 处理器 = 复用**全部**既有能力（选号/轮转/冷却/续期/渠道指纹）。
   // 见本文件头「实现策略」的说明。
+  // ⚠️ 请求级指定账号（`X-FLR-Account`）要跟着转过去，否则 Responses 入口会静默忽略它
+  const pinnedAccount = request.headers.get('x-flr-account')
   const chatRequest = new Request(new URL('/v1/chat/completions', request.url), {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: {
+      'content-type': 'application/json',
+      ...(pinnedAccount !== null && pinnedAccount.trim() !== '' ? { 'x-flr-account': pinnedAccount.trim() } : {}),
+    },
     body: JSON.stringify(chatBody),
   })
   const inner = await handleChatCompletions(chatRequest, env, realm, ctx)

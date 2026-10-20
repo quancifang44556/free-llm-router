@@ -1072,7 +1072,8 @@ test('🔴 同号并发必须摊开（否则上游踢掉先前的流）', () => 
   // ⚠️ 纯加权随机不够：它每次都独立掷骰，完全可能连中同一个账号。
   const src = readFileSync('src/pool/AccountPoolDO.ts', 'utf8')
   const i = src.indexOf('async pick(request: PickRequest)')
-  const block = stripComments(src.slice(i, i + 4000))
+  // 窗口取到 pick() 末尾（函数体随「指定账号」等逻辑增长，固定字数会截断）
+  const block = stripComments(src.slice(i, src.indexOf('\n  }\n', src.indexOf('浮点误差兜底', i))))
   assert.ok(/SPREAD_WINDOW_MS/.test(block), '必须按时间窗摊开刚被选中的账号')
   assert.ok(/notePickedAt\(/.test(block), '必须记录/查询最近选中的时刻')
   assert.ok(
@@ -1086,7 +1087,8 @@ test('⚠️ 摊开必须让位于显式会话粘性（有 user 字段时优先 
   // 否则「同一会话命中 prompt cache」这个收益就没了。
   const src = readFileSync('src/pool/AccountPoolDO.ts', 'utf8')
   const i = src.indexOf('async pick(request: PickRequest)')
-  const block = stripComments(src.slice(i, i + 4000))
+  // 窗口取到 pick() 末尾（函数体随「指定账号」等逻辑增长，固定字数会截断）
+  const block = stripComments(src.slice(i, src.indexOf('\n  }\n', src.indexOf('浮点误差兜底', i))))
   const prefIdx = block.indexOf('preferred !== ')
   const spreadIdx = block.indexOf('SPREAD_WINDOW_MS')
   assert.ok(prefIdx > 0 && spreadIdx > 0, '两段逻辑都应存在')
