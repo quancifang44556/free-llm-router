@@ -150,7 +150,8 @@ EOF
 | `DATABASE_PATH` | `./data/router.db` | SQLite 文件路径 |
 | `API_KEY` | *（空）* | 面板与全部 API 的口令。**不设则任何请求 401**（fail-closed） |
 | `CREDENTIAL_KEY` | *（自动生成）* | 凭据 AES-GCM 加密密钥；不设则首次启动生成并持久化到库里 |
-| `AUTO_TASK_CRON` | `true` | 每小时巡检开关。⚠️ Node 侧只认字面量 `false`，其余值一律视为开启 |
+| `AUTO_TASK_CRON` | `true` | 每小时巡检开关。`false` / `0` / `no` / `off` 均可关闭 |
+| `TRUST_PROXY` | `false` | 前面有自己的反代（nginx / Caddy / cloudflared）时设为 `true`：按 `X-Forwarded-For` 最右一项取客户端 IP。不设则用 TCP 对端地址 |
 | `PUBLIC_URL` | *（空）* | 可选，仅用于启动 banner 显示 |
 | `UPSTREAM_CHAT_BASE` / `UPSTREAM_BILLING_BASE` / `UPSTREAM_WEB_BASE` | 内置默认 | 高级：覆盖上游端点 |
 

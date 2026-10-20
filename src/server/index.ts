@@ -23,12 +23,62 @@ export interface ServerOptions {
   host?: string
   databasePath?: string
   autoCron?: boolean
+  /** 是否信任反向代理追加的 `X-Forwarded-For`（见 {@link resolveClientIp}）。 */
+  trustProxy?: boolean
+}
+
+/**
+ * 解析布尔型环境变量：`false/0/no/off` 为关，`true/1/yes/on` 为开，未设或其他值取默认。
+ *
+ * ⚠️ 此前 `AUTO_TASK_CRON` 只认字面量 `false`，写成 `0`、`no`、`False` 都会被当成「开启」，
+ * 与用户的意图正好相反。
+ */
+export function envFlag(raw: string | undefined, fallback: boolean): boolean {
+  const v = (raw ?? '').trim().toLowerCase()
+  if (['false', '0', 'no', 'off'].includes(v)) return false
+  if (['true', '1', 'yes', 'on'].includes(v)) return true
+  return fallback
+}
+
+/**
+ * 确定客户端真实 IP，写进 `CF-Connecting-IP` 交给业务层（`gateway/authz.ts` 只认这个头）。
+ *
+ * ## ⚠️ 为什么必须由这里重写
+ *
+ * 在 Cloudflare 上，`CF-Connecting-IP` 由边缘强制覆盖，客户端伪造不了；
+ * 但 Node 直接对外时，它只是一个**普通请求头**。原先原样透传 ⇒
+ * 任何人带上 `CF-Connecting-IP: <白名单 IP>` 就能绕过子密钥的来源 IP 限制；
+ * 而正常走 nginx / Caddy 反代的请求又不带这个头 ⇒ IP 为空，白名单把所有人都拒掉。
+ *
+ * ## 规则
+ *
+ * - 默认：用 TCP 连接的对端地址（不可伪造）；
+ * - `TRUST_PROXY=true`（前面有自己的反代）：取 `X-Forwarded-For` **最右边**一项 ——
+ *   那是你的反代追加的真实对端地址；左边的项客户端可以随便写，不能信。
+ */
+export function resolveClientIp(
+  remoteAddress: string | undefined,
+  forwardedFor: string | string[] | undefined,
+  trustProxy: boolean,
+): string {
+  const normalize = (ip: string): string => {
+    const t = ip.trim()
+    return t.startsWith('::ffff:') ? t.slice(7) : t
+  }
+  if (trustProxy && forwardedFor !== undefined) {
+    const joined = Array.isArray(forwardedFor) ? forwardedFor.join(',') : forwardedFor
+    const parts = joined.split(',').map((p) => p.trim()).filter((p) => p !== '')
+    const last = parts[parts.length - 1]
+    if (last !== undefined) return normalize(last)
+  }
+  return normalize(remoteAddress ?? '')
 }
 
 export function startServer(options: ServerOptions = {}) {
   const port = options.port ?? Number.parseInt(process.env.PORT || '11451', 10)
   const host = options.host ?? process.env.HOST ?? '0.0.0.0'
-  const autoCron = options.autoCron ?? (process.env.AUTO_TASK_CRON !== 'false')
+  const autoCron = options.autoCron ?? envFlag(process.env.AUTO_TASK_CRON, true)
+  const trustProxy = options.trustProxy ?? envFlag(process.env.TRUST_PROXY, false)
 
   const runtime = createNodeRuntime(options.databasePath)
   const { env, db, taskRunnerNamespace } = runtime
@@ -58,12 +108,17 @@ export function startServer(options: ServerOptions = {}) {
     const headers = new Headers()
     for (const [key, val] of Object.entries(req.headers)) {
       if (val === undefined) continue
+      // ⚠️ 客户端自带的 CF-Connecting-IP 一律丢弃，下方用可信来源重写（见 resolveClientIp）。
+      if (key === 'cf-connecting-ip') continue
       if (Array.isArray(val)) {
         for (const item of val) headers.append(key, item)
       } else {
         headers.set(key, val)
       }
     }
+
+    const clientIp = resolveClientIp(req.socket.remoteAddress, req.headers['x-forwarded-for'], trustProxy)
+    if (clientIp !== '') headers.set('cf-connecting-ip', clientIp)
 
     const hasBody = req.method !== 'GET' && req.method !== 'HEAD'
     let webReq: Request

@@ -59,7 +59,8 @@ EOF
 | `DATABASE_PATH` | `./data/router.db` | SQLite 文件路径 |
 | `API_KEY` | *（空）* | 面板与全部 API 的口令。**不设 = 任何人可访问** |
 | `CREDENTIAL_KEY` | *（自动生成）* | 凭据 AES-GCM 加密密钥 |
-| `AUTO_TASK_CRON` | `true` | 每小时自动巡检（签到 / 成长任务）开关（`false` 关闭） |
+| `AUTO_TASK_CRON` | `true` | 每小时自动巡检（签到 / 成长任务）开关（`false` / `0` / `no` / `off` 关闭） |
+| `TRUST_PROXY` | `false` | 走反向代理时设为 `true`，否则子密钥的「来源 IP」会全部显示为反代地址（见 §1.6） |
 | `PUBLIC_URL` | *（空）* | 可选：仅用于启动 banner 显示对外地址 |
 
 > ⚠️ **`CREDENTIAL_KEY` 的行为（务必理解）**：
@@ -150,6 +151,10 @@ node dist/server.mjs
 
 > ⚠️ **SSE（流式响应）必须关闭缓冲**，否则流式对话会被整段卡住、体验极差。
 > 代码已读取 `X-Forwarded-Proto` / `Host`，反代只需正确透传。
+>
+> ⚠️ **走反代时请在 `.env` 里加 `TRUST_PROXY=true`**：服务会按 `X-Forwarded-For` 最右一项（反代追加的真实地址）识别客户端 IP，
+> 子密钥的 IP 白名单与「最后来源 IP」才准确。不走反代、直接对外时**不要**开 —— 那样客户端可以自己伪造这个头。
+> 客户端自带的 `CF-Connecting-IP` 一律会被丢弃，无法用来绕过白名单。
 
 **Caddy**（最简，自动申请证书）：
 

@@ -219,7 +219,10 @@ test('startServer：HTTP 服务端启动、健康检查与面板可访问性', a
 
 test('🔴 Node 下 AccountPoolDO 并发「读-改-写」不丢更新（串行队列）', async () => {
   // 复现：没有串行队列时，50 个并发 recordApiKeyUse 只记下 1 次。
+  const originalLog = console.log
+  console.log = () => {}
   const rt = createNodeRuntime(':memory:')
+  console.log = originalLog
   const pool = rt.env.ACCOUNT_POOL.get(rt.env.ACCOUNT_POOL.idFromName('cn')) as any
   const rec = await pool.addApiKey({ name: 'race', hash: 'hash-race', prefix: 'sk-race' })
   await Promise.all(
@@ -249,4 +252,70 @@ test('串行队列：前一个调用抛错不会卡住后续调用', async () =>
   assert.equal(await a, 'caught')
   assert.equal(await b, 'after')
   assert.deepEqual(order, ['boom', 'after'])
+})
+
+test('🔴 Node 客户端 IP：默认只认 TCP 对端，客户端伪造的头无效', async () => {
+  const { resolveClientIp } = await import('../src/server/index.js')
+  // 未开 TRUST_PROXY：X-Forwarded-For 不可信，取对端地址
+  assert.equal(resolveClientIp('198.51.100.7', '1.2.3.4', false), '198.51.100.7')
+  // IPv4 映射地址去掉 ::ffff: 前缀，白名单才能匹配
+  assert.equal(resolveClientIp('::ffff:198.51.100.7', undefined, false), '198.51.100.7')
+  // 开了 TRUST_PROXY：取最右一项（反代追加的），左边客户端自填的不算
+  assert.equal(resolveClientIp('127.0.0.1', '6.6.6.6, 203.0.113.5', true), '203.0.113.5')
+  // 开了但没有 X-Forwarded-For：回落对端地址
+  assert.equal(resolveClientIp('127.0.0.1', undefined, true), '127.0.0.1')
+})
+
+test('🔴 Node 服务：客户端自带的 CF-Connecting-IP 被丢弃并按对端地址重写', async () => {
+  const tmp = path.join(process.cwd(), '.build', `ip-test-${Date.now()}.db`)
+  const originalApiKey = process.env.API_KEY
+  process.env.API_KEY = 'ip-test-key'
+  // ⚠️ 静音启动横幅：node:test 子进程的 stdout 同时承载测试协议帧，
+  // 大段 console 输出与协议帧交错时偶发「Unable to deserialize cloned data」。
+  const originalLog = console.log
+  console.log = () => {}
+  const { server, runtime } = startServer({ port: 0, host: '127.0.0.1', databasePath: tmp, autoCron: false })
+  await new Promise<void>((resolve) => {
+    if (server.listening) resolve()
+    else server.once('listening', () => resolve())
+  })
+  const addr = server.address()
+  assert.ok(addr && typeof addr === 'object')
+  const base = `http://127.0.0.1:${addr.port}`
+  try {
+    const auth = { authorization: 'Bearer ip-test-key', 'content-type': 'application/json' }
+    // 建两把子密钥：一把只允许 10.9.9.9，一把只允许本机
+    const mk = async (ips: string[]): Promise<string> => {
+      const r = (await (await fetch(`${base}/admin/apikeys`, {
+        method: 'POST', headers: auth, body: JSON.stringify({ name: 'ip', limits: { allowedIps: ips } }),
+      })).json()) as { key?: string }
+      assert.ok(typeof r.key === 'string' && r.key !== '')
+      return r.key
+    }
+    const remoteOnly = await mk(['10.9.9.9'])
+    const localOnly = await mk(['127.0.0.1'])
+    // 伪造白名单 IP：必须被拒（真实对端是 127.0.0.1）
+    const forged = await fetch(`${base}/v1/models`, {
+      headers: { authorization: `Bearer ${remoteOnly}`, 'cf-connecting-ip': '10.9.9.9' },
+    })
+    assert.equal(forged.status, 403)
+    // 真实对端在白名单内：放行
+    const ok = await fetch(`${base}/v1/models`, { headers: { authorization: `Bearer ${localOnly}` } })
+    assert.equal(ok.status, 200)
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()))
+    runtime.db.close()
+    console.log = originalLog
+    if (originalApiKey === undefined) delete process.env.API_KEY
+    else process.env.API_KEY = originalApiKey
+    for (const f of [tmp, `${tmp}-wal`, `${tmp}-shm`]) fs.rmSync(f, { force: true })
+  }
+})
+
+test('envFlag：常见的「关」写法都能关掉', async () => {
+  const { envFlag } = await import('../src/server/index.js')
+  for (const v of ['false', 'FALSE', '0', 'no', 'off', ' False ']) assert.equal(envFlag(v, true), false, v)
+  for (const v of ['true', '1', 'yes', 'on']) assert.equal(envFlag(v, false), true, v)
+  assert.equal(envFlag(undefined, true), true)
+  assert.equal(envFlag('乱写', false), false)
 })
