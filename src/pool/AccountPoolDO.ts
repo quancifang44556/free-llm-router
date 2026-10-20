@@ -630,7 +630,9 @@ export class AccountPoolDO extends DurableObject<Env> {
     const fresh = candidates.filter((s) => now - this.notePickedAt(s.uid) >= SPREAD_WINDOW_MS)
     const pool = fresh.length > 0 ? fresh : candidates
 
-    const strategy = this.cachedRoutingConfig?.strategy ?? 'roundrobin'
+    // ⚠️ 必须 await 读取（缓存未命中就读 storage）：此前只读内存缓存，
+    // DO 重启 / Node 进程重启后缓存为空就静默回落到轮询，面板上选的策略形同虚设。
+    const strategy = (await this.routingConfig()).strategy
 
     if (strategy === 'random') {
       const weights = pool.map((s) => 1 + Math.max(0, s.credits) / 100)
@@ -652,7 +654,15 @@ export class AccountPoolDO extends DurableObject<Env> {
       // 当调用时间戳相同时（如均为 0），按 uid 字符串稳定排序，
       // 确保请求严格在池中多个账号之间均匀交替轮转，
       // 单账号 RPM 严格压低至 1/N，避免单个账号连续承载高频流量导致上游频次瞬间超限。
+      // `expiry`（临期优先）：有到期时刻的号按「最早到期」升序排在前面，先烧快过期的积分；
+      // 不知道到期时刻（0 / 已过）的号视为最晚，彼此之间仍按最久未用轮换。
+      // `roundrobin`：只按最久未用轮换。
+      const expiryOf = (s: AccountState): number =>
+        strategy === 'expiry' && s.creditsEarliestExpiry > now ? s.creditsEarliestExpiry : Number.POSITIVE_INFINITY
       const sorted = [...pool].sort((a, b) => {
+        const ea = expiryOf(a)
+        const eb = expiryOf(b)
+        if (ea !== eb) return ea < eb ? -1 : 1
         const diff = this.notePickedAt(a.uid) - this.notePickedAt(b.uid)
         return diff !== 0 ? diff : a.uid.localeCompare(b.uid)
       })
@@ -728,6 +738,11 @@ export class AccountPoolDO extends DurableObject<Env> {
       order: input.order.filter((x) => typeof x === 'string'),
       disabled: input.disabled.filter((x) => typeof x === 'string'),
     })
+  }
+
+  /** 当前路由配置（优先内存缓存，未命中再读 storage）。 */
+  private async routingConfig(): Promise<RoutingConfig> {
+    return this.cachedRoutingConfig ?? (await this.getRoutingConfig())
   }
 
   /** 获取系统调度与路由配置。 */
@@ -852,6 +867,9 @@ export class AccountPoolDO extends DurableObject<Env> {
      */
     modelCause?: 'absent' | 'denied' | 'busy'
   }): Promise<{ disabled: boolean }> {
+    // 软冷却起步时长来自路由配置（默认 60 秒）。⚠️ 在读账号**之前**取，
+    // 避免「读账号 → await → 写回」之间插入别的写。
+    const softBaseMs = input.kind === 'soft' ? (await this.routingConfig()).softCooldownSeconds * 1000 : 60_000
     const raw = readAccount(this.ctx.storage.sql, input.uid)
     if (raw === undefined) return { disabled: false }
     const state = normalizeAccountState(JSON.parse(raw))
@@ -874,8 +892,8 @@ export class AccountPoolDO extends DurableObject<Env> {
           state.until = input.resetAt
         } else if (!isActive(state.until, now)) {
           state.softStreak += 1
-          // 起步冷却从 10 分钟缩短至 60 秒（1 分钟），对齐上游「Wait about a minute」真实提示，避免单次超频连坐 10 分钟
-          const backoff = Math.min(60_000 * 2 ** (state.softStreak - 1), 30 * 60 * 1000)
+          // 起步时长 = 路由配置 `softCooldownSeconds`（默认 60 秒，对齐上游「Wait about a minute」），之后逐次翻倍、封顶 30 分钟
+          const backoff = Math.min(softBaseMs * 2 ** (state.softStreak - 1), 30 * 60 * 1000)
           state.until = now + backoff
         }
         // ⚠️ 「已在冷却中」时**不推进不延长**（Go 侧 `cooldown.go:321`）——

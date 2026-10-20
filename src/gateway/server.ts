@@ -105,6 +105,35 @@ export function recordLog(
 /** 单次请求最多换号次数（Go 侧 `MaxRotate` 默认 3）。 */
 export const MAX_ROTATE = 3
 
+/** 路由配置「单次请求最大换号重试」的进程内缓存（30 秒），省得每个请求多一次 DO 往返。 */
+let maxRotateCache: { value: number; at: number } | undefined
+const MAX_ROTATE_TTL_MS = 30_000
+
+/** 保存路由配置后调用：本进程立即生效（Workers 其余 isolate 最多 30 秒后生效）。 */
+export function resetMaxRotateCache(): void {
+  maxRotateCache = undefined
+}
+
+/**
+ * 本次请求最多换几次号（读路由配置 `maxRetries`，读不到就用 {@link MAX_ROTATE}）。
+ *
+ * ⚠️ 读失败**绝不**影响请求本身：回落到默认值。
+ */
+export async function maxRotateFor(pool: DurableObjectStub<AccountPoolDO>, now = Date.now()): Promise<number> {
+  if (maxRotateCache !== undefined && now - maxRotateCache.at < MAX_ROTATE_TTL_MS) return maxRotateCache.value
+  let value = MAX_ROTATE
+  try {
+    const cfg = await pool.getRoutingConfig()
+    if (typeof cfg?.maxRetries === 'number' && Number.isInteger(cfg.maxRetries) && cfg.maxRetries >= 0 && cfg.maxRetries <= 10) {
+      value = cfg.maxRetries
+    }
+  } catch {
+    // 回落默认值
+  }
+  maxRotateCache = { value, at: now }
+  return value
+}
+
 /** 上游错误类别 → 账号池的惩罚维度。 */
 /**
  * 把错误类别翻译成「模型级冷却的成因」，供 `applyFailure({ modelCause })` 使用。
@@ -753,8 +782,9 @@ export async function handleChatCompletions(
   const turnRequestId = newTurnRequestId()
   let conversationId = sessionKey === '' ? crypto.randomUUID() : ''
   const pinnedHeader = requestedAccount(request)
+  const maxRotate = await maxRotateFor(pool)
 
-  for (let attempt = 0; attempt <= MAX_ROTATE; attempt += 1) {
+  for (let attempt = 0; attempt <= maxRotate; attempt += 1) {
     const now = Date.now()
     // ⚠️ 限定默认供应商：池里可能同时有 cline 等家的账号，
     // 拿它们的凭据去打 WorkBuddy 端点必然 401（看起来像「凭据坏了」）。
@@ -1615,8 +1645,9 @@ export async function handleProviderChat(input: {
   const pinnedHeader = requestedAccount(request)
   /** 是否被「只用指定账号」挡住（挡住时不做跨渠道容灾 —— 用户要的就是这个号）。 */
   let pinBlocked = false
+  const maxRotate = await maxRotateFor(env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn')))
 
-  for (let attempt = 0; attempt <= MAX_ROTATE; attempt += 1) {
+  for (let attempt = 0; attempt <= maxRotate; attempt += 1) {
     const now = Date.now()
     // ⚠️ 供应商过滤交给 `pick()` 做（`provider` 字段），
     // **不要**在这里「先选中再筛掉」—— 那会让「池里有账号但当前供应商没账号」

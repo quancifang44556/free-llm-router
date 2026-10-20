@@ -69,7 +69,7 @@ import type { ProviderModel } from './providers/types.js'
 import type { LoginCredential } from './upstream/auth.js'
 import { parseAuthDocument, parseAuthPayload } from './upstream/import.js'
 import { handleResponses } from './gateway/responses.js'
-import { handleChatCompletions } from './gateway/server.js'
+import { handleChatCompletions, resetMaxRotateCache } from './gateway/server.js'
 import {
   emptyApiKeyUsage,
   generateApiKey,
@@ -2937,6 +2937,11 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
     const body = (await request.json().catch(() => ({}))) as Record<string, unknown>
     const cnPool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn'))
     const config = await cnPool.setRoutingConfig(body)
+    // ⚠️ 必须镜像到 global 分片：国际版账号在那里选号 / 记冷却，
+    // 只写 cn 会让「负载均衡模式」「软冷却时长」对国际版账号不生效（与永久积分锁同一个坑）。
+    const globalPool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('global'))
+    await globalPool.setRoutingConfig(config)
+    resetMaxRotateCache()
     return json({ ok: true, config })
   }
 
@@ -3985,6 +3990,15 @@ async function refreshAccountBalances(env: Env, now: number): Promise<void> {
 async function scheduled(event: ScheduledController, env: Env): Promise<void> {
   const now = Date.now()
 
+  // 面板「路由与调度」里的两个开关。读失败按默认（都开）处理，绝不因此整轮跳过。
+  let routing = { autoTaskCron: true, autoRefreshCredential: true }
+  try {
+    const cfg = await env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn')).getRoutingConfig()
+    routing = { autoTaskCron: cfg.autoTaskCron !== false, autoRefreshCredential: cfg.autoRefreshCredential !== false }
+  } catch (error) {
+    console.error('[cron] 读路由配置失败，按默认处理：', error instanceof Error ? error.message : String(error))
+  }
+
   // ⚠️ **主动续期扫一遍（每个整点都做，与是否有任务时点无关）。**
   //
   // ## 🔴 为什么必须主动续期（用户报「其它账号的稳定性能不能提升一下，
@@ -4002,10 +4016,14 @@ async function scheduled(event: ScheduledController, env: Env): Promise<void> {
   //
   // ⚠️ 扫到失败**不抛**：一条 cron 不能因为某个账号续期失败就整体不跑
   //（那会让任务分发也一起停掉）。逐账号 try，如实记日志。
-  try {
-    await refreshExpiringCredentials(env, now)
-  } catch (error) {
-    console.error('[cron] 主动续期整体失败：', error instanceof Error ? error.message : String(error))
+  if (!routing.autoRefreshCredential) {
+    console.log('[cron] 「凭据主动刷新」已在面板关闭，跳过续期扫描')
+  } else {
+    try {
+      await refreshExpiringCredentials(env, now)
+    } catch (error) {
+      console.error('[cron] 主动续期整体失败：', error instanceof Error ? error.message : String(error))
+    }
   }
 
   // ⚠️ **余额快照也必须每个整点刷**（与续期同理，不能只在被调用时才更新）。
@@ -4030,6 +4048,10 @@ async function scheduled(event: ScheduledController, env: Env): Promise<void> {
   // ⚠️ 注意：续期在 return **之前** —— 这正是「非任务时点也保持登录态」的关键。
   if (plan === undefined) {
     console.log(`[cron] ${event.cron} UTC+8 ${hour} 时点无任务，已做完续期扫描`)
+    return
+  }
+  if (!routing.autoTaskCron) {
+    console.log(`[cron] ${event.cron} UTC+8 ${hour} 时点有任务（${plan}），但「自动每日任务」已在面板关闭，跳过`)
     return
   }
   if (job === undefined) return
