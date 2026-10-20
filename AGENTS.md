@@ -57,8 +57,8 @@
 
 | 参考项目 | 语言/规模 | 对本项目的价值 | 能否直接移植 |
 |---|---|---|---|
-| `../workbuddy2api-panel` | Go / ~21k 行非测试代码 | **任务协议的权威来源**：25 个任务动作、4 套客户端指纹、领奖路径、幂等判据、真实对话回执 | ❌ 不能。Go 二进制无法在 Workers 运行；且其依赖 23 处文件系统读写、`net/http` 长驻服务、6 处进程内 cron、`go-redis` TCP 客户端 |
-| `../deepseek-harness-codearts` | TypeScript / ~68k 行 | **聚合网关的实现范式**：`src/openai-gateway/*` 已把「多 provider → OpenAI 兼容」做完整，且**对宿主的耦合面收敛为 4 个方法** | ⚠️ 部分。网关层可整体借鉴；但它是 DSH 插件，`src/index.ts` 等强耦合宿主 |
+| `<参考项目>/workbuddy2api-panel` | Go / ~21k 行非测试代码 | **任务协议的权威来源**：25 个任务动作、4 套客户端指纹、领奖路径、幂等判据、真实对话回执 | ❌ 不能。Go 二进制无法在 Workers 运行；且其依赖 23 处文件系统读写、`net/http` 长驻服务、6 处进程内 cron、`go-redis` TCP 客户端 |
+| `<参考项目>/deepseek-harness-codearts` | TypeScript / ~68k 行 | **聚合网关的实现范式**：`src/openai-gateway/*` 已把「多 provider → OpenAI 兼容」做完整，且**对宿主的耦合面收敛为 4 个方法** | ⚠️ 部分。网关层可整体借鉴；但它是 DSH 插件，`src/index.ts` 等强耦合宿主 |
 
 **关键结构性发现（决定了本项目的架构）**：
 `deepseek-harness-codearts` 的 `src/openai-gateway/server.ts:20-25` 定义了 `LlmRuntimeLike` 接口，网关对 DSH 的真实依赖只有四个方法 —— `listProviders()` / `listModels(provider)` / `resolveModelInfo(provider, model)` / `stream(options)`（外加可选的 `attachments.saveImage`）。
@@ -88,7 +88,7 @@
 
 ### 2.4 为什么任务引擎必须是 Durable Object
 
-这是本项目**最容易做错、代价最高**的一个决定。依据来自 Go 侧的实测数据（`../workbuddy2api-panel`）：
+这是本项目**最容易做错、代价最高**的一个决定。依据来自 Go 侧的实测数据（`<参考项目>/workbuddy2api-panel`）：
 
 | 常量 | 值 | 出处 |
 |---|---|---|
@@ -157,7 +157,7 @@
 
 ### 3.1 使用边界（不可协商）
 
-参考项目 `../workbuddy2api-panel` 的 README 明确声明其定位是**个人自用账号管理**，并明确反对：批量注册小号、账号池出租、付费 API 中转、二次打包售卖。
+参考项目 `<参考项目>/workbuddy2api-panel` 的 README 明确声明其定位是**个人自用账号管理**，并明确反对：批量注册小号、账号池出租、付费 API 中转、二次打包售卖。
 
 本项目**继承该边界**，并在实现上体现：
 
@@ -276,7 +276,7 @@ src/
 
 ## 六、必须遵守的协议事实（来自 Go 侧实测）
 
-> 这一节是本项目**最有价值的部分**。全部来自 `../workbuddy2api-panel` 的实测结论，重写时**不要重新踩**。
+> 这一节是本项目**最有价值的部分**。全部来自 `<参考项目>/workbuddy2api-panel` 的实测结论，重写时**不要重新踩**。
 
 ### 6.1 四套客户端指纹（同一端点，不同判据）
 
@@ -3080,10 +3080,10 @@ Workers CPU 超限是两类故障，必须分开判断。
 
 | 用途 | 路径 |
 |---|---|
-| 任务协议权威来源 | `../workbuddy2api-panel/internal/upstream/*.go`、`internal/panel/autotask.go` |
-| 账号池状态机参考 | `../workbuddy2api-panel/internal/pool/*.go` |
-| 网关实现范式 | `../deepseek-harness-codearts/src/openai-gateway/*.ts` |
-| 上游错误分类参考 | `../workbuddy2api-panel/internal/upstream/client.go` |
+| 任务协议权威来源 | `<参考项目>/workbuddy2api-panel/internal/upstream/*.go`、`internal/panel/autotask.go` |
+| 账号池状态机参考 | `<参考项目>/workbuddy2api-panel/internal/pool/*.go` |
+| 网关实现范式 | `<参考项目>/deepseek-harness-codearts/src/openai-gateway/*.ts` |
+| 上游错误分类参考 | `<参考项目>/workbuddy2api-panel/internal/upstream/client.go` |
 | Workers 限额 | https://developers.cloudflare.com/workers/platform/limits/ |
 | DO 限额 | https://developers.cloudflare.com/durable-objects/platform/limits/ |
 | Node 兼容性 | https://developers.cloudflare.com/workers/runtime-apis/nodejs/ |
