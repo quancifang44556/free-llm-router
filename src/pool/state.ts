@@ -41,6 +41,25 @@ export interface ModelCooldown {
   /** 原因标签，用于区分 6004 与 11102（清理由此判定，不可混淆）。 */
   reason: string
   /**
+   * **跨冷却周期的坐实次数**（不随 `pruneExpired` 归零）。
+   *
+   * ⚠️ 为什么不复用 `hits`：`hits` 存在冷却条目内部，条目被 `pruneExpired`
+   * 删掉后计数即归零 —— 于是「短观察窗」永远无法升级成「长冷却」，
+   * 一个真不存在的模型会每 2 分钟被重试一次，永远停留在观察窗档位。
+   *
+   * `confirmed` 放在**账号状态**的同级表里（见 `modelConfirm`），
+   * 与冷却条目解耦，只在「同一模型连续坐实」时递增、在真实成功时清零。
+   */
+  confirmed?: number
+  /**
+   * 结构化成因（`'busy'` / `'absent'` / `'denied'`）。
+   *
+   * ⚠️ 旧实现靠 `reason` 文案做 `includes('not found')` 判断，匹配面过宽 ⇒ 误杀。
+   * 现在由调用方从 `classify()` 的结果直接传入，不再解析文案。
+   * 缺省（旧数据）按 `'busy'` 处理：那是代价最小的解释。
+   */
+  cause?: 'busy' | 'absent' | 'denied'
+  /**
    * 已连续命中次数，驱动 11102 的指数退避。
    * ⚠️ 刻意**不落盘**（Go 侧同口径）：重启后从基数重新学习，避免陈旧计数永久放大。
    */
@@ -105,6 +124,14 @@ export interface AccountState {
   softStreak: number
   /** 模型级冷却表。 */
   modelCooldowns: Record<string, ModelCooldown>
+  /**
+   * 每个模型的**跨周期坐实次数**（键为模型名，值为连续失败轮次）。
+   *
+   * 与 `modelCooldowns[model].confirmed` 冗余保存一份在账号级，
+   * 这样 `pruneExpired` 删掉冷却条目后，坐实进度**不会丢失**。
+   * 真实成功（`noteSuccess`）时清零。
+   */
+  modelConfirm: Record<string, number>
 
   // ── 熔断域 ──
   /** 熔断截止（epoch ms，0 = 无）。 */
@@ -164,6 +191,7 @@ export function createAccountState(input: {
     coolKind: '',
     softStreak: 0,
     modelCooldowns: {},
+    modelConfirm: {},
     breakerUntil: 0,
     retryCount: 0,
     fails: 0,
@@ -224,6 +252,7 @@ export function normalizeAccountState(raw: unknown): AccountState | undefined {
     coolKind: str('coolKind', base.coolKind) as AccountState['coolKind'],
     softStreak: num('softStreak', base.softStreak),
     modelCooldowns: obj('modelCooldowns', base.modelCooldowns),
+    modelConfirm: obj('modelConfirm', (base as Partial<AccountState>).modelConfirm ?? {}),
     breakerUntil: num('breakerUntil', base.breakerUntil),
     retryCount: num('retryCount', base.retryCount),
     fails: num('fails', base.fails),

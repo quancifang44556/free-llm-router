@@ -37,6 +37,16 @@ export type ErrorKind =
   | 'server' // 上游 5xx —— 可重试，喂熔断
   | 'rate_limited' // 429 / 6004 —— 换号 + 冷却；6004 是**模型级**
   | 'model_unavailable' // 11102：该后端无此模型 —— (账号,模型) 负缓存
+  /**
+   * **账号等级不支持该模型**（业务码 `11158`，`is not allowed for user type [...]`）。
+   *
+   * ⚠️ 与 `model_unavailable`(11102) 的区别（2026-10-20 实测捕获原文）：
+   * - `11102` `service info not found` ⇒ **后端没有该模型**；
+   * - `11158` `not allowed for user type [personal_free_user]` ⇒ **模型存在，档位不配用**。
+   *
+   * 两者都要做 (账号,模型) 负缓存，但证据强度不同（见 AccountPoolDO 的冷却阶梯）。
+   */
+  | 'model_denied'
   | 'credit_exhausted' // 402 / 14018 —— 硬冷却至次日 04:00
   | 'waf_blocked' // HTTP 403 且无业务信封 —— **可能是 IP 级**（会触发 IP 级判定）
   /**
@@ -105,6 +115,7 @@ const CODE_KIND: Record<number, ErrorKind> = {
   14003: 'rate_limited',
   14018: 'credit_exhausted',
   14017: 'rate_limited',
+  11158: 'model_denied',
   11140: 'request_illegal',
   12153: 'session_dead',
   11115: 'context_exceeded',
@@ -152,7 +163,43 @@ export function parseEnvelope(text: string): Envelope | undefined {
     }
   }
 
-  if (!trimmed.startsWith('{')) return undefined
+  // ⚠️ 报文可能**不是纯 JSON**：provider 层会把上游原文包进一句中文
+  //   `供应商「WorkBuddy」请求失败：{"code":11158,...}`
+  // 且内层引号可能**已被转义**（`{\"code\":11158}`）。
+  // `ProviderError` 分支正是拿这种 message 再喂给本函数的（见 server.ts），
+  // 所以这里必须能从任意位置取出 JSON，并容忍转义引号。
+  //
+  // 实现刻意保持**单遍、无正则回溯**：用栈式扫描找配对 `}`，
+  // 不依赖「整串是合法 JSON」这个过强前提。
+  if (!trimmed.startsWith('{')) {
+    if (trimmed.includes('\\"')) trimmed = trimmed.replace(/\\"/g, '"')
+    const from = trimmed.indexOf('{')
+    if (from < 0) return undefined
+    let depth = 0
+    let inStr = false
+    let esc = false
+    let to = -1
+    for (let i = from; i < trimmed.length; i++) {
+      const ch = trimmed[i]
+      if (inStr) {
+        if (esc) esc = false
+        else if (ch === '\\') esc = true
+        else if (ch === '"') inStr = false
+      } else if (ch === '"') {
+        inStr = true
+      } else if (ch === '{') {
+        depth++
+      } else if (ch === '}') {
+        depth--
+        if (depth === 0) {
+          to = i
+          break
+        }
+      }
+    }
+    if (to < 0) return undefined
+    trimmed = trimmed.slice(from, to + 1)
+  }
   try {
     const value = JSON.parse(trimmed) as unknown
     if (value === null || typeof value !== 'object' || Array.isArray(value)) return undefined
@@ -165,7 +212,11 @@ export function parseEnvelope(text: string): Envelope | undefined {
     // 这里把 `NN-NNN` 归一成一个稳定的负值，让 `classify` 能认出来。
     // ⚠️ 不能放宽成「任何字符串码都归一」：只有 `数字-数字` 形态才是 11-128 这一类；
     // 其他字符串（如 `"6004"`）仍交给下面按数字解析，否则会把可识别的码误判成渠道拦截。
-    if (typeof raw === 'string' && /^\d+-\d+$/.test(raw.trim())) {
+    // ⚠️ 连字符可能是**非 ASCII 的 U+2011**：`11‑128` 的真实字节是
+    // `31 31 E2 80 91 31 32 38` —— 中间那个不是 `-`，而是 U+2011（非断连字符）。
+    // 旧正则 `/^\d+-\d+$/` 只认 ASCII `-`，于是这个码**始终匹配不上**，
+    // `parseEnvelope` 返回 undefined，整条信封被丢弃、最终落回 `server`。
+    if (typeof raw === 'string' && /^\d+[\u2010-\u2015\u2212\uFF0D-]\d+$/.test(raw.trim())) {
       return {
         code: CHANNEL_BLOCKED_CODE,
         msg: typeof obj.msg === 'string' && obj.msg !== '' ? obj.msg : raw.trim(),
@@ -222,7 +273,21 @@ export function classify(httpStatus: number, bodyText: string): { kind: ErrorKin
   const envelope = parseEnvelope(bodyText)
 
   // ── 2. 5xx ──
+  //
+  // ⚠️ **已知业务码优先于 5xx 状态码**（2026-10-20 实测捕获的真实缺陷）。
+  //
+  // 上游在网关侧出错时用 **502 包裹业务信封**，例如：
+  //   HTTP 502 + {"code":11158,"msg":"model [x] is not allowed for user type [...]"}
+  // 旧实现把 5xx 判在业务码之前 ⇒ 这类被一律成 `server`（账号级，喂熔断），
+  // 连续几次就把好账号熔断掉 —— 「账号是好的却用不了」的第二条来源。
+  //
+  // 判据要**足够窄**：只有信封里的 code 属于已知业务码时才越过 5xx，
+  // 否则真网关故障（HTML/无信封/未知码）仍必须落 `server`。
   if (httpStatus >= 500) {
+    const known = envelope !== undefined ? CODE_KIND[envelope.code] : undefined
+    if (known !== undefined && envelope !== undefined) {
+      return { kind: known, code: envelope.code, msg: envelope.msg }
+    }
     return { kind: 'server', code: envelope?.code, msg: envelope?.msg ?? `upstream ${httpStatus}` }
   }
 
@@ -275,6 +340,8 @@ export function shouldRotate(kind: ErrorKind): boolean {
   switch (kind) {
     case 'rate_limited':
     case 'model_unavailable':
+    // 11158 档位不支持 ⇒ 换到别的档位账号可能可用
+    case 'model_denied':
     case 'credit_exhausted':
     case 'server':
     case 'auth_error':
@@ -301,6 +368,7 @@ export function shouldPunish(kind: ErrorKind): boolean {
   switch (kind) {
     case 'rate_limited':
     case 'model_unavailable':
+    case 'model_denied':
     case 'credit_exhausted':
     case 'waf_blocked':
     case 'session_dead':

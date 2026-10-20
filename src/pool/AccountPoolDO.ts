@@ -685,6 +685,18 @@ export class AccountPoolDO extends DurableObject<Env> {
     /** 上游给出的重置时刻（epoch ms），优先于本地退避计算。 */
     resetAt?: number
     reason?: string
+    /**
+     * 模型级失败的**结构化成因**。
+     *
+     * ⚠️ 不要靠 `reason` 文案反推（旧实现就是这么错的：`includes('not found')`
+     * 把一堆无关文案也判成「模型不存在」，一次误判锁 6 小时）。
+     * 调用方在拿到 `classify()` 的 `kind` 时就已知道语义，直接传进来。
+     *
+     * - `'absent'`  —— 上游确证无此模型（11102 `service info not found`）
+     * - `'denied'`  —— 模型存在但账号档位不支持（11158 `not allowed for user type`）
+     * - `'busy'`    —— 模型繁忙/限频（6004 / 14003）
+     */
+    modelCause?: 'absent' | 'denied' | 'busy'
   }): Promise<{ disabled: boolean }> {
     const raw = readAccount(this.ctx.storage.sql, input.uid)
     if (raw === undefined) return { disabled: false }
@@ -752,22 +764,66 @@ export class AccountPoolDO extends DurableObject<Env> {
         // 失败直接吃到封顶退避。`state.ts` 明确要求 `hits` 从新鲜基数重新学习。
         pruneExpired(state, now, MODEL_COST_TTL_MS)
         const prev = state.modelCooldowns[model]
-        const hits = (prev?.hits ?? 0) + 1
-        // 6004 / 14003：对齐上游重置墙钟，未下发墙钟时按 15s 起步退避（频次超限短时退避）；
-        // 11102（无此模型）：6h 起指数退避，封顶 24h。
-        const isNotAvailable =
-          input.reason?.includes('11102') ||
-          input.reason?.includes('service info not found') ||
-          input.reason?.includes('not found')
-        // ⚠️ 6004/14003 这类「模型繁忙」的冷却**必须短**（2026-10-20 实测）。
+        // ⚠️ 坐实次数取自**账号级** `modelConfirm`，不是冷却条目里的 `hits`。
+        // 原因：`pruneExpired` 会把过期条目整体删掉，`hits` 随之归零，
+        // 于是「短观察窗 → 长冷却」的阶梯**永远不会升级**（实测踩到）。
+        const confirmed = (state.modelConfirm[model] ?? 0) + 1
+        const hits = confirmed
+        // ═══════════════════════════════════════════════════════════════════
+        // 「验证式冷却」—— 一次失败**绝不**直接锁长冷却
+        // ═══════════════════════════════════════════════════════════════════
         //
-        // 原实现起步 60s、指数翻倍封顶 10 分钟；而国际服实测窗口是「约 8 秒一发就不撞」，
-        // 冷却 10 分钟等于把整池账号白白关掉（用户侧表现为「刚修好又全挂」）。
-        // 故起步 15s、封顶 90s —— 略高于实测安全间隔，又能快速自愈。
-        // 1 分钟这个量级是**上游真实提示**（`Wait about a minute`）的老口径，对 14003 不适用。
-        const fallbackCooldown = isNotAvailable
-          ? Math.min(6 * 60 * 60 * 1000 * 2 ** Math.min(hits - 1, 2), 24 * 60 * 60 * 1000)
-          : Math.min(15_000 * 2 ** Math.min(hits - 1, 3), 90_000)
+        // ## 旧策略的错在哪（2026-10-20 实测事故）
+        //
+        // 旧实现只要 `reason` 里出现 `'not found'`，就按 11102 处理：**一次失败锁 6 小时**
+        // （`hits=1` 即 `6h * 2^0`）。当天实测后果：
+        //   - `default-model` / `deepseek-v4.1-flash-sg` 被锁 5.56h，
+        //     而它们**连续 3 次真实调用全部 200** —— 纯粹误杀；
+        //   - `'not found'` 是个过宽的字符串匹配：任何含该词的文案都会命中，
+        //     包括那批失败的**根因是模型名前缀拼错**的场景（AGENTS.md §9 事故）。
+        //
+        // ## 新策略：先短锁、再坐实
+        //
+        // 一次模型级失败**只短锁**（busy 15s / 存疑 2 分钟），让账号立刻还有机会被复查：
+        //   - `busy`（6004/14003）：15s 起、封顶 90s —— 实测国际服约 8 秒一发即不撞；
+        //   - `absent` / `denied`：**首次也只锁 2 分钟**（不是 6 小时）；
+        //     若上游确实没有该模型，2 分钟后必然**再次失败**并 `hits+1`，
+        //     此时才逐级升到 30 分钟 → 2 小时 → 6 小时（封顶 24 小时）。
+        //
+        // ⇒ 「真不存在」的模型会在 10 分钟内自然收敛到长冷却（代价：多几次无效探测）；
+        //   「其实可用」的模型则最多受影响 2 分钟就自动恢复（旧策略是 5.56 小时）。
+        //
+        // 额外好处：不需要探测线程、不需要额外状态字段 —— 复用失败计数本身即验证。
+        //
+        // ⚠️ `denied`（11158 档位不支持）虽然语义确定，仍走同一阶梯：
+        //   因为换号后**别的档位账号可能可用**，一次锁死会让整个模型在全池消失。
+        const cause = input.modelCause ?? 'busy'
+        let fallbackCooldown: number
+        if (cause === 'busy') {
+          // 6004 / 14003 模型繁忙：短退避，快速自愈。
+          // 原实现 60s 起、封顶 10 分钟，实测窗口只有 8~12 秒 ⇒ 白白关掉整池。
+          fallbackCooldown = Math.min(15_000 * 2 ** Math.min(hits - 1, 3), 90_000)
+        } else {
+          // absent / denied：**阶梯式**坐实。hits=1 时只锁 2 分钟作观察窗。
+          const LADDER = [
+            2 * 60 * 1000, // 第 1 次：2 分钟（观察窗，误判代价极低）
+            30 * 60 * 1000, // 第 2 次：30 分钟（基本坐实）
+            2 * 60 * 60 * 1000, // 第 3 次：2 小时
+            6 * 60 * 60 * 1000, // 第 4 次：6 小时
+            24 * 60 * 60 * 1000, // 第 5 次起：24 小时封顶
+          ] as const
+          // 取第 `hits` 级（从 0 起），越界则取最后一档（24h 封顶）
+          const tier = Math.min(hits - 1, LADDER.length - 1)
+          if (tier <= 0) fallbackCooldown = LADDER[0]
+          else if (tier === 1) fallbackCooldown = LADDER[1]
+          else if (tier === 2) fallbackCooldown = LADDER[2]
+          else if (tier === 3) fallbackCooldown = LADDER[3]
+          else fallbackCooldown = LADDER[4]
+          if (input.modelCause === 'denied') {
+            // 档位拒绝是确定性的 ⇒ 观察窗可以更短（90s），但仍不一次锁死。
+            fallbackCooldown = Math.min(fallbackCooldown, hits === 1 ? 90_000 : fallbackCooldown)
+          }
+        }
         const until =
           input.resetAt !== undefined && input.resetAt > now
             ? input.resetAt
@@ -777,8 +833,11 @@ export class AccountPoolDO extends DurableObject<Env> {
           resetAt: input.resetAt ?? 0,
           reason: input.reason ?? 'model cooldown',
           hits,
+          confirmed,
+          cause,
           auditOnly: false,
         }
+        state.modelConfirm[model] = confirmed
         break
       }
     }
@@ -790,12 +849,29 @@ export class AccountPoolDO extends DurableObject<Env> {
   }
 
   /**
-   * 记录一次成功：清熔断与降权，**不碰 `modelCooldowns`**。
+   * 记录一次成功：清熔断与降权；**仅清除「过期或弱证据」的模型冷却**。
    *
-   * ⚠️ 不清模型级冷却是**刻意的**：一次成功不能证明某个模型已解除限流
-   * （Go 侧 `state.go:141-144`）。
+   * ## 为什么不再一刀切「完全不碰 modelCooldowns」
+   *
+   * 原来的理由是「一次成功不能证明某个模型已解除限流」（Go 侧 `state.go:141-144`），
+   * 这对**限频类**（busy）是成立的 —— 换个模型能跑通，不代表原模型不忙。
+   *
+   * 但那条规则被套用到了 `absent` / `denied` 上就产生了死锁：
+   * 一次**误判**写入的「模型不存在」会钉死 6 小时，而期间哪怕该模型**一直在成功**，
+   * 也永远清不掉 —— 用户看到的就是「账号明明是好的，但就是用不了」（2026-10-20 事故）。
+   *
+   * ⇒ 现在按**证据强度**分治：
+   *   - `busy`：**不动**。限频是随时间的，成功一次不构成解除证据；
+   *   - `absent` / `denied`：**真实成功即清除**。成功本身就是最强反证 ——
+   *     一个刚被 200 走通的模型，绝不可能「不存在」。
    */
-  async noteSuccess(uid: string, now: number, usage?: { input: number; output: number }): Promise<void> {
+  async noteSuccess(
+    uid: string,
+    now: number,
+    usage?: { input: number; output: number },
+    /** 本次成功实际使用的模型名（用于反证对应的模型冷却）。 */
+    model?: string,
+  ): Promise<void> {
     const raw = readAccount(this.ctx.storage.sql, uid)
     if (raw === undefined) return
     const state = JSON.parse(raw) as AccountState
@@ -813,6 +889,18 @@ export class AccountPoolDO extends DurableObject<Env> {
     if (usage !== undefined) {
       state.tokenUsage.input += usage.input
       state.tokenUsage.output += usage.output
+    }
+
+    // 用「真实成功」反证弱证据的模型冷却（见上方注释）。
+    if (model !== undefined && model !== '') {
+      const mc = state.modelCooldowns[model]
+      // 真实成功是「该模型可用」的最强证据 ⇒ 清掉弱证据冷却并重置坐实计数。
+      if (mc !== undefined && (mc.cause === 'absent' || mc.cause === 'denied')) {
+        delete state.modelCooldowns[model]
+      }
+      if (mc === undefined || mc.cause === 'absent' || mc.cause === 'denied') {
+        delete state.modelConfirm[model]
+      }
     }
 
     writeAccount(this.ctx.storage.sql, state.uid, state.realm, JSON.stringify(state), now)

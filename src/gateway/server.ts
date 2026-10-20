@@ -94,6 +94,26 @@ export function recordLog(
 export const MAX_ROTATE = 3
 
 /** 上游错误类别 → 账号池的惩罚维度。 */
+/**
+ * 把错误类别翻译成「模型级冷却的成因」，供 `applyFailure({ modelCause })` 使用。
+ *
+ * ⚠️ 这是**唯一**的判定入口：`AccountPoolDO` 不再靠 `reason` 文案反推。
+ * 旧实现里那句 `reason.includes('not found')` 匹配面过宽，
+ * 把由「模型名前缀拼错」引起的 11102 也当成了真不存在 ⇒ 误锁 6 小时（2026-10-20 事故）。
+ */
+export function modelCauseFor(kind: ErrorKind): 'busy' | 'absent' | 'denied' | undefined {
+  switch (kind) {
+    case 'model_unavailable':
+      return 'absent'
+    case 'model_denied':
+      return 'denied'
+    case 'rate_limited':
+      return 'busy'
+    default:
+      return undefined
+  }
+}
+
 export function mapErrorToPunishment(kind: ErrorKind): {
   punish: boolean
   dimension: 'soft' | 'hard' | 'breaker' | 'degrade' | 'session_dead' | 'model'
@@ -106,6 +126,12 @@ export function mapErrorToPunishment(kind: ErrorKind): {
       return { punish: true, dimension: 'soft', rotate: true }
     // 该后端无此模型：模型级负缓存，换号**可能**有用（不同号挂不同后端）
     case 'model_unavailable':
+      return { punish: true, dimension: 'model', rotate: true }
+    // 11158「模型存在但账号档位不支持」：也是模型维度负缓存。
+    // 换号**有意义**——不同账号档位不同（付费号能用免费号用不了的模型）。
+    // ⚠️ 与 `model_unavailable` 分开成一类，是为了让冷却策略拿到不同的证据强度：
+    // 档位拒绝属于确定性拒绝，而 11102 的文案极易由「模型名前缀拼错」触发。
+    case 'model_denied':
       return { punish: true, dimension: 'model', rotate: true }
     // 余额耗尽：硬冷却到次日 04:00，换号有用
     case 'credit_exhausted':
@@ -758,6 +784,7 @@ export async function handleChatCompletions(
 
       // 记账（按类别落到正确维度）
       if (mapped.punish) {
+        const cause = modelCauseFor(kind)
         await pool
           .applyFailure({
             uid: candidate.uid,
@@ -769,6 +796,8 @@ export async function handleChatCompletions(
             // 猜早了会继续撞限流，猜晚了白白少用几小时。
             ...(resetAt !== undefined ? { resetAt } : {}),
             ...(msg !== '' ? { reason: `${kind}: ${msg}`.slice(0, 200) } : {}),
+            // 结构化成因：不靠文案反推（见 modelCauseFor 的注释）
+            ...(cause !== undefined ? { modelCause: cause } : {}),
           })
           .catch(() => {
             // 记账失败不该让回复失败：这是可观测性问题，不是正确性问题
@@ -811,6 +840,7 @@ export async function handleChatCompletions(
       const { dimension, resetAt } = refineModelScoped(kind, errText)
 
       if (mapped.punish) {
+        const cause = modelCauseFor(kind)
         await pool
           .applyFailure({
             uid: candidate.uid,
@@ -819,6 +849,7 @@ export async function handleChatCompletions(
             ...(model !== '' ? { model } : {}),
             ...(resetAt !== undefined ? { resetAt } : {}),
             ...(msg !== '' ? { reason: `${kind}: ${msg}`.slice(0, 200) } : {}),
+            ...(cause !== undefined ? { modelCause: cause } : {}),
           })
           .catch(() => {})
       }
@@ -904,7 +935,7 @@ export async function handleChatCompletions(
         clientGone: () => request.signal.aborted,
         onFirstChunk: () => {
           // 首帧到达即算成功（清熔断/降权）
-          const okTask = pool.noteSuccess(candidate.uid, Date.now()).catch(() => {})
+          const okTask = pool.noteSuccess(candidate.uid, Date.now(), undefined, model).catch(() => {})
           if (ctx !== undefined) ctx.waitUntil(okTask)
           else void okTask
         },
@@ -1456,7 +1487,7 @@ export async function handleProviderChat(input: {
       ? { ...(rawBody as Record<string, unknown>), model }
       : (rawBody as Record<string, unknown>)
   const tried = input.tried
-  let lastError: { status: number; message: string } | undefined
+  let lastError: { status: number; message: string; kind?: string } | undefined
 
   // ⚠️ 会话 / 轮级 id 在重试循环**外**算一次（实测语义）：
   // `X-Conversation-Request-ID` 在一轮用户发送里恒定（重试复用），
@@ -1543,7 +1574,7 @@ export async function handleProviderChat(input: {
                 //（否则用户的取消动作会熔断健康账号，见 `nonStreamingResponse` 的说明）。
                 clientGone: () => request.signal.aborted,
                 onFirstChunk: () => {
-                  const t = pool.noteSuccess(picked.uid, Date.now()).catch(() => {})
+                  const t = pool.noteSuccess(picked.uid, Date.now(), undefined, model).catch(() => {})
                   if (ctx !== undefined) ctx.waitUntil(t)
                   // ⚠️ 首帧到达即绑定会话 —— 此后同一会话优先落这个账号，
                   // 从第二轮起命中上游 prompt cache（更快、更省）。
@@ -1606,6 +1637,55 @@ export async function handleProviderChat(input: {
         }
       }
 
+      // ══════════════════════════════════════════════════════════════════
+      // 🔴 `ProviderError` 必须**先过一遍业务码分类**，不能一律当网络错误
+      // ══════════════════════════════════════════════════════════════════
+      //
+      // ## 实测缺陷（2026-10-20，与 11158 / 11102 误锁直接相关）
+      //
+      // 8 家 provider 的 `chat()` 在非 2xx 时**抛 `ProviderError`**，
+      // 于是网关的 `!upstream.ok` 分支（那里才有 `classify()`）永远走不到。
+      // 结果：**所有**上游业务错误都被压成一句 `lastError = {502, message}`、
+      // 记成传输层失败 —— 业务码语义整条丢失。
+      //
+      // 具体后果（本次事故现场）：
+      //   - `11158 model not allowed for user type` ⇒ 记成网络错误 ⇒ 不写模型负缓存；
+      //   - `11102 service info not found`          ⇒ 同上；
+      //   - 而**另一些**路径（如 SSE 分支）却会写模型冷却 —— 同一份错误两套结果，
+      //     出现 `cause=absent` 与 `cause=denied` 混杂、且冷却时长对不上账的现象。
+      //
+      // 修法：把 `ProviderError` 的原始 message 交给 `classify()`（它本来就是
+      // 按文本解析业务码的），只有**确实解析不出业务码**时才退回传输层语义。
+      const pe = error as { name?: string; httpStatus?: number; code?: unknown }
+      const peStatus = typeof pe?.httpStatus === 'number' ? pe.httpStatus : 0
+      const isProviderErr = pe?.name === 'ProviderError'
+      if (isProviderErr) {
+        const c = classify(peStatus, message)
+        const pm = mapErrorToPunishment(c.kind)
+        const pcause = modelCauseFor(c.kind)
+        if (pm.punish) {
+          await pool
+            .applyFailure({
+              uid: picked.uid,
+              kind: pm.dimension,
+              now: Date.now(),
+              ...(model !== '' ? { model } : {}),
+              ...(pcause !== undefined ? { modelCause: pcause } : {}),
+              reason: `${c.kind}: ${(c.msg || message).slice(0, 180)}`,
+            })
+            .catch(() => {})
+        }
+        lastError = {
+          status: clientStatusFor(peStatus || 502, c.kind),
+          message: `${c.kind}: ${c.msg || message}`,
+          kind: c.kind,
+        }
+        // 业务码判出来的「不可换号」类（如渠道拦截 / 参数错）立刻停，
+        // 否则会白换号并放大风控。
+        if (!pm.rotate) break
+        continue
+      }
+
       lastError = { status: 502, message }
       // 传输层失败：换号可能有用（也可能是本地出口抖动）
       continue
@@ -1644,7 +1724,7 @@ export async function handleProviderChat(input: {
             return {
               response: await streamResponse(retry.body, {
                 onFirstChunk: () => {
-                  const t = pool.noteSuccess(picked.uid, Date.now()).catch(() => {})
+                  const t = pool.noteSuccess(picked.uid, Date.now(), undefined, model).catch(() => {})
                   if (ctx !== undefined) ctx.waitUntil(t)
                   // 会话粘性：首帧到达即绑定，后续轮次优先落同一账号
                   if (sessionKey !== '' && ctx !== undefined) {
@@ -1826,6 +1906,7 @@ export async function handleProviderChat(input: {
       const resolvedResetAt = refined.resetAt ?? (retryAfterMs === undefined ? undefined : Date.now() + retryAfterMs)
 
       if (mapped.punish) {
+        const cause = modelCauseFor(kind)
         await pool
           .applyFailure({
             uid: picked.uid,
@@ -1834,6 +1915,7 @@ export async function handleProviderChat(input: {
             ...(model !== '' ? { model } : {}),
             ...(resolvedResetAt !== undefined ? { resetAt: resolvedResetAt } : {}),
             reason: `${providerId} sse: ${(msg || errText).slice(0, 160)}`,
+            ...(cause !== undefined ? { modelCause: cause } : {}),
           })
           .catch(() => {})
       }
@@ -1920,7 +2002,7 @@ export async function handleProviderChat(input: {
         //（否则用户的取消动作会熔断健康账号，见 `nonStreamingResponse` 的说明）。
         clientGone: () => request.signal.aborted,
         onFirstChunk: () => {
-          const t = pool.noteSuccess(picked.uid, Date.now()).catch(() => {})
+          const t = pool.noteSuccess(picked.uid, Date.now(), undefined, model).catch(() => {})
           if (ctx !== undefined) ctx.waitUntil(t)
         },
         onError: (message) => {
@@ -2491,7 +2573,7 @@ async function handleAggregateChat(input: {
   }
 
   // 逐个候选试。**只在「还没输出内容就失败」时换下一个**。
-  let lastError: { status: number; message: string } | undefined
+  let lastError: { status: number; message: string; kind?: string } | undefined
   const tried: string[] = []
   for (const c of ranked) {
     // ⚠️ 把请求体里的 `model` 换成**该渠道的真实 id**再派发。
