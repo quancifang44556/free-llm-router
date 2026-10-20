@@ -199,6 +199,12 @@ test('startServer：HTTP 服务端启动、健康检查与面板可访问性', a
     assert.equal(loginRes.status, 302)
     assert.equal(loginRes.headers.get('location'), '/panel/')
     assert.equal((await fetch(`${baseUrl}/panel/nope.js`)).status, 404)
+    // 3c. 面板资源在 Node 直连时也要 gzip（Workers 由边缘压缩）；fetch 会自动解压，内容不变
+    assert.equal(panelRes.headers.get('content-encoding'), 'gzip')
+    assert.equal(cssRes.headers.get('content-encoding'), 'gzip')
+    const plain = await fetch(`${baseUrl}${cssPath}`, { headers: { 'accept-encoding': 'identity' } })
+    assert.equal(plain.headers.get('content-encoding'), null, '不接受 gzip 的客户端拿原文')
+    assert.equal((await plain.text()).length > 1000, true)
 
     // 4. /v1/models 无 Authorization 应返回 401
     const unauthRes = await fetch(`${baseUrl}/v1/models`)
@@ -209,6 +215,7 @@ test('startServer：HTTP 服务端启动、健康检查与面板可访问性', a
       headers: { authorization: 'Bearer test-secret-key-12345' },
     })
     assert.equal(authRes.status, 200)
+    assert.equal(authRes.headers.get('content-encoding'), null, 'API 响应不压缩（SSE 不能被缓冲）')
     const modelsJson = (await authRes.json()) as any
     assert.ok(Array.isArray(modelsJson?.data))
   } finally {

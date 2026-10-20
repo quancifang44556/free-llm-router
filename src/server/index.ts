@@ -11,10 +11,14 @@
  * 4. **后台常驻 Cron 定时任务**：模拟 Cloudflare Cron Triggers，默认每整点分发任务，
  *    并在服务启动时自动从 SQLite 恢复未结任务（Alarm）。
  * 5. **优雅停机（Graceful Shutdown）**：捕获 SIGINT/SIGTERM，平稳关闭 HTTP 连接并落盘 SQLite。
+ * 6. **面板静态资源 gzip**：Workers 由 Cloudflare 边缘自动压缩，Node 直连时没人压 ——
+ *    主 bundle 约 500 KB，gzip 后约 160 KB。只压 `/panel/*` 的 200 响应并按路径缓存
+ *   （内容在进程内不变）；API 与 SSE 一律原样透传（压缩会缓冲流式输出）。
  */
 
 import http from 'node:http'
 import { Readable } from 'node:stream'
+import { gzipSync } from 'node:zlib'
 import { createNodeRuntime } from './env.js'
 import worker from '../index.js'
 
@@ -91,6 +95,10 @@ export function startServer(options: ServerOptions = {}) {
     console.error('⚠️ [TaskRunner] 恢复未决任务时发生异常:', err)
   }
 
+  // 面板静态资源的 gzip 缓存（路径 → 压缩后字节）。条目数 = 面板文件数，不会无限增长：
+  // 只缓存 `/panel/*` 下返回 200 的路径，未知路径是 404，不进缓存。
+  const gzipCache = new Map<string, Buffer>()
+
   // 2. 创建 HTTP 服务器
   const server = http.createServer(async (req, res) => {
     const proto = (req.headers['x-forwarded-proto'] as string) || 'http'
@@ -158,6 +166,28 @@ export function startServer(options: ServerOptions = {}) {
         if (cookies.length > 0) {
           res.setHeader('set-cookie', cookies)
         }
+      }
+
+      const pathname = (req.url || '/').split('?')[0] ?? '/'
+      if (
+        response.body &&
+        response.status === 200 &&
+        pathname.startsWith('/panel/') &&
+        !response.headers.has('content-encoding') &&
+        /\bgzip\b/.test(String(req.headers['accept-encoding'] ?? ''))
+      ) {
+        let gz = gzipCache.get(pathname)
+        if (gz === undefined) {
+          gz = gzipSync(Buffer.from(await response.arrayBuffer()))
+          gzipCache.set(pathname, gz)
+        } else {
+          await response.body.cancel()
+        }
+        res.setHeader('content-encoding', 'gzip')
+        res.setHeader('vary', 'accept-encoding')
+        res.setHeader('content-length', gz.length)
+        res.end(gz)
+        return
       }
 
       if (response.body) {
