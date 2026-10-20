@@ -59,26 +59,39 @@ export function translateMaxCompletionTokens(body: Record<string, unknown>): voi
 /**
  * 归一化 `tool_choice`：上游该字段是 **string**，对象形式会 400 `code=11101`。
  *
- * - `'auto'` / `'none'` / `'required'` → 原样透传；
- * - 对象形式（`{type:'function', function:{name}}`）→ 降级为 `'auto'`（**不是**报错：
- *   降级能让请求成功，报错会让整个对话失败。而具名选择在多数客户端里只影响
+ * - `'auto'` / `'none'` / `'required'`（大小写/空白不敏感）→ 规范小写透传；
+ * - 对象 `{type:'none'|'auto'|'required'}` → 同名字符串（Responses / 部分 SDK 的写法）；
+ * - 其余对象形式（含具名函数 `{type:'function', function:{name}}`）→ 降级为 `'auto'`
+ *  （**不是**报错：降级能让请求成功，报错会让整个对话失败。而具名选择在多数客户端里只影响
  *   偏好，不影响正确性）；
  * - 其他未知形态 → 删除该字段（缺省即 `auto`）。
+ *
+ * ⚠️ `none` **只改 tool_choice，不删 tools**：删掉工具声明会让模型拿不到函数签名、
+ * 把调用降级成伪 JSON 文本塞进正文，agent 原地空转（workbuddy2api-hub 踩过的坑）。
  */
 export function normalizeToolChoice(body: Record<string, unknown>): void {
   const choice = body.tool_choice
   if (choice === undefined) return
 
   if (typeof choice === 'string') {
-    if (choice === 'auto' || choice === 'none' || choice === 'required') return
+    const v = choice.trim().toLowerCase()
+    if (v === 'auto' || v === 'none' || v === 'required') {
+      if (v !== choice) body.tool_choice = v
+      return
+    }
     // 未知字符串：删掉（缺省即 auto），比传给上游被拒好
     delete body.tool_choice
     return
   }
 
-  // 对象形式（含具名函数）：降级为 auto
+  if (choice !== null && typeof choice === 'object' && !Array.isArray(choice)) {
+    const t = (choice as Record<string, unknown>).type
+    const v = typeof t === 'string' ? t.trim().toLowerCase() : ''
+    body.tool_choice = v === 'none' || v === 'required' ? v : 'auto'
+    return
+  }
+
   delete body.tool_choice
-  body.tool_choice = 'auto'
 }
 
 /**
@@ -91,24 +104,266 @@ export function ensureStreamOptions(body: Record<string, unknown>): void {
   body.stream_options = { include_usage: true }
 }
 
+type Msg = Record<string, unknown>
+
+function isObj(v: unknown): v is Msg {
+  return v !== null && typeof v === 'object' && !Array.isArray(v)
+}
+
+/** assistant 消息「没有正文」：`undefined` / `null` / `''` / `[]` 都算（各家客户端写法不一）。 */
+function isEmptyContent(value: unknown): boolean {
+  if (value === undefined || value === null) return true
+  if (typeof value === 'string') return value === ''
+  if (Array.isArray(value)) return value.length === 0
+  return false
+}
+
+/** 把 `src.reasoning_content` 并进 `dst`（两边都有时换行拼接）。就地改 `dst`（调用方保证它是副本）。 */
+function mergeReasoningContent(dst: Msg, src: Msg): void {
+  const rc = src.reasoning_content
+  if (typeof rc !== 'string' || rc === '') return
+  const prev = dst.reasoning_content
+  dst.reasoning_content = typeof prev === 'string' && prev !== '' ? `${prev}\n${rc}` : rc
+}
+
 /**
- * 工具配对清理：剔除「孤儿」`tool` 消息与不完整的 `tool_calls`。
+ * 单个 assistant 的 `tool_calls` 逐项修整：
+ * - 剔除**名字为空**的调用（Go 侧记录过它跨 provider 传染，上游报 11133 且不指出字段）；
+ * - `function.arguments` 不是字符串时序列化成 JSON 字符串，缺省补 `"{}"`
+ *  （上游 Go 结构体把它定死为 string，传对象/数组/数字会 400 `code=11101`）。
+ *
+ * @returns 修整后的数组；无改动时返回 `undefined`
+ */
+function fixToolCalls(calls: unknown[]): unknown[] | undefined {
+  let changed = false
+  const out: unknown[] = []
+  for (const call of calls) {
+    if (!isObj(call)) {
+      changed = true
+      continue
+    }
+    const fn = call.function
+    if (!isObj(fn)) {
+      changed = true
+      continue
+    }
+    const name = fn.name
+    if (typeof name !== 'string' || name === '') {
+      changed = true
+      continue
+    }
+    const args = fn.arguments
+    if (typeof args === 'string') {
+      out.push(call)
+      continue
+    }
+    let text: string
+    if (args === undefined || args === null) {
+      text = '{}'
+    } else {
+      try {
+        text = JSON.stringify(args) ?? '{}'
+      } catch {
+        text = String(args)
+      }
+    }
+    changed = true
+    out.push({ ...call, function: { ...fn, arguments: text } })
+  }
+  return changed ? out : undefined
+}
+
+/**
+ * 合并**相邻**的 assistant `tool_calls` 消息（移植自 workbuddy2api-hub `merge_adjacent_tool_calls`）。
+ *
+ * 部分 agent 客户端把一批并行调用回放成**多条相邻 assistant**、每条只带一个 tool_call。
+ * DeepSeek 系上游对这种形状回 400 `code=11148`（tool_call_sequence_broken），
+ * 且每次重试都回放同样的历史 ⇒ 整条会话报废，换号也没用。
+ *
+ * 条件刻意收得很窄（不发明语义）：
+ * - 形态 1：本条带 tool_calls 且**无正文**，前一条是带 tool_calls 的 assistant ⇒ 调用并入前一条；
+ * - 形态 2：本条**不带** tool_calls、正文是非空字符串，前一条是带 tool_calls 且**无正文**的 assistant
+ *   ⇒ 正文并入前一条（同一批被按另一种顺序拆开回放）。
+ * 两种形态都保留 `reasoning_content`（DeepSeek 多轮思考要求原样带回）。
+ */
+export function mergeAdjacentToolCalls(messages: unknown[]): unknown[] {
+  if (messages.length < 2) return messages
+  const out: unknown[] = []
+  let changed = false
+  for (const m of messages) {
+    const prev = out.length > 0 ? out[out.length - 1] : undefined
+    if (isObj(m) && m.role === 'assistant' && isObj(prev) && prev.role === 'assistant') {
+      const calls = m.tool_calls
+      const prevCalls = prev.tool_calls
+      // 形态 1
+      if (Array.isArray(calls) && calls.length > 0 && isEmptyContent(m.content)
+        && Array.isArray(prevCalls) && prevCalls.length > 0) {
+        const merged: Msg = { ...prev, tool_calls: [...prevCalls, ...calls] }
+        mergeReasoningContent(merged, m)
+        out[out.length - 1] = merged
+        changed = true
+        continue
+      }
+      // 形态 2
+      if (!('tool_calls' in m) && typeof m.content === 'string' && m.content !== ''
+        && Array.isArray(prevCalls) && prevCalls.length > 0 && isEmptyContent(prev.content)) {
+        const merged: Msg = { ...prev, content: m.content }
+        mergeReasoningContent(merged, m)
+        out[out.length - 1] = merged
+        changed = true
+        continue
+      }
+    }
+    out.push(m)
+  }
+  return changed ? out : messages
+}
+
+/**
+ * 让一批 tool 结果**紧跟**发起它的 assistant（移植自 workbuddy2api-hub `repack_tool_result_blocks`）。
+ *
+ * 上游要求 `role:'tool'` 结果紧跟请求它们的 assistant，中间不能夹别的消息。
+ * 典型反例：Codex 的 `image_resize_notice` 以 developer 消息插在工具输出之后 ——
+ * 并行调用时它落在两条结果之间 ⇒ 上游判配对断裂 ⇒ 400 `code=11148`，整条会话报废。
+ *
+ * 只**重排**：结果原样、相对顺序不变，插队的消息挪到整批结果之后。
+ */
+export function repackToolResultBlocks(messages: unknown[]): unknown[] {
+  if (messages.length < 3) return messages
+  const out: unknown[] = []
+  let changed = false
+  let i = 0
+  while (i < messages.length) {
+    const m = messages[i]
+    if (!isObj(m) || m.role !== 'assistant' || !Array.isArray(m.tool_calls) || m.tool_calls.length === 0) {
+      out.push(m)
+      i += 1
+      continue
+    }
+    const want = new Set<string>()
+    for (const tc of m.tool_calls as unknown[]) {
+      if (isObj(tc) && typeof tc.id === 'string' && tc.id !== '') want.add(tc.id)
+    }
+    out.push(m)
+    i += 1
+    const results: unknown[] = []
+    const between: unknown[] = []
+    while (i < messages.length) {
+      const mm = messages[i]
+      if (!isObj(mm)) break
+      if (mm.role === 'tool') {
+        const id = mm.tool_call_id
+        if (!(typeof id === 'string' && want.has(id))) break
+        results.push(mm)
+        i += 1
+        continue
+      }
+      // 任何 assistant 都结束这一批
+      if (mm.role === 'assistant') break
+      // 非结果消息只有在**后面还有本批结果**时才算「插队者」（挪到整批之后）；
+      // 否则是正常的后续消息，原样留给外层循环
+      let j = i
+      while (j < messages.length) {
+        const nx = messages[j]
+        if (!isObj(nx) || nx.role === 'tool' || nx.role === 'assistant') break
+        j += 1
+      }
+      const nx = messages[j]
+      const moreResults =
+        isObj(nx) && nx.role === 'tool' && typeof nx.tool_call_id === 'string' && want.has(nx.tool_call_id)
+      if (!moreResults) break
+      for (; i < j; i += 1) between.push(messages[i])
+    }
+    if (results.length > 0) {
+      out.push(...results, ...between)
+      if (between.length > 0) changed = true
+    } else {
+      out.push(...between)
+    }
+  }
+  return changed ? out : messages
+}
+
+/**
+ * 两侧同时剪孤儿（移植自 workbuddy2api-hub `cleanup_orphan_tool_calls`）：
+ * - 没有结果的 tool_call 删掉（工具调用失败/超时后客户端**永远不会**补结果，
+ *   但这条声明会跟着历史每轮重发，上游每轮都 400 `code=11148`）；
+ * - 没有声明的 tool 结果删掉。
+ *
+ * 两侧按**同一个 id 交集**修剪，不会留下半个配对。
+ */
+export function cleanupOrphanToolCalls(messages: unknown[]): unknown[] {
+  const callIds = new Set<string>()
+  const resultIds = new Set<string>()
+  let sawTool = false
+  for (const m of messages) {
+    if (!isObj(m)) continue
+    if (m.role === 'tool') {
+      sawTool = true
+      const id = m.tool_call_id
+      if (typeof id === 'string' && id !== '') resultIds.add(id)
+    } else if (m.role === 'assistant' && Array.isArray(m.tool_calls)) {
+      for (const tc of m.tool_calls as unknown[]) {
+        if (isObj(tc) && typeof tc.id === 'string' && tc.id !== '') callIds.add(tc.id)
+      }
+    }
+  }
+  if (!sawTool && callIds.size === 0) return messages
+
+  let changed = false
+  const out: unknown[] = []
+  for (const m of messages) {
+    if (!isObj(m)) {
+      out.push(m)
+      continue
+    }
+    if (m.role === 'tool') {
+      const id = m.tool_call_id
+      if (typeof id === 'string' && callIds.has(id) && resultIds.has(id)) {
+        out.push(m)
+      } else {
+        changed = true
+      }
+      continue
+    }
+    if (m.role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls.length > 0) {
+      const calls = m.tool_calls as unknown[]
+      const kept = calls.filter((tc) => isObj(tc) && typeof tc.id === 'string' && resultIds.has(tc.id))
+      if (kept.length !== calls.length) {
+        changed = true
+        const copy: Msg = { ...m }
+        if (kept.length > 0) copy.tool_calls = kept
+        else delete copy.tool_calls
+        out.push(copy)
+        continue
+      }
+    }
+    out.push(m)
+  }
+  return changed ? out : messages
+}
+
+/**
+ * 工具配对修复：developer 角色处理 + tool_call 修整 + 相邻合并 + 结果重排 + 两侧剪孤儿。
  *
  * ## 为什么必须做（Go 侧 `tool_pairing.go` 记录的严重缺陷）
  *
  * OpenAI 规范要求每个 `role:'tool'` 消息都有一个**前序** assistant 消息里的
- * `tool_calls` 与之配对（靠 `tool_call_id`）。
+ * `tool_calls` 与之配对（靠 `tool_call_id`），且结果紧跟调用。
  *
- * 若配对不完整，上游会**对之后每条消息都返 400** ——
+ * 若配对不完整，上游会**对之后每条消息都返 400**（`code=11148`）——
  * 也就是整条会话报废，且错误信息不指出是哪个字段。
  *
- * 客户端在中断/重试/切模型时很容易产生孤儿 tool 消息，故必须先行清理。
+ * 客户端在中断/重试/切模型/工具失败时很容易产生这类历史，故必须先行修复。
+ * 合并 / 重排 / 两侧剪孤儿三步移植自 ardeyouxipianyi/workbuddy2api-hub（MIT）。
+ *
+ * ⚠️ **不修改入参**：要改的消息一律复制后再改（重试会复用同一份请求体）。
  *
  * @returns 清理后的消息数组（无改动时返回原数组）
  */
 export function cleanupToolPairing(messages: unknown[]): unknown[] {
   // ⚡ 性能快判：如果消息历史中完全没有 developer、tool 角色，也没有任何 tool_calls，
-  // 直接原样返回，彻底免除 Set 实例化、双重扫描与新数组内存分配（长对话省下数毫秒 CPU）。
+  // 直接原样返回，彻底免除双重扫描与新数组内存分配（长对话省下数毫秒 CPU）。
   let needsScan = false
   for (const raw of messages) {
     if (raw !== null && typeof raw === 'object') {
@@ -121,103 +376,444 @@ export function cleanupToolPairing(messages: unknown[]): unknown[] {
   }
   if (!needsScan) return messages
 
-  // 第一遍：收集所有 assistant 消息声明的 tool_call id
-  const declared = new Set<string>()
-  for (const raw of messages) {
-    if (raw === null || typeof raw !== 'object') continue
-    const msg = raw as Record<string, unknown>
-    if (msg.role !== 'assistant') continue
-    const calls = msg.tool_calls
-    if (!Array.isArray(calls)) continue
-    for (const call of calls) {
-      if (call === null || typeof call !== 'object') continue
-      const id = (call as Record<string, unknown>).id
-      if (typeof id === 'string' && id !== '') declared.add(id)
-    }
-  }
-
-  const out: unknown[] = []
+  let out: unknown[] = []
   let changed = false
 
   for (const raw of messages) {
-    if (raw === null || typeof raw !== 'object') {
+    if (!isObj(raw)) {
       out.push(raw)
       continue
     }
-    const msg = raw as Record<string, unknown>
+    const msg = raw
 
-    // ⚠️ **丢弃 `role: 'developer'` 消息**（实测缺陷，用户报两处 11128）。
-    //
-    // ## 为什么必须丢
+    // ⚠️ **处理 `role: 'developer'` 消息**（实测缺陷，用户报两处 11128）。
     //
     // OpenAI 的**新**规范引入了 `developer` 角色，而**上游只认**
     // `system` / `user` / `assistant` / `tool`。
     // 实测：pi（`pi-coding-agent`）把系统提示词放在
     // `{role:'developer', content:'You are an expert coding assistant…'}` 里，
-    // 我们原样转发 ⇒ 上游判定「首条不是 system」⇒ 国际版回
-    // `11128 Illegal API invocation from an unapproved channel`
-    //（而 `displayMsg` 把它**伪装成「安全策略拦截」**，极易误判成账号被封）。
+    // 原样转发 ⇒ 上游判定「首条不是 system」⇒ 国际版回
+    // `11128 Illegal API invocation from an unapproved channel`。
     //
-    // ## 为什么是「丢弃」而不是「改名为 system」
-    //
-    // 参考实现（`deepseek-harness-codearts/src/message-shape.ts:99,125`）的做法
-    // 就是**丢弃**，理由写得明确：
-    // > `role:'developer'` 只承载工具增删元数据（`tool-addition` / `tool-removal`），
-    // > 不是对话内容。
-    //
-    // ⚠️ 而 pi 那条 developer **确实承载了系统提示词**，丢掉会让模型失去行为约束。
-    // 故这里比参考实现**多做一步**：内容非空时**降级为 `system`**（保住语义），
-    // 只有空内容才真正丢弃。这样两种来源（元数据 / 真提示词）都得到正确处理。
+    // 内容非空时**降级为 `system`**（保住提示词语义），只有空内容（纯元数据，如
+    // `tool-addition` / `tool-removal`）才真正丢弃。
     if (msg.role === 'developer') {
       const content = msg.content
       const text = typeof content === 'string'
         ? content
         : Array.isArray(content)
-          ? content.map((b) => {
-              const o = b as Record<string, unknown> | null
-              return o !== null && typeof o === 'object' && typeof o.text === 'string' ? o.text : ''
-            }).join('')
+          ? content.map((b) => (isObj(b) && typeof b.text === 'string' ? b.text : '')).join('')
           : ''
       changed = true
       if (text.trim() === '') continue // 纯元数据 ⇒ 丢弃
-      // 有真实内容 ⇒ 降级为 system（保住提示词语义）
       out.push({ role: 'system', content: msg.content })
       continue
     }
 
-    // 剔除孤儿 tool 消息（tool_call_id 未被子集声明）
-    if (msg.role === 'tool') {
-      const id = msg.tool_call_id
-      if (typeof id !== 'string' || id === '' || !declared.has(id)) {
-        changed = true
-        continue // 丢弃
-      }
-    }
-
-    // 剔除 assistant 消息里**名字为空**的 tool_call（Go 侧记录过它跨 provider 传染）
     if (msg.role === 'assistant' && Array.isArray(msg.tool_calls)) {
-      const kept = (msg.tool_calls as unknown[]).filter((call) => {
-        if (call === null || typeof call !== 'object') return false
-        const c = call as Record<string, unknown>
-        const fn = c.function
-        if (fn === null || typeof fn !== 'object') return false
-        const name = (fn as Record<string, unknown>).name
-        // ⚠️ 名称为空的 tool_call 会让整条会话报废（上游报 11133 且不指出字段）
-        return typeof name === 'string' && name !== ''
-      })
-      if (kept.length !== msg.tool_calls.length) {
+      const fixed = fixToolCalls(msg.tool_calls as unknown[])
+      if (fixed !== undefined) {
         changed = true
-        if (kept.length === 0) {
-          delete msg.tool_calls
-        } else {
-          msg.tool_calls = kept
-        }
+        const copy: Msg = { ...msg }
+        if (fixed.length > 0) copy.tool_calls = fixed
+        else delete copy.tool_calls
+        out.push(copy)
+        continue
       }
     }
 
     out.push(msg)
   }
 
+  // ⚠️ 顺序即语义：先合并拆开的声明（重排才看得到完整的一批），再重排，最后剪孤儿。
+  for (const step of [mergeAdjacentToolCalls, repackToolResultBlocks, cleanupOrphanToolCalls]) {
+    const next = step(out)
+    if (next !== out) {
+      changed = true
+      out = next
+    }
+  }
+
+  return changed ? out : messages
+}
+
+/** 模型裸名（去掉 `provider/` 前缀，小写）。 */
+function bareModel(model: unknown): string {
+  if (typeof model !== 'string') return ''
+  const i = model.lastIndexOf('/')
+  return (i >= 0 ? model.slice(i + 1) : model).trim().toLowerCase()
+}
+
+/**
+ * DeepSeek 本轮是否处于**思考模式**（口径同 workbuddy2api-hub `build_upstream_body`）：
+ * `thinking.type === 'enabled'`，或没有显式关闭（`type !== 'disabled'` 且 `reasoning_effort !== 'none'`）。
+ */
+export function isDeepseekThinking(body: Record<string, unknown>): boolean {
+  if (!bareModel(body.model).startsWith('deepseek')) return false
+  const thinking = body.thinking
+  const type = isObj(thinking) && typeof thinking.type === 'string' ? thinking.type.trim().toLowerCase() : ''
+  if (type === 'enabled') return true
+  const effort = body.reasoning_effort ?? body.reasoningEffort
+  const effortText = typeof effort === 'string' ? effort.trim().toLowerCase() : ''
+  return type !== 'disabled' && effortText !== 'none'
+}
+
+/**
+ * DeepSeek 多轮一致性：给每条 assistant 补 `reasoning_content`（移植自 workbuddy2api-hub）。
+ *
+ * 上游在思考模式下要求每条 assistant 都带回 `reasoning_content` 字符串，否则 400
+ * `code=11155`（the reasoning content from the previous turn must be passed back in thinking mode）。
+ * 第三方客户端普遍**不回传**思考内容（本项目的 Responses 转换也刻意丢弃 reasoning 项）。
+ *
+ * - 触发：DeepSeek 模型，且思考模式开启**或**历史里已有思考痕迹；
+ * - `reasoning_content` 不是字符串时补成 `reasoning`（若有）或 `''`；
+ * - 上游还校验 `reasoning` 非空 ⇒ 镜像到 `reasoning`，空时用一个空格占位（不带任何语义）。
+ */
+export function backfillReasoningContent(messages: unknown[], model: unknown, thinkingEnabled: boolean): unknown[] {
+  if (!bareModel(model).startsWith('deepseek')) return messages
+  let hasTrace = false
+  for (const m of messages) {
+    if (!isObj(m)) continue
+    if ((typeof m.reasoning === 'string' && m.reasoning !== '') || 'reasoning_content' in m) {
+      hasTrace = true
+      break
+    }
+  }
+  if (!thinkingEnabled && !hasTrace) return messages
+
+  let changed = false
+  const out = messages.map((m) => {
+    if (!isObj(m) || m.role !== 'assistant') return m
+    let rc = m.reasoning_content
+    const needRc = typeof rc !== 'string'
+    if (needRc) rc = typeof m.reasoning === 'string' ? m.reasoning : ''
+    const needMirror = !(typeof m.reasoning === 'string' && m.reasoning !== '')
+    if (!needRc && !needMirror) return m
+    changed = true
+    const item: Msg = { ...m, reasoning_content: rc }
+    if (needMirror) item.reasoning = rc !== '' ? rc : ' '
+    return item
+  })
+  return changed ? out : messages
+}
+
+/**
+ * `stop` 归一化：字符串 → 单元素数组（移植自 workbuddy2api-hub `normalize_stop`）。
+ *
+ * OpenAI 允许 `string | string[]`，上游 Go 端却定死为 `[]string`：
+ * `"stop":"END"` ⇒ 400 `code=11101`，`"stop":["END"]` ⇒ 200。语义完全等价。
+ * 空串 / 空数组 / null / 非法类型一律删字段（含义都是「没有停止序列」）。
+ *
+ * @returns 是否改动
+ */
+export function normalizeStop(body: Record<string, unknown>): boolean {
+  if (!('stop' in body)) return false
+  const val = body.stop
+  if (Array.isArray(val) && val.length > 0 && val.every((s) => typeof s === 'string' && s !== '')) return false
+  const list = typeof val === 'string'
+    ? (val === '' ? [] : [val])
+    : Array.isArray(val)
+      ? val.filter((s): s is string => typeof s === 'string' && s !== '')
+      : []
+  if (list.length > 0) body.stop = list
+  else delete body.stop
+  return true
+}
+
+/**
+ * GPT 系上游要求输出上限 ≥ 16，更小（探针常用 `max_tokens:1`）会 400 `integer_below_min_value`。
+ *
+ * @returns 是否改动
+ */
+export function clampGptMaxTokens(body: Record<string, unknown>): boolean {
+  if (!bareModel(body.model).startsWith('gpt-')) return false
+  const mt = body.max_tokens
+  if (typeof mt !== 'number' || !Number.isFinite(mt) || mt >= 16) return false
+  body.max_tokens = 16
+  return true
+}
+
+const SCHEMA_TYPE_ALIAS: Record<string, string> = {
+  str: 'string',
+  text: 'string',
+  int: 'integer',
+  bool: 'boolean',
+  dict: 'object',
+  list: 'array',
+  float: 'number',
+}
+const SCHEMA_VALID_TYPES = new Set(['string', 'number', 'integer', 'boolean', 'array', 'object', 'null'])
+const SCHEMA_NULLABLE_META = ['description', 'title', 'format', 'pattern', 'items', 'default']
+
+/**
+ * 递归修 JSON Schema（就地；调用方传入的是副本）。上游 Go 校验器很严：
+ * `null` 的 description/title、`str`/`int` 这类别名类型、缺 `properties` 的 object、
+ * 含 null 的 `required`、元组形式的 `items` 都会 400 `code=11129`。
+ *
+ * 只修**不合法**的部分，合规字段原样保留。
+ */
+function normalizeSchema(s: Msg, mark: () => void): void {
+  for (const k of SCHEMA_NULLABLE_META) {
+    if (k in s && s[k] === null) {
+      delete s[k]
+      mark()
+    }
+  }
+
+  if ('type' in s) {
+    const typ = s.type
+    if (typeof typ === 'string') {
+      const lower = typ.trim().toLowerCase()
+      const alias = SCHEMA_TYPE_ALIAS[lower]
+      const next = alias ?? (SCHEMA_VALID_TYPES.has(lower) ? lower : undefined)
+      if (next === undefined) {
+        mark()
+        if ('properties' in s) s.type = 'object'
+        else if ('items' in s) s.type = 'array'
+        else delete s.type
+      } else if (next !== typ) {
+        s.type = next
+        mark()
+      }
+    } else if (Array.isArray(typ)) {
+      const list = typ.filter((t) => t !== null && t !== undefined && t !== '').map((t) => {
+        const lower = String(t).toLowerCase()
+        return SCHEMA_TYPE_ALIAS[lower] ?? lower
+      })
+      if (list.length !== typ.length || list.some((t, i) => t !== typ[i])) {
+        s.type = list
+        mark()
+      }
+    }
+  }
+
+  if (s.type === 'object' || ('properties' in s && s.type === undefined)) {
+    if (s.type === undefined) {
+      s.type = 'object'
+      mark()
+    }
+    if (!isObj(s.properties)) {
+      s.properties = {}
+      mark()
+    }
+  }
+
+  if ('required' in s) {
+    const req = s.required
+    if (Array.isArray(req)) {
+      const cleaned = req.filter((x): x is string => typeof x === 'string' && x.trim() !== '')
+      if (cleaned.length === 0) {
+        delete s.required
+        mark()
+      } else if (cleaned.length !== req.length) {
+        s.required = cleaned
+        mark()
+      }
+    } else if (typeof req === 'string' && req.trim() !== '') {
+      s.required = [req.trim()]
+      mark()
+    } else {
+      delete s.required
+      mark()
+    }
+  }
+
+  if ('items' in s) {
+    const items = s.items
+    if (Array.isArray(items)) {
+      const first = items.find(isObj)
+      s.items = first !== undefined ? { ...first } : { type: 'string' }
+      mark()
+      if (isObj(s.items)) normalizeSchema(s.items, mark)
+    } else if (isObj(items)) {
+      normalizeSchema(items, mark)
+    }
+  }
+
+  if (isObj(s.properties)) {
+    for (const v of Object.values(s.properties)) if (isObj(v)) normalizeSchema(v, mark)
+  }
+  for (const key of ['$defs', 'definitions']) {
+    const defs = s[key]
+    if (isObj(defs)) for (const v of Object.values(defs)) if (isObj(v)) normalizeSchema(v, mark)
+  }
+  for (const key of ['anyOf', 'oneOf', 'allOf']) {
+    const list = s[key]
+    if (Array.isArray(list)) for (const v of list) if (isObj(v)) normalizeSchema(v, mark)
+  }
+}
+
+/** 修一个 function 定义的 `parameters`（返回新对象；无改动返回原对象）。 */
+function normalizeFunctionDef(fn: Msg): Msg {
+  const params = fn.parameters
+  if (!isObj(params)) return { ...fn, parameters: { type: 'object', properties: {} } }
+  let changed = false
+  const mark = (): void => {
+    changed = true
+  }
+  const p = structuredClone(params) as Msg
+  if (p.type !== 'object') {
+    p.type = 'object'
+    mark()
+  }
+  if (!isObj(p.properties)) {
+    p.properties = {}
+    mark()
+  }
+  normalizeSchema(p, mark)
+  return changed ? { ...fn, parameters: p } : fn
+}
+
+/**
+ * 工具声明归一化（移植自 workbuddy2api-hub `normalize_tools`，避免 400 `code=11129`）：
+ * - 老客户端的根级 `functions` → `tools`；
+ * - 顶层 `{name, description, parameters}` 写法包成 `{type:'function', function:{…}}`；
+ * - `parameters` 缺失/非对象 → 空 object schema；不合法的 schema 递归修复；
+ * - 既无 `function` 也无 `name` 的条目（如 Responses 的内置工具）丢弃 —— 上游只认 function 工具；
+ * - 修完为空则删掉 `tools`。
+ *
+ * @returns 是否改动
+ */
+export function normalizeTools(body: Record<string, unknown>): boolean {
+  let changed = false
+  if ('functions' in body && !('tools' in body)) {
+    const funcs = body.functions
+    delete body.functions
+    changed = true
+    if (Array.isArray(funcs)) body.tools = funcs.filter(isObj).map((f) => ({ type: 'function', function: f }))
+  }
+  if (!('tools' in body)) return changed
+  const tools = body.tools
+  if (!Array.isArray(tools) || tools.length === 0) {
+    delete body.tools
+    return true
+  }
+  const norm: unknown[] = []
+  for (const t of tools) {
+    if (!isObj(t)) {
+      changed = true
+      continue
+    }
+    if (!isObj(t.function)) {
+      if (typeof t.name !== 'string' || t.name === '') {
+        changed = true
+        continue
+      }
+      const fn: Msg = {
+        name: t.name,
+        description: typeof t.description === 'string' ? t.description : '',
+        parameters: t.parameters ?? {},
+      }
+      if ('strict' in t) fn.strict = t.strict
+      norm.push({ type: 'function', function: normalizeFunctionDef(fn) })
+      changed = true
+      continue
+    }
+    const fn = normalizeFunctionDef(t.function)
+    if (fn !== t.function || t.type !== 'function') {
+      norm.push({ ...t, type: 'function', function: fn })
+      changed = true
+    } else {
+      norm.push(t)
+    }
+  }
+  if (norm.length > 0) body.tools = norm
+  else delete body.tools
+  return changed
+}
+
+// ── 客户端指纹脱敏（移植自 workbuddy2api-hub `sanitize_text`） ──
+//
+// 上游 WAF 对几段**特定客户端**的系统提示词原文回 `11128`（unapproved channel）。
+// 改写刻意收得很窄：只动已确认的指纹短语，不删 agent 身份与行为约束。
+const FINGERPRINT_LITERALS = [
+  'x-anthropic-billing-header',
+  'cc_entrypoint=',
+  'You are Claude Code',
+  'Main branch (',
+  'You are a coding agent running in the Codex CLI',
+  'github.com/anthropics/',
+]
+const FINGERPRINT_CI = /x-anthropic-billing-header|Sisyphus-Junior - Focused executor from OhMyOpenCode/i
+const FINGERPRINT_REWRITES: ReadonlyArray<readonly [string, string]> = [
+  ["You are Claude Code, Anthropic's official CLI for Claude", "You are Claude Code, Anthropic's official CLI tool for Claude"],
+  ['Main branch (you will usually use this for PRs)', 'Default branch (you will usually use this for PRs)'],
+  [
+    'You are a coding agent running in the Codex CLI, a terminal-based coding assistant.',
+    'You are a coding agent running in the Codex CLI tool, a terminal-based coding assistant.',
+  ],
+  [
+    'To give feedback, users should report the issue at https://github.com/anthropics/claude-code/issues',
+    'To provide feedback, users should report the issue at https://github.com/anthropics/claude-code/issues',
+  ],
+]
+const OMO_JUNIOR_RE = /Sisyphus-Junior - Focused executor from OhMyOpenCode/gi
+const BILLING_HDR_RE = /x-anthropic-billing-header:[^;\r\n]*;?\s*/gi
+const BARE_BILLING_HDR_RE = /x-anthropic-billing-header/gi
+const CC_KV_RE = /\bcc_[a-z0-9_]+=[^;\r\n]*;?\s*/gi
+
+function hasFingerprint(text: string): boolean {
+  for (const f of FINGERPRINT_LITERALS) if (text.includes(f)) return true
+  return FINGERPRINT_CI.test(text)
+}
+
+/** 改写一段文本里的客户端指纹（无指纹时原样返回同一字符串）。 */
+export function scrubFingerprintText(text: string): string {
+  if (text === '' || !hasFingerprint(text)) return text
+  let out = text.replace(OMO_JUNIOR_RE, 'Sisyphus-Junior - Focused executor')
+  for (const [from, to] of FINGERPRINT_REWRITES) out = out.replaceAll(from, to)
+  out = out.replace(BILLING_HDR_RE, '')
+  if (out.includes('cc_')) {
+    for (let prev = ''; prev !== out;) {
+      prev = out
+      out = out.replace(CC_KV_RE, '')
+    }
+  }
+  out = out.replace(BARE_BILLING_HDR_RE, 'x-anthropic-billing-hdr')
+  return out.trim()
+}
+
+function scrubContent(content: unknown): unknown {
+  if (typeof content === 'string') return scrubFingerprintText(content)
+  if (!Array.isArray(content)) return content
+  let changed = false
+  const out = content.map((part) => {
+    if (!isObj(part) || part.type !== 'text' || typeof part.text !== 'string') return part
+    const text = scrubFingerprintText(part.text)
+    if (text === part.text) return part
+    changed = true
+    return { ...part, text }
+  })
+  return changed ? out : content
+}
+
+/** 对整段消息历史做指纹脱敏（正文 / 文本分段 / reasoning_content / 工具参数）。无改动返回原数组。 */
+export function scrubFingerprints(messages: unknown[]): unknown[] {
+  let changed = false
+  const out = messages.map((m) => {
+    if (!isObj(m)) return m
+    let item: Msg | undefined
+    const content = scrubContent(m.content)
+    if (content !== m.content) (item ??= { ...m }).content = content
+    if (typeof m.reasoning_content === 'string') {
+      const rc = scrubFingerprintText(m.reasoning_content)
+      if (rc !== m.reasoning_content) (item ??= { ...m }).reasoning_content = rc
+    }
+    if (Array.isArray(m.tool_calls)) {
+      let callsChanged = false
+      const calls = (m.tool_calls as unknown[]).map((tc) => {
+        if (!isObj(tc) || !isObj(tc.function) || typeof tc.function.arguments !== 'string') return tc
+        const args = scrubFingerprintText(tc.function.arguments)
+        if (args === tc.function.arguments) return tc
+        callsChanged = true
+        return { ...tc, function: { ...tc.function, arguments: args } }
+      })
+      if (callsChanged) (item ??= { ...m }).tool_calls = calls
+    }
+    if (item === undefined) return m
+    changed = true
+    return item
+  })
   return changed ? out : messages
 }
 
@@ -231,8 +827,8 @@ export interface PrepareResult {
 /**
  * 完整准备管线。
  *
- * ⚠️ 顺序即语义：先翻译字段名（影响后续判断），再清理工具配对
- * （配对错误会让整个请求失败，必须最先修好内容）。
+ * ⚠️ 顺序即语义：先翻译字段名（影响后续判断），再修消息历史
+ * （配对错误会让整个请求失败，必须修好内容）。
  */
 export function prepareChatBody(input: unknown): PrepareResult {
   if (input === null || typeof input !== 'object' || Array.isArray(input)) {
@@ -252,6 +848,7 @@ export function prepareChatBody(input: unknown): PrepareResult {
     translateMaxCompletionTokens(body)
     applied.push('max_completion_tokens→max_tokens')
   }
+  if (clampGptMaxTokens(body)) applied.push('max_tokens≥16')
 
   // ③ stream_options 补默认
   if (body.stream_options === undefined) {
@@ -261,21 +858,34 @@ export function prepareChatBody(input: unknown): PrepareResult {
 
   // ④ tool_choice 归一化（对象形式会 400）
   if (body.tool_choice !== undefined) {
-    const before = typeof body.tool_choice
+    const before = body.tool_choice
     normalizeToolChoice(body)
-    if (before === 'object') applied.push('tool_choice→auto')
+    if (body.tool_choice !== before) applied.push('tool_choice')
   }
 
-  // ⑤ 工具配对清理（不完整配对会让之后每条消息都 400）
-  if (Array.isArray(body.messages)) {
-    const cleaned = cleanupToolPairing(body.messages)
-    if (cleaned !== body.messages) {
-      body.messages = cleaned
-      applied.push('tool-pairing')
-    }
-  } else {
-    throw new Error('messages 必须是数组')
+  // ⑤ tools / stop 归一化（schema 不合法 11129、stop 字符串 11101）
+  if (normalizeTools(body)) applied.push('tools')
+  if (normalizeStop(body)) applied.push('stop[]')
+
+  // ⑥ 消息历史：指纹脱敏 → 工具配对修复 → DeepSeek 思考回填
+  if (!Array.isArray(body.messages)) throw new Error('messages 必须是数组')
+  let messages = body.messages as unknown[]
+  const scrubbed = scrubFingerprints(messages)
+  if (scrubbed !== messages) {
+    messages = scrubbed
+    applied.push('fingerprint')
   }
+  const cleaned = cleanupToolPairing(messages)
+  if (cleaned !== messages) {
+    messages = cleaned
+    applied.push('tool-pairing')
+  }
+  const backfilled = backfillReasoningContent(messages, body.model, isDeepseekThinking(body))
+  if (backfilled !== messages) {
+    messages = backfilled
+    applied.push('reasoning_content')
+  }
+  body.messages = messages
 
   return { body: JSON.stringify(body), applied }
 }

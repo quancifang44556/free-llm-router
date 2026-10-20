@@ -31,6 +31,9 @@ export interface Env {
   UPSTREAM_CHAT_BASE?: string
   UPSTREAM_BILLING_BASE?: string
   UPSTREAM_WEB_BASE?: string
+
+  /** 国际版每日活跃打卡用的模型（默认 `deepseek-v4.1-flash`，见 `upstream/webagent.ts`）。 */
+  WORKBUDDY_DAILY_CHAT_MODEL?: string
 }
 
 /** CN 域默认上游（与 Go 侧 `internal/upstream/client.go:693-695` 一致）。 */

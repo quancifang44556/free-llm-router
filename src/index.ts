@@ -20,7 +20,8 @@
 
 import { TaskRunnerDO, type RunContext, type TaskStep } from './taskrunner/TaskRunnerDO.js'
 import { AccountPoolDO } from './pool/AccountPoolDO.js'
-import { planByName } from './taskrunner/plans.js'
+import { planByName, type PlanName } from './taskrunner/plans.js'
+import { cstDay } from './upstream/travel.js'
 import { resolveUpstream, type Env } from './env.js'
 import { cliChatHeaders } from './upstream/headers.js'
 import { isValidUid, LOGIN_STATE_TTL_MS, pollLogin, startLogin } from './upstream/auth.js'
@@ -2648,6 +2649,34 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
         results.push({ uid: account.uid, provider: providerId, ok: false, detail: '未知供应商' })
         continue
       }
+      // 国际版没有签到接口：每日活跃积分靠「跑完一条网页端 agent 会话」，
+      // 单个账号就要 ~35 个子请求、十几秒到两分钟 —— 不能在这个请求里串行跑，
+      // 改为**入队 TaskRunner**（每账号独立 alarm 预算），结果见 `/admin/tasks/status`。
+      if (isIntlWorkbuddy(account)) {
+        if (account.lastCheckinDay === cstDay(Date.now())) {
+          results.push({
+            uid: account.uid, provider: providerId, nickname: account.nickname,
+            ok: true, alreadyDone: true, detail: '今日已完成网页端活跃打卡',
+          })
+          continue
+        }
+        try {
+          const r = await startRun(env, {
+            uid: account.uid, nickname: account.nickname, realm: account.realm, accessToken: '', plan: 'intlDaily',
+          })
+          results.push({
+            uid: account.uid, provider: providerId, nickname: account.nickname,
+            ok: true, queued: r.queued,
+            detail: '已入队网页端活跃打卡（约 1–2 分钟跑完，结果见 /admin/tasks/status）',
+          })
+        } catch (error) {
+          results.push({
+            uid: account.uid, provider: providerId, nickname: account.nickname,
+            ok: false, detail: `入队失败：${error instanceof Error ? error.message : String(error)}`,
+          })
+        }
+        continue
+      }
       if (!provider.capabilities.checkin || provider.checkin === undefined) {
         // ⚠️ 显式说明原因，不静默跳过
         results.push({
@@ -3479,7 +3508,7 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
     const body = (await request.json().catch(() => ({}))) as {
       uid?: string
       realm?: string
-      plan?: 'daily' | 'growth'
+      plan?: PlanName
       includeRealChat?: boolean
     }
     if (typeof body.uid !== 'string' || body.uid === '') {
@@ -3508,7 +3537,7 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
       nickname: account.nickname,
       realm: account.realm,
       accessToken: credential.accessToken,
-      plan: planName,
+      plan: planForProvider(account, planName),
       ...(body.includeRealChat === undefined ? {} : { includeRealChat: body.includeRealChat }),
     })
     return json(result)
@@ -3528,7 +3557,7 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
     const body = (await request.json().catch(() => ({}))) as {
       uid?: string
       realm?: string
-      plan?: 'daily' | 'growth'
+      plan?: PlanName
       includeRealChat?: boolean
     }
     if (typeof body.uid !== 'string' || body.uid === '') {
@@ -3552,7 +3581,7 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
       nickname: account.nickname,
       realm: account.realm,
       accessToken: credential.accessToken,
-      plan: body.plan ?? 'daily',
+      plan: planForProvider(account, body.plan ?? 'daily'),
       ...(body.includeRealChat === undefined ? {} : { includeRealChat: body.includeRealChat }),
     })
     return json(result)
@@ -3769,6 +3798,24 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
 }
 
 /**
+ * 按供应商修正计划名：国际版（workbuddy.ai）只有网页端活跃打卡这一个计划
+ *（`daily`/`growth` 全是国内版协议，对它只会白跑一轮失败）。
+ */
+function planForProvider(account: { provider?: string; realm: string }, requested: PlanName): PlanName {
+  return isIntlWorkbuddy(account) ? 'intlDaily' : requested
+}
+
+/**
+ * 是否国际版 workbuddy.ai 账号。
+ *
+ * ⚠️ 必须同时看 realm：升级前的老账号状态缺省 `provider: 'workbuddy'`
+ *（`pool/state.ts::createAccountState`），它们其实是 cn 分片里的国内版账号。
+ */
+function isIntlWorkbuddy(account: { provider?: string; realm: string }): boolean {
+  return account.provider === WORKBUDDY_INTL.id && account.realm === 'global'
+}
+
+/**
  * 把一次运行入队并唤起 alarm。
  *
  * ⚠️ 这里**不等待任务完成** —— 只做入队 + 排 alarm，立刻返回。
@@ -3781,7 +3828,7 @@ async function startRun(
     nickname: string
     realm: string
     accessToken: string
-    plan: 'daily' | 'growth'
+    plan: PlanName
     /** ⚠️ 显式开启才会跑「需要真实对话」的任务（会消耗配额）。 */
     includeRealChat?: boolean
   },
@@ -3815,7 +3862,7 @@ async function startRun(
  * 改时点只改这张表，**不需要重新部署 wrangler 配置**。
  */
 interface ScheduleJob {
-  plan: 'daily' | 'growth'
+  plan: PlanName
   includeRealChat?: boolean
 }
 
@@ -4091,6 +4138,39 @@ async function scheduled(event: ScheduledController, env: Env): Promise<void> {
       console.error(`[cron] 账号 ${account.uid} 入队失败：`, error instanceof Error ? error.message : String(error))
     }
   }
+
+  // 国际版（workbuddy.ai）每日活跃打卡：只在签到时点（9/21）跑，当天已成功的跳过。
+  // 两个时点 = 一次重试机会；按北京时间日去重，无论上游按哪个时区换日都每天至多一次。
+  if (job.plan === 'daily') {
+    try {
+      await fanOutIntlDailyChat(env, now)
+    } catch (error) {
+      console.error('[cron] 国际版活跃打卡扇出失败：', error instanceof Error ? error.message : String(error))
+    }
+  }
+}
+
+/** 给 global 分片里今天还没打卡的 workbuddy 账号入队 `intlDaily`。 */
+async function fanOutIntlDailyChat(env: Env, now: number): Promise<number> {
+  const realm = 'global'
+  const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
+  const accounts = await pool.listAccounts(realm, now)
+  const today = cstDay(now)
+  let queued = 0
+  for (const account of accounts) {
+    if (account.disabled || !isIntlWorkbuddy(account)) continue
+    if (account.lastCheckinDay === today) continue
+    try {
+      await startRun(env, {
+        uid: account.uid, nickname: account.nickname, realm: account.realm, accessToken: '', plan: 'intlDaily',
+      })
+      queued += 1
+    } catch (error) {
+      console.error(`[cron] 国际版账号 ${account.uid} 打卡入队失败：`, error instanceof Error ? error.message : String(error))
+    }
+  }
+  if (queued > 0) console.log(`[cron] 国际版活跃打卡：入队 ${queued} 个账号`)
+  return queued
 }
 
 export default {

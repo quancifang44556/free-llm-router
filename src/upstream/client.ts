@@ -67,6 +67,14 @@ export type ErrorKind =
   | 'session_dead' // 12153 —— **连续 3 次**才禁用
   | 'context_exceeded' // 11115 —— 不罚号、不轮转
   | 'image_invalid' // 11135 —— 不罚号、不轮转
+  /**
+   * 请求**参数/协议形状**被上游拒绝（11101 / 11129 / 11133 / 11148 / 11150 / 11155）。
+   *
+   * 同一份请求换到任何账号都会被同样拒绝 ⇒ **不罚号、不换号**，如实回 400。
+   * ⚠️ 上游有时用 5xx 包这些码；若落进 `server` 会喂熔断，把好账号逐个熔断掉
+   *（workbuddy2api-hub 把它们列为 model-scoped，不计入账号故障）。
+   */
+  | 'bad_request'
   | 'auth_error' // 401 —— 续期凭据后重试
   | 'not_found' // 404 —— 路径不存在（可能需换 fallback 路径）
   | 'already_done' // 幂等命中（如签到 10001）—— 视为成功
@@ -120,6 +128,15 @@ const CODE_KIND: Record<number, ErrorKind> = {
   12153: 'session_dead',
   11115: 'context_exceeded',
   11135: 'image_invalid',
+  // ── 请求形状类（与账号无关，见 `bad_request` 的说明） ──
+  11101: 'bad_request', // 参数反序列化失败（如 stop 传了字符串、arguments 传了对象）
+  11129: 'bad_request', // 工具 schema 不合法
+  11133: 'bad_request', // tool_call 名字为空等
+  11148: 'bad_request', // tool_call 配对/顺序断裂
+  11150: 'bad_request', // reasoning_effort 该模型不支持
+  11155: 'bad_request', // 思考模式下缺上一轮 reasoning_content
+  // 11134「模型供应方暂不可用」：模型级繁忙，与 6004/14003 同档（见 `refineModelScoped`）
+  11134: 'rate_limited',
   // ⚠️ **11128 不是 `request_illegal`**（实测缺陷，用户报「账号是好的但就是用不了」）。
   //
   // 上游原文：`Illegal API invocation from an unapproved channel` /
@@ -351,6 +368,7 @@ export function shouldRotate(kind: ErrorKind): boolean {
     // ⚠️ 参数类错误**不换号**：换号重试会重放同样的非法请求，放大风控。
     case 'context_exceeded':
     case 'image_invalid':
+    case 'bad_request':
     case 'request_illegal':
     // ⚠️ 渠道指纹被拒 ⇒ **不换号**：换号撞的是同一套渠道判定，只会放大风控。
     case 'channel_blocked':
@@ -382,6 +400,7 @@ export function shouldPunish(kind: ErrorKind): boolean {
     case 'not_found':
     case 'context_exceeded':
     case 'image_invalid':
+    case 'bad_request':
     case 'already_done':
     case 'unsupported':
     case 'unknown':

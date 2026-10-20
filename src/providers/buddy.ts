@@ -167,8 +167,8 @@ export const WORKBUDDY_INTL: VariantConfig = {
   requiresSystemFirst: true,
   checkin: false,
   checkinBlockedReason:
-    '国际版没有每日签到积分接口（积分领取在 CodeBuddy 侧完成）——'
-    + '这是上游产品形态，不是本服务的缺失。',
+    '国际版没有签到接口；每日活跃积分改由「网页端活跃打卡」获得'
+    + '（跑完一条网页端 agent 会话，定时任务 9/21 点自动入队，也可 POST /admin/checkin/all 手动入队）。',
 }
 
 /**
@@ -361,7 +361,7 @@ export function buildBuddyProvider(config: VariantConfig, env?: Env): Provider {
    * 每日签到。
    *
    * ⚠️ 只有**国内版**会走到这里（国际版的 `capabilities.checkin` 是 false，
-   * 上游本就没有该接口）。
+   * 上游本就没有该接口；它的每日活跃积分走 `upstream/webagent.ts` 的网页端打卡）。
    *
    * 幂等由上游业务码保证（已签到返回 `10001`/`1001`，映射为 `alreadyDone`）——
    * 故重复点击是安全的。

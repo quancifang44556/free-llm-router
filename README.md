@@ -34,7 +34,7 @@
 
 ## 特性
 
-- **一个入口**：`/v1/models`、`/v1/chat/completions`、`/v1/responses`，支持流式、非流式和工具调用。凡是能填自定义 Base URL 的 OpenAI 客户端都能直接接。
+- **一个入口**：`/v1/models`、`/v1/chat/completions`、`/v1/responses`，支持流式、非流式和工具调用。凡是能填自定义 Base URL 的 OpenAI 客户端都能直接接。出站前自动修好客户端常见的请求体问题（工具调用配对断裂、`tool_choice`/`tools`/`stop` 形态不对、DeepSeek 思考模式缺 `reasoning_content` 等），避免上游 400 让整条会话报废。
 - **15 家供应商**：Buddy、WorkBuddy、Cline、MiniMax、Qoder、TRAE、ZCode、Loomy、Gemini 等。账号可以在面板里用设备码、扫码、短信登录，也可以粘贴凭据导入，系统会自动识别是哪一家。
 - **账号池自动调度**：默认先用积分最早到期的账号。失败时按上游错误类型决定换号、罚号还是只冷却某个模型；国内版账号全部不可用时自动切到国际版。
 - **聚合模型**：`aggregate/<模型名>` 把多家的同一个模型归到一起，优先走积分最快作废的渠道，失败自动换下一家。
@@ -141,7 +141,7 @@ export OPENAI_API_KEY=<API_KEY 或子密钥>
 | id | 名称 | 面板登录 | 每日签到 |
 |---|---|---|---|
 | `buddy` | Buddy（腾讯国内版） | ✅ 设备码 | ✅ |
-| `workbuddy` | WorkBuddy（腾讯国际版） | ✅ 设备码 | ✕ |
+| `workbuddy` | WorkBuddy（腾讯国际版） | ✅ 设备码 | ✅ 活跃打卡 |
 | `cline` | Cline | ✅ 用户码 | ✕ |
 | `minimax` | MiniMax Code（中国版） | ✅ 设备码 | ✅ |
 | `codearts` | CodeArts（华为云码道） | ✕ | ✅ |
@@ -159,6 +159,7 @@ export OPENAI_API_KEY=<API_KEY 或子密钥>
 - **「面板登录」指能不能从本服务发起登录。** 打 ✕ 的一样能用：15 家都支持粘贴凭据导入（单个、数组或 `{"accounts":[...]}` 批量），可以自动识别供应商，也可以用 `"provider":"<id>"` 显式指定。
 - **签到和对话是两回事**：没有签到的供应商照样能正常对话。
 - `buddy` 是默认供应商。为了不抢走别家的凭据，它不参与自动识别。
+- `workbuddy` 没有签到接口，每日活跃积分要靠「跑完一条网页端 agent 会话」：定时器在 09:00、21:00 给当天还没打卡的国际版账号各跑一次 `Hi`，并钉到免费模型 `deepseek-v4.1-flash`（环境变量 `WORKBUDDY_DAILY_CHAT_MODEL` 可改）。`POST /admin/checkin/all`（`realm: "global"`）会把它们入队，结果在 `/admin/tasks/status` 查看。
 - `zcode` 的签到接口总是要求阿里云验证码，所以签到**大概率失败**，系统会如实报错；对话不受影响。
 - 每家的实际能力和「为什么不支持」由 `GET /admin/providers` 返回，面板也是按这个接口渲染的。
 
@@ -387,7 +388,8 @@ probe/             出口 IP 探针（独立 Worker）
 | 6 家不能在面板登录 | codearts、lobsterai、trae、gemini、meoo、opencode 只能导入凭据，原因见[支持的供应商](#支持的供应商) |
 | 流式输出开始后不换号 | 只在输出开始前换号；输出中途上游出错，不会自动换号续写 |
 | zcode 签到大概率失败 | 上游强制阿里云验证码，还会间歇触发风控；对话不受影响 |
-| 5 家没有每日签到 | workbuddy（上游无此接口）、cline（没找到接口）、raccoon（服务端每日自动发放）、gemini（额度按配额比例，不是可领积分）、opencode（没有积分体系） |
+| 4 家没有每日签到 | cline（没找到接口）、raccoon（服务端每日自动发放）、gemini（额度按配额比例，不是可领积分）、opencode（没有积分体系） |
+| workbuddy 活跃打卡未在本仓库实测 | 协议照搬参考项目的抓包；每次会消耗极少量免费模型额度，失败会在任务状态里如实记录 |
 | 3 家不能自动续期 | zcode（凭据是静态的）、loomy（没有续期接口）、opencode（匿名通道没有凭据） |
 | opencode 没有余额接口 | 多个匿名槽共用同一个出口 IP，免费额度不能靠多开来扩容；也不参与聚合排序 |
 | 聚合路由不缓存 | 每次请求都实时拉目录和到期时间，换取「临期优先」的准确性 |
@@ -404,6 +406,10 @@ probe/             出口 IP 探针（独立 Worker）
 - 出租账号池、对外提供付费 API、二次封装转售。
 
 技术上无法阻止这些用法，但它们不在本项目的设计意图之内，并且违反目标平台的服务条款。
+
+## 致谢
+
+- [ardeyouxipianyi/workbuddy2api-hub](https://github.com/ardeyouxipianyi/workbuddy2api-hub)（MIT）：请求体修复（工具调用配对/孤儿清理、`tool_choice`/`tools`/`stop` 归一、DeepSeek `reasoning_content` 回填、客户端指纹清洗）、400 业务码分类，以及国际版网页端活跃打卡流程，移植自该项目，许可声明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
 ## License
 

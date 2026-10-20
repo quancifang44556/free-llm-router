@@ -218,6 +218,7 @@ export function mapErrorToPunishment(kind: ErrorKind): {
     // 参数类：**不换号**（换号会重放同样的非法请求，放大风控）
     case 'context_exceeded':
     case 'image_invalid':
+    case 'bad_request':
       return { punish: false, dimension: 'soft', rotate: false }
     // 网络层：抖动量，不构成「这个号坏了」的证据；也不该立刻换号（可能是本地出口抖动）
     case 'network':
@@ -304,6 +305,8 @@ async function isProviderClosedByUser(env: Env, providerId: string): Promise<boo
 }
 
 export function clientStatusFor(upstreamStatus: number, kind: ErrorKind | string): number {
+  // 请求形状被拒：客户端的请求本身有问题（换号也不会好）——即使上游用 5xx 包着也回 400
+  if (kind === 'bad_request') return 400
   // 上游 5xx ⇒ 网关上必然是 502
   if (upstreamStatus >= 500) return 502
   // 确实是「请求内容」的问题 ⇒ 如实回 400（客户端改请求才有用）
@@ -355,7 +358,8 @@ export function refineModelScoped(
   const isChannelBlockedText = /"code"\s*:\s*"11-128"/.test(bodyText)
   if (isChannelBlockedText) return { dimension: 'soft', code, resetAt }
   // 6004 / 14003 = 模型级限流（切模型即可用，不该罚整个账号）
-  if (code === 6004 || code === 14003) return { dimension: 'model', code, resetAt }
+  // 11134 = 模型供应方暂不可用（同属「换个模型就行」）
+  if (code === 6004 || code === 14003 || code === 11134) return { dimension: 'model', code, resetAt }
   // ⚠️ 文案兜底（第二道腿）：上游换码值时仍能判对。只认「模型」语义的措辞，
   // **不得**匹配泛泛的 "too many requests"（那是真·账号级限流）。
   //
