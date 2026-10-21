@@ -72,7 +72,7 @@ import type { ProviderModel } from './providers/types.js'
 import type { LoginCredential } from './upstream/auth.js'
 import { parseAuthDocument, parseAuthPayload } from './upstream/import.js'
 import { handleResponses } from './gateway/responses.js'
-import { handleChatCompletions, resetMaxRotateCache } from './gateway/server.js'
+import { handleChatCompletions, refineModelScoped, resetMaxRotateCache } from './gateway/server.js'
 import { resetSafetyConfigCache } from './gateway/safety.js'
 import {
   emptyApiKeyUsage,
@@ -3623,14 +3623,54 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
       model?: unknown
       realm?: unknown
     }
-    const realm = typeof body.realm === 'string' && body.realm !== '' ? body.realm : 'cn'
+    const explicitRealm = typeof body.realm === 'string' && body.realm !== '' ? body.realm : undefined
     const onlyUid = typeof body.uid === 'string' && body.uid !== '' ? body.uid : undefined
     const wantedModel = typeof body.model === 'string' && body.model !== '' ? body.model : undefined
 
-    const stub = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
+    /**
+     * 🔴 **realm 不能盲目默认成 `cn`**（2026-10-21 实测缺陷）。
+     *
+     * 面板点「探测」时报过：
+     * ```
+     * 探测失败: 账号不存在：workbuddy:500b0019-3be3-493a-81b0-2330131e8939
+     * ```
+     * 而该账号明明在列表里、状态「正常」。
+     *
+     * ## 根因：**uid 的归属 realm 因 provider 而异**
+     * | provider | realm | uid 形态 |
+     * |---|---|---|
+     * | `buddy`（国内版） | `cn` | `358a60c4-…`（**无前缀**） |
+     * | `workbuddy`（国际版） | **`global`** | `workbuddy:500b0019-…` |
+     * | `zcode` | `cn` | `zcode:603917…` |
+     * | `qodercn` | `cn` | `qodercn:01a154b3-…` |
+     *
+     * 而 `/admin/accounts` 返回的账号对象**不含 `realm` 字段**，
+     * 面板无法把它传回来 ⇒ 服务端必须自己解析。
+     *
+     * ## 处置
+     * 未显式指定 realm 时，先在 `cn` 找；**找不到再找另一个 realm**。
+     * 这与本文件既有的 `otherRealm = realm === 'cn' ? 'global' : 'cn'` 模式一致
+     *（见 `src/index.ts:440` 附近的同类处理）。
+     */
+    let realm = explicitRealm ?? 'cn'
+    let stub = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
     const now = Date.now()
-    const all = await stub.listAccounts(realm, now)
-    const targets = onlyUid === undefined ? all : all.filter((a) => a.uid === onlyUid)
+    let all = await stub.listAccounts(realm, now)
+    let targets = onlyUid === undefined ? all : all.filter((a) => a.uid === onlyUid)
+
+    if (onlyUid !== undefined && targets.length === 0 && explicitRealm === undefined) {
+      const other = realm === 'cn' ? 'global' : 'cn'
+      const otherStub = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(other))
+      const otherAll = await otherStub.listAccounts(other, now)
+      const otherTargets = otherAll.filter((a) => a.uid === onlyUid)
+      if (otherTargets.length > 0) {
+        realm = other
+        stub = otherStub
+        all = otherAll
+        targets = otherTargets
+      }
+    }
+
     if (onlyUid !== undefined && targets.length === 0) {
       return jsonError(400, `账号不存在：${onlyUid}`, 'invalid_request')
     }
@@ -3668,11 +3708,33 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
             error?: { message?: string }
           }
           detail = errJson.error?.message ?? `HTTP ${gatewayResult.response.status}`
-          // 复用错误分类：把「谁的错」翻成用户能行动的三类
+          // 复用错误分类：把「谁的错」翻成用户能行动的四类
+          //
+          // ⚠️ **必须把 `credit_exhausted` 算作账号问题**（2026-10-21 修）：
+          // 它的处置是「充值/换号」，与「稍后重试」完全相反。
+          // 早先漏了它 ⇒ 用户看到「稍后重试」而实际永远好不了。
+          //
+          // ⚠️ **模型级限流必须算作 `model_problem`**：像 qoder 的 `110`
+          // （日次数上限）分类是 `rate_limited`，但 `refineModelScoped` 会把它
+          // 细化成 `dimension: 'model'` —— 只有该模型不可用，账号本身健康。
+          // 若笼统报 `upstream_problem`，用户会去换账号（白费功夫），
+          // 而正确做法只是**换个模型**。
           const { kind } = classify(gatewayResult.response.status, detail)
-          if (kind === 'auth_error' || kind === 'request_illegal') verdict = 'account_problem'
-          else if (kind === 'model_unavailable' || kind === 'model_denied') verdict = 'model_problem'
-          else verdict = 'upstream_problem'
+          if (
+            kind === 'auth_error'
+            || kind === 'request_illegal'
+            || kind === 'credit_exhausted'
+          ) {
+            verdict = 'account_problem'
+          } else if (
+            kind === 'model_unavailable'
+            || kind === 'model_denied'
+            || refineModelScoped(kind, detail).dimension === 'model'
+          ) {
+            verdict = 'model_problem'
+          } else {
+            verdict = 'upstream_problem'
+          }
         }
       } catch (error) {
         detail = error instanceof Error ? error.message : String(error)
