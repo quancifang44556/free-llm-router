@@ -22,6 +22,7 @@ import {
   isSessionTraceEnabled,
   referenceChatHeaders,
 } from '../src/upstream/headers.js'
+import { shouldRotate } from '../src/upstream/client.js'
 import {
   configureThrottle,
   resetThrottle,
@@ -385,4 +386,20 @@ test('源码级：会话头族只在国际版路径出现（防止又被「统�
   // 国内版主分支（referenceChatHeaders → intlReferenceChatHeaders 之间）不得直接调用
   const refSeg = lines.slice(fnAt('export function referenceChatHeaders'), intlLine).join('\n')
   assert.ok(!refSeg.includes('sessionTraceHeaders('), '国内版主分支不得直接调用 sessionTraceHeaders')
+})
+
+// ───────────── ⑧ 11140 是账号级封禁 ⇒ 必须换号（曾拖垮整个 provider） ─────────────
+
+test('🔴 11140(request_illegal) 必须换号：上游原文是账号级封禁', () => {
+  // 实测原文（2026-10-21，HTTP 403）：
+  //   {"code":11140,"msg":"request illegal",
+  //    "displayMsg":{"zh":"账号存在异常行为，已被限制使用",
+  //                  "en":"Your account has been restricted due to unusual activity"}}
+  // 罚的是**这一个账号**，所以 `shouldRotate` 必须是 true —— 否则一个被封的号
+  // 会把整个 provider 拖死（每次都只撞它，好号永远轮不到）。
+  assert.equal(shouldRotate('request_illegal'), true)
+})
+
+test('11128(channel_blocked) 仍不换号：渠道指纹与账号无关', () => {
+  assert.equal(shouldRotate('channel_blocked'), false)
 })

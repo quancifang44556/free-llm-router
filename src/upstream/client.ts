@@ -372,13 +372,16 @@ export function shouldRotate(kind: ErrorKind): boolean {
     case 'auth_error':
     case 'session_dead':
     case 'waf_blocked':
+    // 11140 账号级封禁 ⇒ 换号（好号还能用，别被坏号拖住）
+    case 'request_illegal':
       return true
     // ⚠️ 参数类错误**不换号**：换号重试会重放同样的非法请求，放大风控。
     case 'context_exceeded':
     case 'image_invalid':
     case 'bad_request':
-    case 'request_illegal':
-    // ⚠️ 渠道指纹被拒 ⇒ **不换号**：换号撞的是同一套渠道判定，只会放大风控。
+    // ⚠️ 11140 是**账号级封禁**（上游原文 `Your account has been restricted`），
+    // 换号有用 —— 见 `clientStatusFor` 上方注释里抓到的完整响应体。
+    // 只有 11128（渠道指纹）才是「换号无用」。
     case 'channel_blocked':
     case 'network':
     case 'not_found':

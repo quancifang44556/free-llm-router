@@ -65,7 +65,11 @@ test('⚠️ 回归：不罚号的类别不得因新增 model_denied 被误纳',
 
 test('⚠️ 回归：不换号的类别不得因新增 model_denied 被误纳', () => {
   // 这些错误换号只会放大风控或重放非法请求
-  for (const k of ['request_illegal', 'channel_blocked', 'context_exceeded', 'network', 'not_found'] as const) {
+  //
+  // ⚠️ `request_illegal` 已从此列**移出**：11140 经实测是**账号级封禁**
+  //（上游原文 `Your account has been restricted`），换号有用。
+  // 原先把它归入「换号只会放大风控」是把它与 11128（渠道指纹）混淆了。
+  for (const k of ['channel_blocked', 'context_exceeded', 'network', 'not_found'] as const) {
     assert.equal(shouldRotate(k), false, `${k} 不该换号`)
   }
 })

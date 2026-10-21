@@ -431,10 +431,16 @@ test('⚠️ WAF 拦截不换号（可能是 IP 级，换号无用）', () => {
   assert.equal(m.rotate, false, 'IP 级拦截换号无用，只会放大请求')
 })
 
-test('⚠️ 11140 请求非法不换号（同样的非法请求换号也失败）', () => {
+test('🔴 11140 是账号级封禁 ⇒ 要罚该号且换号（不再拖垮整个 provider）', () => {
+  // 上游原文（2026-10-21，HTTP 403）：
+  //   {"code":11140,"msg":"request illegal",
+  //    "displayMsg":{"zh":"账号存在异常行为，已被限制使用",
+  //                  "en":"Your account has been restricted due to unusual activity"}}
+  // 「this account has been restricted」⇒ 罚的是这一个号，换号有用。
+  // 旧断言写成 rotate: false，导致一个被封的号把整个 provider 拖死。
   const m = mapErrorToPunishment('request_illegal')
   assert.equal(m.punish, true, '是强信号，要罚')
-  assert.equal(m.rotate, false)
+  assert.equal(m.rotate, true, '账号级封禁，换号有用')
 })
 
 test('余额耗尽 / session 死亡 / 5xx 应换号', () => {

@@ -205,9 +205,25 @@ export function mapErrorToPunishment(kind: ErrorKind): {
     // 差别在**请求指纹**，不在账号。
     case 'channel_blocked':
       return { punish: false, dimension: 'soft', rotate: false }
-    // 请求非法：强信号，直接禁用；换号无用（同样的非法请求）
+    // 请求非法（上游 11140）：**账号级封禁，换号有用**。
+    //
+    // ⚠️⚠️ 这里此前判 `rotate: false`，理由是「换号无用（同样的非法请求）」——
+    // 但那是把 11140 与 11128 混为一谈。2026-10-21 抓到上游原文，两者语义完全不同：
+    //
+    //   code 11140 / HTTP 403 →
+    //     {"msg":"request illegal",
+    //      "displayMsg":{"zh":"账号存在异常行为，已被限制使用",
+    //                    "en":"Your account has been restricted due to unusual activity"},
+    //      "displayTips":{"zh":"系统检测到该账号存在异常使用行为，如需申诉请提交反馈"}}
+    //
+    // 上游说的是 **this account has been restricted** —— 罚的是**这一个账号**，
+    // 与请求内容、与其它账号都无关。`rotate: false` 的后果是：
+    // 一个被封的号会把整个 provider 拖死（每次都只撞它，好号永远轮不到），
+    // 实测就出现过「三个 WB 号里只有 z 被封，另两个完好却全线不可用」。
+    //
+    // ⇒ 正确处置：**罚该号（breaker）+ 换下一个号**。11128（渠道指纹）才是不换号的那个。
     case 'request_illegal':
-      return { punish: true, dimension: 'breaker', rotate: false }
+      return { punish: true, dimension: 'breaker', rotate: true }
     // session 死亡：连续 3 次才禁用；换号有用
     case 'session_dead':
       return { punish: true, dimension: 'session_dead', rotate: true }

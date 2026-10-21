@@ -159,8 +159,10 @@ test('404 → not_found（可能需换 fallback 路径）', () => {
 test('⚠️ 参数类错误不换号（换号会重放同样的非法请求）', () => {
   assert.equal(shouldRotate('context_exceeded'), false)
   assert.equal(shouldRotate('image_invalid'), false)
-  assert.equal(shouldRotate('request_illegal'), false)
   assert.equal(shouldRotate('network'), false)
+  // ⚠️ `request_illegal` **不在此列**：11140 是账号级封禁，换号有用。
+  //    旧断言把它归到「参数类」是错的，见下方专门的用例。
+  assert.equal(shouldRotate('request_illegal'), true)
 })
 
 test('限流/余额/鉴权类错误应换号', () => {
