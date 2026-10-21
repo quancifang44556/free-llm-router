@@ -3590,6 +3590,12 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
         // 于是误判「三个号都没被封」。记账失效是**静默**的，这条字段就是唯一的显示出口。
         restrictedUntil: a.restrictedUntil,
         softStreak: a.softStreak,
+        // ⚠️ 派发节奏守卫的**唯一观测口**（`MIN_DISPATCH_GAP_MS`）。
+        // 与上面 `restrictedUntil` 是同一类陷阱：`/admin/accounts` 是**逐字段
+        // 白名单投影**，新增的状态字段若不加进来，面板上就完全看不到 ——
+        // 而守卫是否生效从外部无法感知（请求都成功，只是节奏被拉开）。
+        // 排查"限速有没有起作用"时，这是唯一能回答的字段。
+        lastUsedAt: a.lastUsedAt ?? 0,
         // ⚠️ 不只给模型名，还要给**到期时间与原因** ——
         // 面板的「模型限流」弹窗要显示「还剩多久 / 为什么被限」，
         // 只给名字无法回答用户最关心的那两个问题。

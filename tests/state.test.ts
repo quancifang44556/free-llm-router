@@ -482,3 +482,37 @@ test('🔴 排队预算可配置（官方客户端等 60 分钟，我们默认 4
   // 运行时必须真的走访问器，否则配置了也没用（空转的配置项是最难发现的那种）
   assert.match(src, /spent >= queueTotalBudget\(\)/, '预算判据必须走访问器')
 })
+
+test('lastUsedAt 必须能往返（防止逐字段重建时丢字段）', async () => {
+  const { normalizeAccountState } = await import('../src/pool/state.ts')
+  const old = {
+    uid: 'u1', provider: 'buddy', nickname: 'n', realm: 'cn',
+    disabled: false, reason: '', until: 0, coolKind: 'none', softStreak: 0,
+    modelCooldowns: {}, modelConfirm: {}, breakerUntil: 0, restrictedUntil: 0,
+  }
+  const s = normalizeAccountState(old)
+  assert.ok(s !== undefined)
+  assert.equal(s.lastUsedAt, 0, '老记录缺该字段时应回落 0')
+  s.lastUsedAt = 12345
+  const back = normalizeAccountState(JSON.parse(JSON.stringify(s)))
+  assert.equal(back.lastUsedAt, 12345, '必须能往返，否则守卫永远读到 0')
+})
+
+test('🔴 新增池状态字段必须进 /admin/accounts 白名单（否则面板永远看不到）', async () => {
+  // ## 这是本仓库**第三次**踩同一个坑
+  // `/admin/accounts` 是逐字段白名单投影，不是整体序列化。新增字段忘了加，
+  // 字段就"存在但不可观测"，而这类失效**完全静默**：
+  //   第 1 次 `restrictedUntil` —— 库里写了 2h，面板不返回 ⇒ 误判"三个号都没被封"
+  //   第 2 次 `breakerUntil`  —— 同理
+  //   第 3 次 `lastUsedAt`    —— 节奏守卫是否生效从外部完全无法感知
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync('src/index.ts', 'utf8')
+  const idx = src.indexOf("path === '/admin/accounts'")
+  assert.ok(idx > 0, '必须能找到该端点')
+  // 取该端点后 4KB 作为投影区（够覆盖白名单，又不会串到别的端点）
+  const region = src.slice(idx, idx + 4000)
+
+  for (const field of ['restrictedUntil', 'breakerUntil', 'lastUsedAt', 'fails', 'softStreak']) {
+    assert.match(region, new RegExp(`${field}:`), `池状态字段 ${field} 必须出现在投影白名单里`)
+  }
+})
