@@ -80,6 +80,8 @@ import {
   hashApiKey,
   isWindowExpired,
   keyPrefix,
+  modelAllowed,
+  type ApiKeyRecord,
   normalizeApiKeyLimits,
   resetUsageWindow,
   toApiKeyView,
@@ -1284,6 +1286,14 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
   // ⚠️ 判定顺序刻意为「主密钥优先」：子密钥路径要打一次 DO（查哈希），
   // 主密钥不用。日常运维走的是主密钥，不该为子密钥的选择付代价。
   const isV1Path = path.startsWith('/v1/')
+  /**
+   * 🔴 **子密钥记录必须提到外层作用域**（2026-10-21 审查补，M6 指出高危）。
+   *
+   * 原来 `sub` 只活在下面这个 `if` 块里，而模型白名单**必须等请求体解析完**
+   * （那一刻才知道 `model`）才能判 ⇒ 块外的代码拿不到 `record` ⇒
+   * 校验点**根本无处安放**，于是从来没有被校验过。
+   */
+  let subkeyRecord: ApiKeyRecord | undefined
   if (!(await authorized(request, env))) {
     // 不是主密钥 ⇒ 只有在 `/v1/*` 上才尝试子密钥。
     if (!isV1Path) {
@@ -1305,6 +1315,8 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
     if (sub.kind === 'subkey') {
       // ⚠️ 模型名此时还未知（在请求体里），传空串占名额即可；
       // `countUse` 内部的 `recordApiKeyUse` 只累加请求数，不校验模型。
+      // 模型白名单改在拿到请求体后单独判（见下方 `subkeyRecord` 的用法）。
+      subkeyRecord = sub.record
       ctx.waitUntil(countUse(env, sub.record, request, ''))
     }
   }
@@ -4188,6 +4200,10 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
   // ── OpenAI 兼容：对话（**流式 SSE 透传**） ──
   if (path === '/v1/chat/completions' && request.method === 'POST') {
     const realm = url.searchParams.get('realm') ?? 'cn'
+    // 🔴 子密钥的**模型白名单**在这里判（2026-10-21 审查补，M6 指出高危）。
+    // 详见下方 `subkeyModelDenied` 的说明。
+    const denied = await subkeyModelDenied(request, subkeyRecord)
+    if (denied !== undefined) return denied
     const result = await handleChatCompletions(request, env, realm, ctx)
     // ⚠️ 流式响应必须**原样返回** —— 不要在这里包装或缓冲，
     // 那会破坏逐字输出并可能超出 CPU 预算。
@@ -4203,12 +4219,60 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
   // 依据：参考实现 `openai-gateway/responses.ts:12-16`。
   if (path === '/v1/responses' && request.method === 'POST') {
     const realm = url.searchParams.get('realm') ?? 'cn'
+    // 同 Chat 路径：子密钥的模型白名单在这条协议上也要判（否则换个协议就绕过）。
+    const denied = await subkeyModelDenied(request, subkeyRecord)
+    if (denied !== undefined) return denied
     const result = await handleResponses(request, env, realm, ctx)
     // 同 Chat 路径：流式响应**原样返回**，不在这里包装或缓冲。
     return result.response
   }
 
   return json({ error: { message: 'not found', path } }, 404)
+}
+
+/**
+ * 子密钥**模型白名单**校验（2026-10-21 审查补，M6 指出高危）。
+ *
+ * ## 缺陷：三维限制只接通了一维
+ * 子密钥支持三维限制：IP / **模型** / token 配额。
+ * 但 `authenticate()` 只在鉴权那一刻调用一次，而**那一刻模型名还未知**
+ *（在请求体里）⇒ 它被传入 `model = ''` ⇒ 模型检查**恒被跳过**。
+ *
+ * 源码里原本有一句注释「真正的模型校验见下方 chat 分支」，
+ * 而**那个分支从来不存在** —— 注释描述了一个没有实现的校验点。
+ *
+ * ⇒ 用户给子密钥配了「只允许 X 模型」，实际**任何模型都能用**。
+ * 这是**安全项**，不是显示问题。
+ *
+ * ## 为什么用 `clone()` 而不是改造 `handleChatCompletions`
+ * 请求体是一次性的流。`clone()` 只在**存在子密钥**时才发生（主密钥路径零开销），
+ * 且网关自己也有体积上限保护。这样改动集中在入口，不用把 `ApiKeyRecord`
+ * 一路透传进 provider 层。
+ *
+ * ⚠️ 只判 `models` 非空的子密钥；空数组 = 不限制（`modelAllowed` 的既有语义）。
+ */
+async function subkeyModelDenied(
+  request: Request,
+  record: ApiKeyRecord | undefined,
+): Promise<Response | undefined> {
+  if (record === undefined) return undefined
+  const rules = record.limits.models
+  if (rules.length === 0) return undefined
+  const probe = request.clone()
+  const body = (await probe.json().catch(() => undefined)) as { model?: unknown } | undefined
+  const model = typeof body?.model === 'string' ? body.model : ''
+  // 取不到模型名就不拦（由下游按自己的规则报错），避免把合法请求误杀。
+  if (model === '') return undefined
+  if (modelAllowed(model, rules)) return undefined
+  return json(
+    {
+      error: {
+        message: `该 API Key 不被允许使用模型「${model}」`,
+        type: 'permission_error',
+      },
+    },
+    403,
+  )
 }
 
 /**
