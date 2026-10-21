@@ -372,9 +372,12 @@ export function shouldRotate(kind: ErrorKind): boolean {
     case 'auth_error':
     case 'session_dead':
     case 'waf_blocked':
-    // 11140 账号级封禁 ⇒ 换号（好号还能用，别被坏号拖住）
-    case 'request_illegal':
       return true
+    // ⚠️ `request_illegal`（11140）**不换号** —— 与 `mapErrorToPunishment` 同一口径。
+    // 依据 workbuddy2api-hub #422/#425：11140 是**设备/出口维度**的账号标记，
+    // 换号不改变被盯上的设备，只会把更多无辜账号送进同一个标记
+    // （社区实测：一个请求遍历整池，7 个号一次任务全被封）。
+    // 下一次**独立**请求自然会落到别的号，不需要在同一请求里硬换。
     // ⚠️ 参数类错误**不换号**：换号重试会重放同样的非法请求，放大风控。
     case 'context_exceeded':
     case 'image_invalid':
@@ -383,6 +386,9 @@ export function shouldRotate(kind: ErrorKind): boolean {
     // 换号有用 —— 见 `clientStatusFor` 上方注释里抓到的完整响应体。
     // 只有 11128（渠道指纹）才是「换号无用」。
     case 'channel_blocked':
+    // 11140 与 11128 一样不换号，但理由不同：
+    // 11128 换的是「请求指纹」不成立，11140 换的是「设备」不成立。
+    case 'request_illegal':
     case 'network':
     case 'not_found':
     case 'already_done':

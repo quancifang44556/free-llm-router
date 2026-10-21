@@ -1118,8 +1118,14 @@ export async function handleChatCompletions(
             // 结构化成因：不靠文案反推（见 modelCauseFor 的注释）
             ...(cause !== undefined ? { modelCause: cause } : {}),
           })
-          .catch(() => {
-            // 记账失败不该让回复失败：这是可观测性问题，不是正确性问题
+          .catch((error: unknown) => {
+            // 记账失败不该让回复失败：这是可观测性问题，不是正确性问题。
+            // ⚠️ 但**不能完全静默** —— 此前这里是空 catch，导致「restricted 维度
+            // 没被 DO 接受」这类问题只表现为「罚了却看不出罚」，线上排查极难。
+            console.warn(
+              `[punish] applyFailure 失败 uid=${candidate.uid} kind=${mapped.dimension}: ` +
+                (error instanceof Error ? error.message : String(error)),
+            )
           })
       }
 

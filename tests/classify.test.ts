@@ -160,9 +160,11 @@ test('⚠️ 参数类错误不换号（换号会重放同样的非法请求）'
   assert.equal(shouldRotate('context_exceeded'), false)
   assert.equal(shouldRotate('image_invalid'), false)
   assert.equal(shouldRotate('network'), false)
-  // ⚠️ `request_illegal` **不在此列**：11140 是账号级封禁，换号有用。
-  //    旧断言把它归到「参数类」是错的，见下方专门的用例。
-  assert.equal(shouldRotate('request_illegal'), true)
+  // ⚠️ `request_illegal`（11140）也**不换号**，但理由不是「参数类」：
+  //    它是账号级限制，换号改变不了被盯上的**设备**，只会连坐更多号
+  //    （workbuddy2api-hub #422：一个请求遍历整池，7 个号一次任务全被封）。
+  //    见 safety-config.test.ts 里的专门用例与推理演进。
+  assert.equal(shouldRotate('request_illegal'), false)
 })
 
 test('限流/余额/鉴权类错误应换号', () => {

@@ -1028,7 +1028,10 @@ export class AccountPoolDO extends DurableObject<Env> {
       // 是账号级封禁 —— 前 2 次会继续把请求打到一个已被封的号上，期间如果发生
       // 换号（默认已禁止），被牵连的号会更多。账号级限制必须一次即罚。
       case 'restricted': {
-        state.restrictedUntil = Math.max(state.restrictedUntil, now + RESTRICTED_HOLD_MS)
+        // ⚠️ 用 `Number.isFinite` 兜一层：`Math.max(NaN, x)` 是 NaN，
+        // 写进库再读回就成了 0 —— 惩罚被静默吞掉，比不罚更危险（以为罚了）。
+        const prevRestricted = Number.isFinite(state.restrictedUntil) ? state.restrictedUntil : 0
+        state.restrictedUntil = Math.max(prevRestricted, now + RESTRICTED_HOLD_MS)
         break
       }
       case 'breaker': {

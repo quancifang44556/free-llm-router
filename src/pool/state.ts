@@ -319,6 +319,11 @@ export function normalizeAccountState(raw: unknown): AccountState | undefined {
     modelCooldowns: obj('modelCooldowns', base.modelCooldowns),
     modelConfirm: obj('modelConfirm', (base as Partial<AccountState>).modelConfirm ?? {}),
     breakerUntil: num('breakerUntil', base.breakerUntil),
+    // ⚠️ 必须显式列出：`normalizeAccountState` 是**逐字段重建**对象的，
+    // 没列出的字段不会从 `base` 继承 —— 老记录读出来就是 `undefined`。
+    // 线上实测后果：`Math.max(undefined, x)` = NaN → 写库后读回 0，
+    // 表现为「11140 罚了却看不出罚」，排查极难。
+    restrictedUntil: num('restrictedUntil', base.restrictedUntil),
     retryCount: num('retryCount', base.retryCount),
     fails: num('fails', base.fails),
     degradeUntil: num('degradeUntil', base.degradeUntil),

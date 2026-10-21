@@ -246,3 +246,82 @@ test('🔴 11140 波次判定：同号重复不算波次，不同号达标才整
   assert.match(m![1]!, /30 \* 60 \* 1000/, '整池暂停应为 30 分钟')
   assert.match(src, /RESTRICTION_WAVE_THRESHOLD = 2/, '波次阈值为 2 个不同账号')
 })
+
+test('🔴 回归：normalizeAccountState 必须**显式**携带每个字段（漏一个就静默丢惩罚）', async () => {
+  // ## 这是线上真实踩到的 bug，不是假想
+  //
+  // `normalizeAccountState` 是**逐字段重建**对象的（`{ ...num(...) }`），
+  // 没列出的字段**不会**从 `base` 继承 —— 老记录读出来是 `undefined`。
+  //
+  // 加 `restrictedUntil` 时忘了在这一行里补上，后果链：
+  //   读老记录 → restrictedUntil === undefined
+  //   → `Math.max(undefined, x)` === NaN
+  //   → 写进 SQLite 再读回 === 0
+  //   → 表现「11140 罚了却看不出罚」，且账号继续被派单。
+  //
+  // 所以这里用「新账号状态 → 序列化 → normalize」往返，
+  // **逐字段**比对：任何一个字段丢失都会被这条断言抓住。
+  const { createAccountState, normalizeAccountState } = await import('../src/pool/state.ts')
+
+  const fresh = createAccountState({ uid: 'u-roundtrip', nickname: 'n', realm: 'cn', provider: 'buddy' })
+  // 给所有数值字段灌上有辨识度的非零值，避免「0 默认值掩盖丢失」
+  const filled = {
+    ...fresh,
+    until: 111,
+    breakerUntil: 222,
+    degradeUntil: 333,
+    restrictedUntil: 444,
+    fails: 5,
+    retryCount: 2,
+    consecutiveFails: 3,
+    errTotal: 7,
+  }
+  const back = normalizeAccountState(JSON.parse(JSON.stringify(filled)))
+  assert.ok(back !== undefined, '往返后应能解析')
+
+  for (const [k, want] of Object.entries({
+    until: 111,
+    breakerUntil: 222,
+    degradeUntil: 333,
+    restrictedUntil: 444,
+    fails: 5,
+    retryCount: 2,
+    consecutiveFails: 3,
+    errTotal: 7,
+  })) {
+    assert.equal(
+      (back as unknown as Record<string, number>)[k],
+      want,
+      `normalizeAccountState 丢了字段 ${k}（逐字段重建最容易漏新增字段）`,
+    )
+  }
+
+  // 老记录（压根没有该字段）必须补成 0，绝不能是 undefined/NaN
+  const legacy = normalizeAccountState({ uid: 'u-legacy', nickname: 'n', realm: 'cn', provider: 'buddy' })
+  assert.equal(legacy!.restrictedUntil, 0, '缺字段必须补 0')
+  assert.ok(Number.isFinite(legacy!.restrictedUntil), '缺失字段绝不能被读成 NaN')
+})
+
+test('🔴 回归：/admin/accounts 必须暴露 restrictedUntil（否则"被封"在面板上隐形）', async () => {
+  // ## 线上真实踩到
+  //
+  // 数据库里 rst 明明已写入（sqlite 直接查：1792564552799 = +2h），
+  // 但 `/admin/accounts` 的序列化是**逐字段列举**的，漏了 restrictedUntil。
+  // 后果：面板上「被上游限制的号」与健康号长得一模一样，
+  // 我据此误判过一次「三个号都没被封」，实际三个全受限。
+  //
+  // 记账失效是**静默的**，这个字段是唯一的显示出口 —— 所以用源码级断言钉住它。
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync('src/index.ts', 'utf8')
+  assert.match(
+    src,
+    /restrictedUntil:\s*a\.restrictedUntil/,
+    '/admin/accounts 必须返回 restrictedUntil，否则前端看不到账号被上游限制',
+  )
+  // 同时确认它没被写成别的账号字段（复制粘贴最容易错）
+  assert.doesNotMatch(
+    src,
+    /restrictedUntil:\s*a\.breakerUntil/,
+    'restrictedUntil 不能错接成 breakerUntil（两者语义不同）',
+  )
+})

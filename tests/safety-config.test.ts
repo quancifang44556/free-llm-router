@@ -22,7 +22,7 @@ import {
   isSessionTraceEnabled,
   referenceChatHeaders,
 } from '../src/upstream/headers.js'
-import { shouldRotate } from '../src/upstream/client.js'
+import { shouldPunish, shouldRotate } from '../src/upstream/client.js'
 import {
   configureThrottle,
   resetThrottle,
@@ -390,14 +390,31 @@ test('源码级：会话头族只在国际版路径出现（防止又被「统�
 
 // ───────────── ⑧ 11140 是账号级封禁 ⇒ 必须换号（曾拖垮整个 provider） ─────────────
 
-test('🔴 11140(request_illegal) 必须换号：上游原文是账号级封禁', () => {
+test('🔴 11140(request_illegal) **不换号**：换号会连坐更多账号', () => {
   // 实测原文（2026-10-21，HTTP 403）：
   //   {"code":11140,"msg":"request illegal",
   //    "displayMsg":{"zh":"账号存在异常行为，已被限制使用",
   //                  "en":"Your account has been restricted due to unusual activity"}}
-  // 罚的是**这一个账号**，所以 `shouldRotate` 必须是 true —— 否则一个被封的号
-  // 会把整个 provider 拖死（每次都只撞它，好号永远轮不到）。
-  assert.equal(shouldRotate('request_illegal'), true)
+  //
+  // ## 这条断言改过两次，两版推理都记在这里，别再走回头路
+  //
+  // ① 最初：`shouldRotate=false`，理由「换号无用（同样的非法请求）」。
+  //    对了一半 —— 换号绕不过**这个**号，但把它当参数类错误是错的。
+  //
+  // ② 后来：`shouldRotate=true`，理由「上游说 this account has been restricted
+  //    ⇒ 罚单号 ⇒ 换号有用」。这条**漏了设备维度**：换号改变的是"谁发请求"，
+  //    不改变"从哪台设备发"。
+  //
+  // ③ 现在：`shouldRotate=false`。workbuddy2api-hub #422/#425 实测 ——
+  //    在 11140 上「冷却该号后立刻换下一个号继续同一请求」，一个请求最多
+  //    遍历整个池子，**用户 7 个号在一次任务里全被封**。社区复盘红线原文：
+  //    「看到 11140 立即停手，解封前严禁换号继续打同一设备 —— 设备指纹会连坐」。
+  //
+  //    正确做法：罚该号（`restricted` 维度，一次即生效、2 小时持久化），
+  //    但**不在同一请求里换号**；下一次独立请求自然落到别的号。
+  assert.equal(shouldRotate('request_illegal'), false)
+  // 该罚还是要罚（不罚就等于继续用被封的号）
+  assert.equal(shouldPunish('request_illegal'), true)
 })
 
 test('11128(channel_blocked) 仍不换号：渠道指纹与账号无关', () => {

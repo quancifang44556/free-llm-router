@@ -3567,6 +3567,11 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
         lastErr: a.lastErr,
         fails: a.fails,
         breakerUntil: a.breakerUntil,
+        // ⚠️ 必须暴露：账号级限制（11140）是**上游标记**，与 breakerUntil（我们自己
+        // 怀疑它不行）语义不同。不暴露的话，面板上「被封的号」看起来和健康号一模一样 ——
+        // 线上实测踩过：库里 rst=2h 已写入，但 /admin/accounts 不返回该字段，
+        // 于是误判「三个号都没被封」。记账失效是**静默**的，这条字段就是唯一的显示出口。
+        restrictedUntil: a.restrictedUntil,
         softStreak: a.softStreak,
         // ⚠️ 不只给模型名，还要给**到期时间与原因** ——
         // 面板的「模型限流」弹窗要显示「还剩多久 / 为什么被限」，
