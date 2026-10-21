@@ -7,6 +7,7 @@
  * 3. 面板拿到的是过期静态表、没有价格。
  */
 import { test } from 'node:test'
+import { readFileSync } from 'node:fs'
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import {
@@ -266,4 +267,43 @@ test('🔴 /v1/models 名称带渠道与倍率（不再只有 DeepSeek-Flash）'
   // buddy 的既有形态不变
   const buddy = annotateModelEntry({ id: 'buddy/glm', name: 'GLM', credits: 'x0.21' }, 'buddy')
   assert.equal(buddy.name, '国内 · GLM · ×0.21')
+})
+
+test('🔴 客户端没给档位时，必须回落到目录的 defaultEffort（不传 ≠ 中性默认）', () => {
+  // ## 实测依据（2026-10-21）
+  //
+  // 同一个问题（`qodercn/dfmodel`，"解释递归"）的 reasoning_tokens：
+  //
+  // | 请求 | reasoning_tokens |
+  // |---|---|
+  // | 不传档位 | **1417** |
+  // | `low`    | 247 |
+  // | `max`    | 728 |
+  //
+  // 「不传」比显式 `max` 还多 2 倍 —— 上游默认走最重思考。
+  // 客户端（DSH）只在用户**主动选**档位时才带 `reasoning_effort`，
+  // 于是「没选」＝ 被动吃最贵档位：又慢又费积分。
+  //
+  // 故 qoder 的推理入口在客户端没给档位时，回落到目录 `defaultEffort`。
+  // 目录**没声明**时保持 `undefined`（不干预），与改动前行为一致。
+  const source = readFileSync('src/providers/qoder.ts', 'utf8')
+  assert.ok(
+    /clientEffort\s*\?\?\s*catalogDefaultEffort/.test(source),
+    '⚠️ reasonEffort 必须是「客户端优先、目录默认兜底」，不能写死常量',
+  )
+  assert.ok(
+    /findQoderModel\(product,\s*request\.model\)\?\.defaultEffort/.test(source),
+    '默认档位必须取自该模型自己的目录条目（不同模型默认档不同）',
+  )
+
+  // 目录里该模型确实声明了 defaultEffort —— 否则上面的兜底取到 undefined，
+  // 功能等于没开。`dfmodel` 目录声明 `defaultEffort: 'max'`。
+  const df = QODER_CN_FALLBACK_MODELS.find((m) => m.id === 'dfmodel')
+  assert.ok(df !== undefined, 'CN 目录必须有 dfmodel')
+  assert.equal(df!.defaultEffort, 'high', 'CN dfmodel 的目录默认档是 high')
+
+  // 反向：目录没声明 defaultEffort 的模型，兜底值必须是 undefined（不编造）。
+  const noDefault = QODER_CN_FALLBACK_MODELS.find((m) => m.defaultEffort === undefined)
+  assert.ok(noDefault !== undefined, '目录里应存在未声明 defaultEffort 的模型（用于验证不编造）')
+  assert.equal(noDefault!.defaultEffort, undefined)
 })

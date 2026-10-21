@@ -177,7 +177,12 @@ export const QODER_CN_FALLBACK_MODELS: readonly QoderFallbackModel[] = [
   { id: 'q37fmodel', name: 'Qwen3.7-Flash', contextWindow: 1_000_000, supportsImage: true, supportsThinking: true, priceFactor: 0.1 },
   // ⚠️ CN 的 `max_input_tokens` 是 96000，但档位表有 1M 档 → 填 1M（口径见 `contextWindow`）。
   { id: 'dmodel', name: 'DeepSeek-V4-Pro', contextWindow: 1_000_000, supportsImage: true, supportsThinking: true, priceFactor: 0.5 },
-  { id: 'dfmodel', name: 'DeepSeek-Flash', contextWindow: 1_000_000, supportsImage: true, priceFactor: 0.1 },
+  // ⚠️ CN 目录原本这三项全缺（`supportsThinking`/`efforts`/`defaultEffort`），
+  // 导致 `/v1/models` 里该模型既不能报档位、客户端也选不了思考强度。
+  // 2026-10-21 实测 reasoning_tokens 单调分层：
+  //   low=206 / high=436 / max=736 / **不传=1212**
+  // 「不传」比 low 多 5.9 倍 —— 上游默认走最重思考，必须显式声明档位。
+  { id: 'dfmodel', name: 'DeepSeek-Flash', contextWindow: 1_000_000, supportsImage: true, supportsThinking: true, priceFactor: 0.1, efforts: ['low', 'high', 'max'], defaultEffort: 'high', supportsDisable: true },
   { id: 'gmodel', name: 'GLM-5.3', contextWindow: 1_000_000, supportsImage: true, supportsThinking: true, priceFactor: 0.8 },
   { id: 'gfmodel', name: 'GLM-5.3-Flash', contextWindow: 1_000_000, supportsImage: true, supportsThinking: true, priceFactor: 0.1 },
   // CN 独有：GLM-5.2（国际版目录无此 key）。
@@ -1183,9 +1188,30 @@ async function postQoderInfer(
   const maxTokens = typeof body.max_tokens === 'number' && Number.isSafeInteger(body.max_tokens) && body.max_tokens > 0
     ? body.max_tokens
     : undefined
-  const reasoningEffort = typeof body.reasoning_effort === 'string' && body.reasoning_effort.length > 0
+  // ⚠️ **客户端没给档位时，用目录里的默认档位补上**（`defaultEffort`）。
+  //
+  // ## 为什么必须补
+  //
+  // 不传 `reasoning_effort` 并不等于「上游用中性默认值」—— 实测同一个问题
+  //（`qodercn/dfmodel`，"解释递归"）的 reasoning_tokens：
+  //
+  // | 请求 | reasoning_tokens |
+  // |---|---|
+  // | 不传档位 | **1417** |
+  // | `low`    | 247 |
+  // | `max`    | 728 |
+  //
+  // 不传时的思考量**比显式 `max` 还多 2 倍**，即上游默认走的是「最重思考」。
+  // 客户端（如 DSH）只在用户**主动选**档位时才带该字段，于是「没选」= 被动
+  // 接受最贵的档位，既慢又费积分。
+  //
+  // 口径：目录给了 `defaultEffort` 就用它（那是上游自己声明的默认档）；
+  // 目录没给则保持 `undefined`（= 不干预，与改动前一致）。
+  const clientEffort = typeof body.reasoning_effort === 'string' && body.reasoning_effort.length > 0
     ? body.reasoning_effort
     : undefined
+  const catalogDefaultEffort = findQoderModel(product, request.model)?.defaultEffort
+  const reasoningEffort = clientEffort ?? catalogDefaultEffort
 
   const prepared = await prepareQoderInfer({
     user: { uid: credential.uid, securityOauthToken: credential.accessToken },
