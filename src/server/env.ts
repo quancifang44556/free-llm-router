@@ -122,6 +122,7 @@ export function createNodeRuntime(databasePath?: string): NodeRuntimeContext {
     // `tests/safety-config.test.ts` 的环境变量回落用例抓出来的）。
     // 同为原样透传：解析与「0 = 不限制」的语义归 `resolveMaxContextMessages`。
     MAX_CONTEXT_MESSAGES: process.env.MAX_CONTEXT_MESSAGES?.trim(),
+    PUBLIC_URL: process.env.PUBLIC_URL?.trim(),
     /**
      * 🔴 **这三个曾经漏在白名单外**（2026-10-21 审查补，M6 指出）。
      *

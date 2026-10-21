@@ -1168,6 +1168,30 @@ function annotateModelEntry(
   return out
 }
 
+/**
+ * 拼 OAuth 回调地址时用的「对外基准地址」。
+ *
+ * 🔴 **绝不能直接用 `url.origin`**（2026-10-21 审查补，安全面专项）：
+ * 它来自 `Host` + `x-forwarded-proto` 两个**客户端可控**的请求头。
+ * 伪造 Host 就能把回调指到攻击者域，而 OAuth 回调里带着
+ * 「换取上游凭据的能力凭证（secret）」—— 等于把账号送人。
+ *
+ * 优先 `PUBLIC_URL`；未设置才回落到请求 origin（单机场景），并打一次 warn。
+ */
+let warnedMissingPublicUrl = false
+function publicOrigin(env: Env, url: URL): string {
+  const configured = env.PUBLIC_URL?.trim()
+  if (configured !== undefined && configured !== '') return configured.replace(/\/+$/, '')
+  if (!warnedMissingPublicUrl) {
+    warnedMissingPublicUrl = true
+    console.warn(
+      '⚠️ [安全] 未设置 PUBLIC_URL，OAuth 回调地址将按请求头 Host 拼接。'
+        + '生产环境请设置 PUBLIC_URL，否则伪造 Host 可把回调指到他人域名。',
+    )
+  }
+  return url.origin
+}
+
 async function handle(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   try {
     return await handleInner(request, env, ctx)
@@ -1651,7 +1675,7 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
       const ticketId = crypto.randomUUID()
       const state = generateCodeArtsLoginState()
       // 回调地址取**本次请求的 origin** —— 自定义域与 workers.dev 都自动正确。
-      const callbackUrl = buildCodeArtsCallbackUrl(url.origin, state)
+      const callbackUrl = buildCodeArtsCallbackUrl(publicOrigin(env, url), state)
       const { loginUrl } = buildCodeArtsLoginUrl(callbackUrl, ticketId)
       const expiresAt = Date.now() + CODEARTS_LOGIN_STATE_TTL_MS
       // ⚠️ `expiresAt` 也存进载荷：回调回写 secret 时要沿用它（否则每次回跳

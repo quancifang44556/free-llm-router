@@ -986,6 +986,48 @@ export async function handleChatCompletions(
 
   // 非 WorkBuddy 的供应商走独立的 Provider 接口（协议差异极大，
   // 不能把分支塞进下面这段 WorkBuddy 专用逻辑里）。
+  /**
+   * 🔴 **逐模型「停用」必须在直连路径也生效**（2026-10-21 审查补，重复实现专项）。
+   *
+   * 「供应商级」关闭上面已经两路都拦了；但**模型级**此前只在 `/v1/models`
+   * 目录与 `aggregate` 聚合路径过滤（`filterDisabledCandidates`）。
+   * 于是：面板里关掉的烧钱模型，目录里消失、`aggregate/auto` 也剔除它，
+   * 但客户端直接写 `qodercn/dfmodel`（或裸名）**照样打通、照样扣额度**。
+   *
+   * 就是上面那段注释的原话 ——「只在 `/v1/models` 里过滤是不够的 …… 那会让
+   * 『我明明关了它』变成一句空话」—— 只是这句当时没对模型级执行。
+   */
+  /**
+   * ⚠️ `auto` 是**网关自己的别名**（"不指定模型，用默认的"），不是供应商的真实模型 id。
+   *
+   * 停用列表里可能存在一条陈旧的 `auto`（历史目录里曾有过同名模型），
+   * 若一并拦掉，会把 `buddy/auto` 这个**默认入口**打成 403 ——
+   * 实测就踩到了：上线后 `buddy/auto` 立刻从 200 变成
+   * `模型「auto」已被停用`，而 `/v1/models` 里根本不存在 `buddy/auto`。
+   *
+   * 与 `aggregate/auto` 的处理保持一致：别名不受「停用」约束。
+   */
+  const isAutoAlias = model.toLowerCase() === 'auto'
+  try {
+    const poolForModelGate = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
+    const disabledModels = isAutoAlias ? [] : await poolForModelGate.getDisabledModels(providerId)
+    if (disabledModels.length > 0) {
+      const lowered = model.toLowerCase()
+      if (disabledModels.some((m) => m.toLowerCase() === lowered)) {
+        return {
+          response: jsonError(
+            403,
+            `模型「${model}」已被你在面板中停用。如需使用，请在「模型」页重新启用。`,
+            'model_disabled',
+          ),
+        }
+      }
+    }
+  } catch (error) {
+    // 读不到停用列表就按「没停用」处理：这是展示/省钱用的闸门，不该把请求卡死。
+    console.warn(`[model-disabled] 读 ${providerId} 的停用模型失败，按「未停用」放行：`, error)
+  }
+
   if (providerId !== DEFAULT_PROVIDER) {
     return await handleProviderChat({ providerId, model, wantsStream, rawBody, request, env, realm, ctx, tried: [], sessionKey })
   }

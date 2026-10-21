@@ -45,6 +45,20 @@ export interface Env {
    *
    * ⚠️ `0` 或负数 = **不限制**（显式放开，见 `parseMaxContextMessages` 的说明）。
    */
+  /**
+   * 对外的公网地址（如 `https://router.example.com`），**用于拼 OAuth 回调地址**。
+   *
+   * 🔴 为什么必须有它（2026-10-21 审查补，安全面专项）：
+   * 回调地址原先由 `url.origin` 拼出，而 `origin` 来自请求头 `Host` +
+   * `x-forwarded-proto` —— **两者都是客户端可控的**。
+   * 一旦有人拿着管理密钥调 `POST /admin/providers/login/start` 并伪造 Host，
+   * 回调就会被指到攻击者域；用户完成授权后，上游把 `?secret=<换取凭据的能力凭证>`
+   * 送到那里 —— 直接拿到可换 accessToken 的 secret。
+   *
+   * 未设置时仍回落到 `url.origin`（保持单机可用），但会**打一条 warn**。
+   */
+  PUBLIC_URL?: string
+
   MAX_CONTEXT_MESSAGES?: string
 
   /**

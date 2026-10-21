@@ -73,3 +73,41 @@ export async function readJsonCapped(
   }
   return JSON.parse(new TextDecoder().decode(buf)) as unknown
 }
+
+/**
+ * 读文本但**只保留前 `limit` 字节**（多余部分直接丢弃，不驻留内存）。
+ *
+ * 🔴 用于**上游错误响应体**（2026-10-21 审查补，并发专项）：
+ * 原来是 `const text = await response.text()` 然后再 `text.slice(0, 4096)` ——
+ * 注释写的是「截断到 4KB」，实际**先把整包读进内存**再截。
+ * 上游/WAF/强制门户回一个几 MB 的 HTML 时，单次错误就能把几 MB 搬进内存。
+ */
+export async function readTextCapped(response: Response, limit: number = 4096): Promise<string> {
+  if (response.body === null) return ''
+  const reader = response.body.getReader()
+  const chunks: Uint8Array[] = []
+  let total = 0
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      if (value === undefined) continue
+      const room = limit - total
+      if (room <= 0) break
+      chunks.push(value.byteLength <= room ? value : value.subarray(0, room))
+      total += Math.min(value.byteLength, room)
+      if (total >= limit) break
+    }
+  } finally {
+    // ⚠️ 必须 cancel：否则底层 socket 会把剩余字节继续推进来
+    await reader.cancel().catch(() => undefined)
+    reader.releaseLock?.()
+  }
+  const buf = new Uint8Array(total)
+  let offset = 0
+  for (const c of chunks) {
+    buf.set(c, offset)
+    offset += c.byteLength
+  }
+  return new TextDecoder().decode(buf)
+}

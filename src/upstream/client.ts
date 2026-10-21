@@ -17,6 +17,7 @@
  * 2. **12153 单次不算死亡**：连续 3 次才禁用（`state.go:27-40`）。
  */
 
+import { readTextCapped } from '../gateway/body.js'
 import type { HeaderMap } from './headers.js'
 
 /** 上游业务信封（所有端点统一形态）。 */
@@ -626,8 +627,10 @@ export async function callUpstream<T = unknown>(options: RequestOptions): Promis
     })
   }
 
-  const text = await response.text()
-  const raw = text.slice(0, 4096)
+  // ⚠️ 只读前 4 KiB：注释说的「截断到 4KB」原先只是**读完之后**才 slice，
+  // 上游回一个几 MB 的错误页时会整包进内存（并发专项实测）。
+  const text = await readTextCapped(response, 4096)
+  const raw = text
   const envelope = parseEnvelope(text) as Envelope<T> | undefined
 
   // 网络层「成功但业务失败」也走信封：code !== 0 视为 not ok
