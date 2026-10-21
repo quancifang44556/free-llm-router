@@ -37,6 +37,49 @@ export function resetSafetyConfigCache(): void {
  * `MAX_CONTEXT_MESSAGES` / `BURN_RATE_*`，升级后若 DO 里还没有值，
  * 直接换成代码默认会把人家配好的东西**悄悄改回默认**。
  */
+/**
+ * 单账号 QPS 上限（`RATE_LIMIT_QPS`，默认 **0 = 不限速**）。
+ *
+ * ## 为什么需要它（防封的「节奏」层）
+ *
+ * 真人操作有停顿，脚本是连发。上游把「高频连发」并入机器行为画像。
+ * `throttle.ts` 实现了按 uid 的限速 + 抖动，但**此前没有任何开启途径**：
+ * `rateLimitQps` 硬编码 0、无环境变量、面板也没有对应端点 ——
+ * 等于模块写好了却永远关着。
+ *
+ * ## 为什么沿用「环境变量回落」而不是加硬编码常量
+ *
+ * 与 `MAX_CONTEXT_MESSAGES` / `BURN_RATE_*` 同一口径：老部署用环境变量配过，
+ * 升级后若 DO 里没值就直接用代码默认，会把人配好的东西**悄悄改回默认**。
+ * 补上回落，部署方一个环境变量就能开，不必等面板端点。
+ *
+ * ⚠️ **默认保持 0（关闭）**：限速会改变现有用户的实际吞吐，
+ * 该由部署方决定何时启用，不能升级后自动生效。
+ *
+ * ⚠️ 本项目跑在 **Node 单容器**（非 Workers），所以 `throttle.ts` 里
+ * 「多 isolate 各一份状态」的已知限制在这里**不成立** —— 限速是精确的。
+ */
+function resolveRateLimitQps(env: Env): number {
+  const raw = (env as { RATE_LIMIT_QPS?: string }).RATE_LIMIT_QPS
+  if (raw === undefined || raw.trim() === '') return 0
+  const n = Number(raw)
+  // 非法值回落 0（=关闭）。限速配置写错时宁可放行，也不要卡住全部请求。
+  return Number.isFinite(n) && n > 0 ? n : 0
+}
+
+/**
+ * 限速之外的随机抖动上限（`RATE_JITTER_MS`，默认 0）。
+ *
+ * 固定间隔本身也是一种"机器特征"：每 1000ms 一次，比随机间隔更像脚本。
+ * 抖动让节奏接近人类。只有 `RATE_LIMIT_QPS > 0` 时才有意义。
+ */
+function resolveRateJitterMs(env: Env): number {
+  const raw = (env as { RATE_JITTER_MS?: string }).RATE_JITTER_MS
+  if (raw === undefined || raw.trim() === '') return 0
+  const n = Number(raw)
+  return Number.isFinite(n) && n > 0 ? n : 0
+}
+
 function envFallback(env: Env): SafetyConfig {
   const burn = resolveBurnRate(env)
   return {
@@ -44,8 +87,8 @@ function envFallback(env: Env): SafetyConfig {
     maxContextMessages: resolveMaxContextMessages(env),
     burnRateWindowMs: burn.windowMs,
     burnRateThresholdPct: burn.thresholdPct,
-    rateLimitQps: 0,
-    rateJitterMs: 0,
+    rateLimitQps: resolveRateLimitQps(env),
+    rateJitterMs: resolveRateJitterMs(env),
   }
 }
 

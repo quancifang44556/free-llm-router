@@ -413,3 +413,28 @@ test('🔴 误判可人工解冻：clear 端点必须支持按 uid 解除单个�
   // fails 也要清：只清 restricted 而留着 fails，下次 5xx 立刻又熔断
   assert.match(pool, /state\.fails = 0/, '解除限制时应同时清失败计数')
 })
+
+test('🔴 限速模块必须有开启途径（否则写好也永远关着）', async () => {
+  // ## 真实缺陷
+  // `src/gateway/throttle.ts` 实现了按 uid 限速 + 抖动，防封的「节奏」层。
+  // 但 `safety.ts` 的 envFallback 里 `rateLimitQps` **硬编码 0**，
+  // 且无环境变量、面板无端点 ⇒ 模块写好了却永远关着。
+  //
+  // 这同一文件里其它配置（MAX_CONTEXT_MESSAGES / BURN_RATE_*）**都有**
+  // 环境变量回落，注释明写「不能把人配好的东西悄悄改回默认」。限速是个例外，
+  // 属于漏做，不是有意设计。
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync('src/gateway/safety.ts', 'utf8')
+
+  assert.match(src, /RATE_LIMIT_QPS/, '必须能用环境变量开启限速')
+  assert.match(src, /RATE_JITTER_MS/, '抖动也必须可配（固定间隔本身是机器特征）')
+  // 默认必须仍是关闭：限速会改变现有吞吐，不能升级后自动生效
+  assert.match(src, /raw\.trim\(\) === ''\) return 0/, '未设置时必须回落 0（关闭）')
+  // 非法值也必须回落关闭，而不是 NaN（NaN 会让每次请求都算出一个无效等待）
+  assert.match(src, /Number\.isFinite\(n\) && n > 0 \? n : 0/, '非法值必须回落关闭')
+  // 不能硬编码 0 了事（这正是缺陷本身）
+  assert.ok(
+    !/^\s+rateLimitQps: 0,$/m.test(src),
+    'rateLimitQps 不能硬编码 0 —— 那等于这个模块永远不生效',
+  )
+})
