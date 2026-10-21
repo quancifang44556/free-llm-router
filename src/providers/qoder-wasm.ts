@@ -125,8 +125,31 @@ async function compileWasm(raw: unknown): Promise<WebAssembly.Module> {
  */
 const IMPORT_MODULE = './qoder_auth_wasm_bg.js'
 
-/** 客户端版本（影响 `Cosy-Version` 与签名载荷）。 */
+/**
+ * 客户端版本（影响 `Cosy-Version` 头**与签名载荷**）。
+ *
+ * ⚠️ **这个值直接参与签名**（见 `prepareQoderInfer` 里写进 stack 的 `version`），
+ * 改错会让上游回 `403 Signature invalid` —— 不是"旧一点也无所谓"的装饰性头。
+ *
+ * 当前值 1.1.49 来自最初的参考实现，**没有留下可核验的依据**。
+ * 上游若升级 CLI，可用 `QODER_COSY_VERSION` 环境变量覆盖而不必改代码：
+ * shuishuipingan/qoder2api-hub 的 PR #75 对照官方 qodercli 1.1.75 与桌面端 0.4.8
+ * 指出网关应升到 1.1.75，但该版本号**在本环境无法独立核实**（npm 上查不到
+ * `qodercli`），故不盲改默认值 —— 只把覆盖入口打开，等实测确认后再动常量。
+ */
 export const QODER_COSY_VERSION = '1.1.49'
+
+/**
+ * 实际使用的客户端版本：`QODER_COSY_VERSION` 优先，便于上游升级时无需改代码。
+ *
+ * 用 `globalThis` 探测而不是直接写 `process`：本模块同时要跑在 Workers
+ *（没有 `process`）与 Node（有）上，直接引用会让 Workers 构建期的类型检查失败。
+ */
+export function cosyVersion(): string {
+  const env = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env
+  const trimmed = (env?.QODER_COSY_VERSION ?? '').trim()
+  return trimmed === '' ? QODER_COSY_VERSION : trimmed
+}
 
 /** `generate_runtime_auth_fields` 的产物。 */
 export interface QoderRuntimeAuthFields {
@@ -571,7 +594,7 @@ export async function prepareQoderInfer(options: {
 }): Promise<QoderInferRequest> {
   const g = await getGlue()
   const fields = await generateRuntimeAuthFields(options.user)
-  const version = options.clientVersion ?? QODER_COSY_VERSION
+  const version = options.clientVersion ?? cosyVersion()
 
   const userInfoJson = JSON.stringify({
     uid: options.user.uid,

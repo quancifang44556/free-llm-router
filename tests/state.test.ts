@@ -325,3 +325,65 @@ test('🔴 回归：/admin/accounts 必须暴露 restrictedUntil（否则"被封
     'restrictedUntil 不能错接成 breakerUntil（两者语义不同）',
   )
 })
+
+test('🔴 延迟记账：全池同样失败**不得**记熔断（否则上游抖动会放大成半小时不可用）', async () => {
+  // ## 依据 qoder2api-hub #65 的 C 点（"连锁熔断"）
+  //
+  // 缺陷形态：每个请求遍历 N 个号，每号失败各记 1 次 `fails`；
+  // 3 个请求后所有号 breaker 30 分钟。而熔断期内**没有成功请求来复位计数**，
+  // 所以上游恢复后号池仍然不可用 —— 故障被我们自己延长了。
+  //
+  // 修复：breaker/degrade 延迟记账，只在「换号后成功了」时结算；
+  // 全失败则丢弃。判据是"换号成功"而不是"这个号失败了"。
+  //
+  // 这里做源码级守卫（行为层需要真 DO，单测不便造）：
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync('src/gateway/server.ts', 'utf8')
+
+  // ① 必须存在 blame 收件箱，且只收累加型维度
+  assert.match(src, /const blame: Array<\{ uid: string; kind: 'breaker' \| 'degrade'; reason: string \}> = \[\]/,
+    'breaker/degrade 必须走延迟记账（blame 只收这两种累加型维度）')
+
+  // ② 这两个维度不得直接 applyFailure
+  assert.match(src, /if \(punishKind === 'breaker' \|\| punishKind === 'degrade'\) \{\s*blame\.push/,
+    'breaker/degrade 应先入 blame，而不是立即记账')
+
+  // ③ 成功时必须结算
+  assert.match(src, /settleBlame\(pool, blame, Date\.now\(\)\)/,
+    '首帧成功时必须结算 blame')
+
+  // ④ 全失败时必须丢弃并留日志
+  assert.match(src, /全池同样失败，丢弃/,
+    '全池失败时必须丢弃 blame 并打日志，不能静默记熔断')
+
+  // ⑤ 有明确上游证据的维度**仍然立即记**（不能被误改成延迟）
+  assert.match(src, /\.applyFailure\(\{\s*uid: candidate\.uid,\s*kind: punishKind,/,
+    'restricted/model/soft 等仍应立即记账（它们有上游证据，不靠换号反推）')
+})
+
+test('🔴 cosy 版本可被环境变量覆盖（签名载荷里的版本，不能硬编码锁死）', async () => {
+  // 背景：`QODER_COSY_VERSION` 不只是 `Cosy-Version` 头 —— 它被写进
+  // `prepareQoderInfer` 的签名载荷，改错会让上游回 403 Signature invalid。
+  // 上游升级 CLI（qoder2api-hub PR #75 指出 1.1.75）时若只能改代码重新发版，
+  // 运维会很被动；但盲改默认值又会破坏签名。折中：打开覆盖入口，默认值不动。
+  const mod = await import('../src/providers/qoder-wasm.ts')
+  assert.equal(typeof mod.cosyVersion, 'function', '必须有 cosyVersion() 覆盖入口')
+
+  const prev = process.env.QODER_COSY_VERSION
+  try {
+    // 默认：没有环境变量时用内置常量
+    delete process.env.QODER_COSY_VERSION
+    assert.equal(mod.cosyVersion(), mod.QODER_COSY_VERSION)
+
+    // 空串/空白视为未设置，不能把空版本号发上去（会签出非法载荷）
+    process.env.QODER_COSY_VERSION = '   '
+    assert.equal(mod.cosyVersion(), mod.QODER_COSY_VERSION, '空白值必须回落到默认')
+
+    // 显式覆盖生效且去空白
+    process.env.QODER_COSY_VERSION = ' 1.1.75 '
+    assert.equal(mod.cosyVersion(), '1.1.75')
+  } finally {
+    if (prev === undefined) delete process.env.QODER_COSY_VERSION
+    else process.env.QODER_COSY_VERSION = prev
+  }
+})

@@ -173,6 +173,40 @@ export function modelCauseFor(kind: ErrorKind): 'busy' | 'absent' | 'denied' | u
   }
 }
 
+/**
+ * 结算延迟记账：把 `blame` 里的失败真正写进账号状态。
+ *
+ * ## 为什么需要「延迟」这一步（qoder2api-hub #65 的 C 点）
+ *
+ * 判据是「**换号后成功了**」，而不是「这个号失败了」：
+ * - 成功 ⇒ 说明其余候选是健康的，之前的失败确实是那几个号的问题 ⇒ 记账；
+ * - 全失败 ⇒ 更可能是上游整体故障 / 本机断网 ⇒ **丢弃**，只留一条日志。
+ *
+ * 不这么做会造成连锁熔断：每个请求遍历 N 个号、各记 1 次失败，
+ * 3 个请求后全池 `breaker` 30 分钟；而熔断期内没有成功请求来复位计数，
+ * 于是**上游恢复后号池仍然不可用** —— 故障被我们自己延长了。
+ *
+ * 只用于 breaker / degrade（累加型计数）；restricted / model / soft
+ * 有明确上游证据，一律立即记账，不走这里。
+ */
+async function settleBlame(
+  pool: DurableObjectStub<AccountPoolDO>,
+  blame: Array<{ uid: string; kind: 'breaker' | 'degrade'; reason: string }>,
+  now: number,
+): Promise<void> {
+  if (blame.length === 0) return
+  await Promise.all(
+    blame.map((b) =>
+      pool.applyFailure({ uid: b.uid, kind: b.kind, now, reason: b.reason }).catch((error: unknown) => {
+        console.warn(
+          `[blame] 结算失败 uid=${b.uid} kind=${b.kind}: ` +
+            (error instanceof Error ? error.message : String(error)),
+        )
+      }),
+    ),
+  )
+}
+
 export function mapErrorToPunishment(kind: ErrorKind): {
   punish: boolean
   dimension: 'soft' | 'hard' | 'breaker' | 'degrade' | 'session_dead' | 'model' | 'restricted'
@@ -957,6 +991,18 @@ export async function handleChatCompletions(
   const pinnedHeader = requestedAccount(request)
   const maxRotate = await maxRotateFor(pool)
 
+  // ⚠️ **延迟记账收件箱**（借鉴 qoder2api-hub #65 的 blame 机制）。
+  //
+  // 只有「**换号后成功了**」才能证明问题出在之前那个账号上；若所有号都以同样方式
+  // 失败，更可能是上游整体故障 / 本机断网，此时给每个号都记一次失败会造成
+  // **连锁熔断**：每个请求遍历 N 个号 ⇒ 各记 1 次 ⇒ 3 个请求后全池 breaker 30 分钟，
+  // 而熔断期内没有成功请求来复位计数，网络恢复后号池仍然不可用。
+  //
+  // 因此只对「会累加失败计数」的维度（breaker / degrade）延迟记账；
+  // restricted（上游明确标记）、model（模型级）、soft（限流）等**仍然立即记** ——
+  // 它们都有明确的上游证据，不是「靠换号成功才反推」的推测。
+  const blame: Array<{ uid: string; kind: 'breaker' | 'degrade'; reason: string }> = []
+
   for (let attempt = 0; attempt <= maxRotate; attempt += 1) {
     const now = Date.now()
     // ⚠️ 限定默认供应商：池里可能同时有 cline 等家的账号，
@@ -1104,10 +1150,16 @@ export async function handleChatCompletions(
       // 记账（按类别落到正确维度）
       if (mapped.punish) {
         const cause = modelCauseFor(kind)
+        const punishKind =
+          kind === 'rate_limited' ? dimension : mapped.dimension === 'model' ? 'model' : mapped.dimension
+        // 累加失败的维度延迟到「换号成功」时再记（见 blame 的注释）
+        if (punishKind === 'breaker' || punishKind === 'degrade') {
+          blame.push({ uid: candidate.uid, kind: punishKind, reason: `${kind}: ${msg}`.slice(0, 200) })
+        } else {
         await pool
           .applyFailure({
             uid: candidate.uid,
-            kind: kind === 'rate_limited' ? dimension : mapped.dimension === 'model' ? 'model' : mapped.dimension,
+            kind: punishKind,
             now: Date.now(),
             ...(model !== '' ? { model } : {}),
             // ⚠️ 带上上游给的重置时刻（文案里的 `reset at … UTC+8`）。
@@ -1123,10 +1175,11 @@ export async function handleChatCompletions(
             // ⚠️ 但**不能完全静默** —— 此前这里是空 catch，导致「restricted 维度
             // 没被 DO 接受」这类问题只表现为「罚了却看不出罚」，线上排查极难。
             console.warn(
-              `[punish] applyFailure 失败 uid=${candidate.uid} kind=${mapped.dimension}: ` +
+              `[punish] applyFailure 失败 uid=${candidate.uid} kind=${punishKind}: ` +
                 (error instanceof Error ? error.message : String(error)),
             )
           })
+        }
       }
 
       lastError = {
@@ -1263,6 +1316,11 @@ export async function handleChatCompletions(
           const okTask = pool.noteSuccess(candidate.uid, Date.now(), undefined, model).catch(logPoolError('noteSuccess'))
           if (ctx !== undefined) ctx.waitUntil(okTask)
           else void okTask
+          // ✅ **结算 blame**：这个号成功了 ⇒ 之前那些失败确实是那几个号的问题，
+          // 现在才记账（见 blame 的注释：全池同样失败时不记账，避免连锁熔断）。
+          const settle = settleBlame(pool, blame, Date.now())
+          if (ctx !== undefined) ctx.waitUntil(settle)
+          else void settle
         },
         onFinish: (usage) => {
           // 记账用量（面板的「用量」视图靠它）
@@ -1341,6 +1399,16 @@ export async function handleChatCompletions(
   }
 
   // 所有轮转都失败
+  // ⚠️ **丢弃 blame**：所有候选都以同样方式失败，没有「换号后成功」这个证据，
+  // 就不能断定是那几个号坏了（更可能是上游整体故障 / 本机断网）。
+  // 记账会累加 `fails`，3 次后全池熔断 30 分钟且期间无成功请求复位 ——
+  // 那会把一次上游抖动放大成半小时不可用。留日志便于事后判断。
+  if (blame.length > 0) {
+    console.warn(
+      `[blame] 全池同样失败，丢弃 ${blame.length} 条失败记录（不记熔断）: ` +
+        blame.map((b) => `${b.uid.slice(0, 8)}/${b.kind}`).join(','),
+    )
+  }
   return {
     response: jsonError(
       lastError?.status ?? 502,
