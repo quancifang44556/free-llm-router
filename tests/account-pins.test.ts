@@ -579,6 +579,7 @@ test('🔴 provider 返回非 2xx 时必须按业务语义罚，不能一律熔�
       await addAccount(pool, 'n1', { provider: 'opencode' })
       await pool.putCredential('n1', { uid: 'n1', nickname: 'n1', accessToken: 't', refreshToken: '', expiresAt: Date.now() + 3600_000 }, Date.now())
 
+
       const res = await handleProviderChat({
         providerId: 'opencode', model: 'm', wantsStream: false,
         rawBody: { model: 'm', messages: [{ role: 'user', content: 'hi' }] },
@@ -592,6 +593,57 @@ test('🔴 provider 返回非 2xx 时必须按业务语义罚，不能一律熔�
       assert.equal(acc.breakerUntil, 0, '⚠️ 400 参数错误不得熔断账号')
       assert.equal(acc.fails, 0, '失败计数也不该涨')
       assert.equal(acc.until, 0, '也不该产生冷却')
+    } finally {
+      provider.chat = originalChat
+      console.log = originalLog
+      console.warn = originalWarn
+    }
+  } finally {
+    rt.cleanup()
+  }
+})
+
+test('🔴 换号时必须重算 conversationId（不得把同一会话 id 发给两个账号）', async () => {
+  // 2026-10-21 审查（M3）指出的高危：源码注释明写「换号**必须**换 id
+  //（同一段会话 id 发给两个账号就是跨账号关联键）」，但实现是
+  //   let providerConversationId = sessionKey === '' ? crypto.randomUUID() : ''
+  //   … 循环内 if (providerConversationId === '') { … }
+  // ⇒ 只在第一个账号身上算一次，之后换号全程复用。
+  // buddy 路径的 `conversationId` 有同一缺陷（两处都已修）。
+  const rt = freshRuntime('conv-id-rotate')
+  try {
+    const provider = findProvider('cline')
+    assert.ok(provider !== undefined)
+    const originalChat = provider.chat
+    const originalLog = console.log
+    const originalWarn = console.warn
+    const seen: string[] = []
+    let calls = 0
+    console.log = () => {}
+    console.warn = () => {}
+    provider.chat = (async (_cred: unknown, opts: { conversation?: { conversationId?: string } }) => {
+      calls += 1
+      seen.push(String(opts?.conversation?.conversationId ?? ''))
+      if (calls === 1) throw new Error('upstream busy')
+      return new Response(okStream('ok'), { status: 200, headers: { 'content-type': 'text/event-stream' } })
+    }) as never
+    try {
+      const pool = rt.env.ACCOUNT_POOL.get(rt.env.ACCOUNT_POOL.idFromName('cn'))
+      for (const uid of ['cq1', 'cq2']) {
+        await addAccount(pool, uid, { provider: 'cline' })
+        await pool.putCredential(uid, { uid, nickname: uid, accessToken: `tok-${uid}`, refreshToken: '', expiresAt: Date.now() + 3600_000 }, Date.now())
+      }
+
+      const res = await handleProviderChat({
+        providerId: 'cline', model: MODEL, wantsStream: false,
+        rawBody: { model: MODEL, messages: [{ role: 'user', content: 'hi' }] },
+        request: new Request('https://example.test/v1/chat/completions', { method: 'POST', headers: {} }),
+        env: rt.env, realm: 'cn', tried: [], sessionKey: '', failoverDepth: 1,
+      })
+      const bodyText = await res.response.text()
+
+      assert.ok(calls >= 2, `应发生换号重试（实际 ${calls} 次）；响应=${bodyText.slice(0, 200)}`)
+      assert.notEqual(seen[0], seen[1], '⚠️ 换号后 conversationId 必须变化（否则是跨账号关联键）')
     } finally {
       provider.chat = originalChat
       console.log = originalLog

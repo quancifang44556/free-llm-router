@@ -1027,7 +1027,25 @@ export async function handleChatCompletions(
   // 放在循环内会让每次重试都变成「另一个会话 / 另一轮」，正是上游画像里最显眼的
   // 非人类特征。
   const turnRequestId = newTurnRequestId()
-  let conversationId = sessionKey === '' ? crypto.randomUUID() : ''
+  /**
+   * `X-Conversation-ID` 的**当前值**与**它属于哪个账号**（2026-10-21 审查补，M3 指出高危）。
+   *
+   * ## 原缺陷：注释与实现相反
+   * 下面（`:1167`）的注释明写「`X-Conversation-ID` 按「账号 + 会话」派生：
+   * 换号**必须**换 id（同一段会话 id 发给两个账号就是跨账号关联键）」，
+   * 但实现是 `if (conversationId === '') { … }` —— 只在**第一次**算，
+   * 之后换号**永远复用**同一个 id。**注释描述了意图，代码做了相反的事。**
+   *
+   * 更糟的是 `sessionKey === ''` 时原来直接 `crypto.randomUUID()` 一次，
+   * 于是「无会话」的请求在整个重试链路上共用**一个随机 id**，同样构成关联键。
+   *
+   * ## 为什么要记 owner
+   * 只判 `=== ''` 无法区分「没算过」与「算过但属于别的账号」。
+   * 用 `conversationIdOwner` 显式记住归属，账号一变就重算 ——
+   * 同一账号的多次重试仍复用同一 id（客户端在同一次发送里重试是正常的）。
+   */
+  let conversationId = ''
+  let conversationIdOwner = ''
   const pinnedHeader = requestedAccount(request)
   const maxRotate = await maxRotateFor(pool)
 
@@ -1165,8 +1183,16 @@ export async function handleChatCompletions(
 
     // ⚠️ `X-Conversation-ID` 按「账号 + 会话」派生：换号**必须**换 id
     //（同一段会话 id 发给两个账号就是跨账号关联键）。
-    if (conversationId === '') {
-      conversationId = await deriveIntlConversationId(candidate.uid, sessionKey)
+    //
+    // 🔴 判据是「**归属账号变了**」，不是「还没算过」（2026-10-21 审查补，M3 指出）。
+    // 原来写成 `if (conversationId === '')`，于是：
+    //   - 有会话：只在第一个账号身上算一次，之后换号全程复用 ⇒ 跨账号关联键；
+    //   - 无会话：整个重试链路共用一个 `randomUUID()` ⇒ 同样是关联键。
+    if (conversationIdOwner !== candidate.uid) {
+      conversationId = sessionKey === ''
+        ? crypto.randomUUID()
+        : await deriveIntlConversationId(candidate.uid, sessionKey)
+      conversationIdOwner = candidate.uid
     }
 
     // ② 构造出站请求
@@ -2067,7 +2093,19 @@ export async function handleProviderChat(input: {
   // `X-Conversation-Request-ID` 在一轮用户发送里恒定（重试复用），
   // 放在循环内会让每次重试都变成「另一轮」。
   const providerTurnRequestId = newTurnRequestId()
-  let providerConversationId = sessionKey === '' ? crypto.randomUUID() : ''
+  /**
+   * 与 buddy 路径的 `conversationId` **同一缺陷、同一修法**
+   *（2026-10-21 审查补，M3 指出高危）。
+   *
+   * 原来 `let providerConversationId = sessionKey === '' ? crypto.randomUUID() : ''`
+   * 配合循环内 `if (providerConversationId === '') { … }`，
+   * ⇒ 只在**第一个账号**身上算一次，之后换号全程复用
+   * ⇒ **同一段会话 id 发给多个账号 = 跨账号关联键**（防封最忌的形态之一）。
+   *
+   * 判据改为「**归属账号变了**」：用 `providerConversationIdOwner` 显式记归属。
+   */
+  let providerConversationId = ''
+  let providerConversationIdOwner = ''
   const pinnedHeader = requestedAccount(request)
   /** 是否被「只用指定账号」挡住（挡住时不做跨渠道容灾 —— 用户要的就是这个号）。 */
   let pinBlocked = false
@@ -2199,8 +2237,12 @@ export async function handleProviderChat(input: {
     tried.push(picked.uid)
     console.log(`[pick:${providerId}] 选中账号 uid=${picked.uid} realm=${activeRealm} tried=${tried.length}`)
     // ⚠️ 换号必须换会话 id（同一段会话发给两个账号就是跨账号关联键）
-    if (providerConversationId === '') {
-      providerConversationId = await deriveIntlConversationId(picked.uid, sessionKey)
+    // 🔴 换号必须换 id（见声明处的说明）：判「归属账号变了」，不是「还没算过」。
+    if (providerConversationIdOwner !== picked.uid) {
+      providerConversationId = sessionKey === ''
+        ? crypto.randomUUID()
+        : await deriveIntlConversationId(picked.uid, sessionKey)
+      providerConversationIdOwner = picked.uid
     }
 
     const credential = (await pool.getCredential(picked.uid)) as ProviderCredential | undefined
