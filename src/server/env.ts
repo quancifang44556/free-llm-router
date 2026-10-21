@@ -111,6 +111,10 @@ export function createNodeRuntime(databasePath?: string): NodeRuntimeContext {
     UPSTREAM_CHAT_BASE: process.env.UPSTREAM_CHAT_BASE?.trim(),
     UPSTREAM_BILLING_BASE: process.env.UPSTREAM_BILLING_BASE?.trim(),
     UPSTREAM_WEB_BASE: process.env.UPSTREAM_WEB_BASE?.trim(),
+    // ⚠️ 原样透传（含空串），解析与「0 = 关闭」的语义统一由 `env.ts:resolveBurnRate` 负责 ——
+    // 在这里做任何兜底都会形成第二份判据，两处慢慢分叉（本项目已吃过多次亏）。
+    BURN_RATE_WINDOW_MS: process.env.BURN_RATE_WINDOW_MS?.trim(),
+    BURN_RATE_THRESHOLD_PCT: process.env.BURN_RATE_THRESHOLD_PCT?.trim(),
   }
 
   const accountPoolNamespace = new NodeDurableObjectNamespace<AccountPoolDO>(

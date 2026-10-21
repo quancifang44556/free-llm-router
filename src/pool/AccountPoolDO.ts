@@ -25,6 +25,8 @@
 
 import { DurableObject } from 'cloudflare:workers'
 import type { Env } from '../env.js'
+import { resolveBurnRate } from '../env.js'
+import { appendBalanceSample, detectBurnRate } from './burn-rate.js'
 import {
   type AccountState,
   createAccountState,
@@ -1079,7 +1081,7 @@ export class AccountPoolDO extends DurableObject<Env> {
   }
 
   /**
-   * 更新账号的**余额快照**（只写额度三元组，**不碰任何惩罚态**）。
+   * 更新账号的**余额快照**（只写额度三元组 + 采样史，**不碰任何惩罚态**）。
    *
    * ## 为什么不能用 `revive()` 代替
    *
@@ -1098,6 +1100,17 @@ export class AccountPoolDO extends DurableObject<Env> {
    *   4. `expiry` 策略（默认）依赖 `creditsExpiring` 排序 ⇒ 键全等，
    *      退化成按 uid 轮转，没有实现它名字承诺的「临期先烧」。
    *
+   * ## 消耗速率异常熔断（`burn-rate.ts`）
+   *
+   * 这里是**唯一**的采样入口：每次刷新把 `{at, credits}` 追加进 `state.samples`
+   *（上限 6 条），然后判「窗口内烧掉的比例」是否 ≥ 阈值。
+   * 命中时**复用现有软冷却**（`applyFailure({kind:'soft'})`）而**不是**新造一套惩罚态 ——
+   * 这样「到期自动恢复」「已在冷却中不延长」「面板显示原因」全都自动一致，
+   * 不会出现两套机制互相拆台（本项目吃过「同一个概念两处判据」的亏多次）。
+   *
+   * ⚠️ 顺序是**先写余额与采样，再判速率**：判定读的必须是刚刚落盘的那条采样，
+   * 否则会一直拿「上一次的余额」当终点，永远差一拍。
+   *
    * @param credits   可用总额；`undefined` 表示本次没查到，**保持原值**（不清零）
    * @param expiring  快过期子集（0 = 无）
    * @param earliest  最早过期时刻（0 = 无）
@@ -1112,14 +1125,58 @@ export class AccountPoolDO extends DurableObject<Env> {
     const state = normalizeAccountState(JSON.parse(raw))
     if (state === undefined) return false
 
-    // ⚠️ 只改这三个字段。**绝不动** until / breakerUntil / degradeUntil /
+    // ⚠️ 只改额度与采样。**绝不动** until / breakerUntil / degradeUntil /
     // modelCooldowns / disabled / fails —— 那是惩罚态，与余额无关。
-    state.credits = Math.max(0, Math.trunc(balance.credits))
+    const credits = Math.max(0, Math.trunc(balance.credits))
+    state.credits = credits
     state.creditsExpiring = Math.max(0, Math.trunc(balance.expiring))
     state.creditsEarliestExpiry = Math.max(0, Math.trunc(balance.earliestExpiry))
+    state.samples = appendBalanceSample(state.samples, now, credits)
 
     writeAccount(this.ctx.storage.sql, state.uid, state.realm, JSON.stringify(state), now)
+
+    await this.enforceBurnRate(state, now)
     return true
+  }
+
+  /**
+   * 按**已落盘**的采样史判一次消耗速率，异常则软冷却。
+   *
+   * ⚠️ 必须单独成一个方法而不是内联进 `updateBalance`：`applyFailure` 内部
+   * 会**重新读**账号再整体写回，与 `updateBalance` 的「读-改-写」不是同一次事务。
+   * 分开写让这条「写完再判」的时序在代码上就看得见，不会被后人误合并成一次读改写。
+   */
+  private async enforceBurnRate(state: AccountState, now: number): Promise<void> {
+    const config = resolveBurnRate(this.env)
+    // 关闭时直接返回：连判定函数都不进，省掉每条账号一次遍历。
+    if (config.windowMs <= 0 || config.thresholdPct <= 0) return
+
+    // ⚠️ 已在**硬冷却**（余额耗尽，直到次日 04:00）时不再判：软冷却分支会把
+    // `coolKind` 从 `hard` 改写成 `soft`，等于把「没钱」降级成「被限流」，
+    // 而 `until` 仍指向次日 —— 状态自相矛盾。余额为 0 时也谈不上「烧太快」。
+    if (state.coolKind === 'hard' && isActive(state.until, now)) return
+
+    const trip = detectBurnRate(state.samples, now, config)
+    if (trip === undefined) return
+
+    // 已在冷却中就不再刷日志（整点 cron 会在同一窗口内重复命中同一批采样）。
+    // 冷却本身仍交给 `applyFailure` —— 它对「已冷却」是幂等的（不推进、不延长）。
+    if (!isActive(state.until, now)) {
+      // ⚠️ 日志只放 uid **前 8 位**与额度数字，**不含任何凭据**。
+      console.warn(
+        `[burn] 消耗速率异常：账号 ${state.uid.slice(0, 8)}… 在 ${Math.round(trip.windowMs / 1000)}s 内` +
+          `消耗 ${trip.burned} 积分（${trip.pct}%），起点 ${trip.fromCredits} → 现 ${trip.credits}，已软冷却`,
+      )
+    }
+
+    // 复用现有软冷却：`until` + `coolKind='soft'` + `softStreak` 指数退避，
+    // 到期自动恢复，无需在这里另写恢复逻辑。
+    await this.applyFailure({
+      uid: state.uid,
+      kind: 'soft',
+      now,
+      reason: `credits burn ${trip.pct}% / ${Math.round(trip.windowMs / 1000)}s`,
+    })
   }
 
   /** 解冻账号（面板「解冻」/ 签到后余额恢复）。清全部惩罚态，但不动 `disabled`。 */
@@ -1139,6 +1196,11 @@ export class AccountPoolDO extends DurableObject<Env> {
     state.consecutiveFails = 0
     state.sessionDeadFails = 0
     state.modelCooldowns = {}
+    // ⚠️ **必须一起清空采样历史**：revive 的语义是「人工判定这个号是好的，解冻」。
+    // 若不清，上一轮触发熔断前的高消耗采样仍在观察窗口内（默认 1 小时），
+    // 下一次 `updateBalance` 会拿它当基准**立刻再锁一次** ——
+    // 用户会看到「点了解冻，一分钟后又被锁」，且找不到原因。
+    state.samples = []
     if (credits !== undefined) state.credits = credits
 
     writeAccount(this.ctx.storage.sql, state.uid, state.realm, JSON.stringify(state), now)

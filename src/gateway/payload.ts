@@ -344,6 +344,131 @@ export function cleanupOrphanToolCalls(messages: unknown[]): unknown[] {
   return changed ? out : messages
 }
 
+/** 消息裁剪结果。 */
+export interface TrimMessagesResult {
+  /**
+   * 裁剪后的消息数组。
+   *
+   * ⚠️ **未超限时返回的就是入参本身**（同一个引用），调用方靠 `result.messages !== messages`
+   * 就能判断「有没有动过」—— 与 `cleanupToolPairing` / `scrubFingerprints` 的口径一致。
+   */
+  messages: unknown[]
+  /** 被省略的**更早**消息条数（0 = 未裁剪）。供日志用，不含任何消息内容。 */
+  dropped: number
+}
+
+/** 摘要提示消息的抬头（日志与测试都按它识别，改文案时先看这里）。 */
+export const CONTEXT_TRIM_NOTE_PREFIX = '（系统提示·上下文压缩）'
+
+/**
+ * 构造一条「更早的消息已省略」的提示消息。
+ *
+ * ⚠️ 刻意用 `role: 'system'` 而不是 `user`：
+ * - 用 `user` 会在「上一条恰好也是 user」时形成**连续两条 user**，Gemini 系要求
+ *   user/model 交替，会被判非法请求（本项目的 gemini provider 也按 `role` 分流）；
+ * - 用 `user` 还会让模型把这段提示当成**用户真的说过的话**，进而顺着它回答。
+ *   而 `system` 在 gemini provider 里被并进 `systemInstruction`（见 `gemini.ts`），
+ *   在 OpenAI 兼容上游里也是合法位置。
+ *
+ * ⚠️ **不得**把被省略的消息内容摘进这条提示：那等于把隐私写进日志/上下文，
+ * 也失去「压缩」的意义。这里只说条数。
+ */
+function buildTrimNote(dropped: number, kept: number): Msg {
+  return {
+    role: 'system',
+    content:
+      `${CONTEXT_TRIM_NOTE_PREFIX} 更早的 ${dropped} 条消息因超出单请求消息数上限已被省略，`
+      + (kept > 0
+        ? `下面紧接的是最近 ${kept} 条消息的原文。`
+        : '保留窗口内没有能安全保留的消息（留下会拆散工具调用与结果）。')
+      + '省略的只是历史长度，不影响当前任务的上下文；'
+      + '若确实需要其中某个细节，请向用户确认后重新索取。',
+  }
+}
+
+/**
+ * 单请求消息数**硬上限**：超出就把更早的历史折叠成一条「已省略 X 条」的提示。
+ *
+ * ## 为什么必须做（真实依据，不是预防性设计）
+ *
+ * 同类项目 workbuddy2api 的封禁复盘记录：三次账号封禁前，**最后一次成功请求都是超大消息数**
+ * —— 2552 条、428→434 条、987~993 条连发。上游腾讯云风控把「超大上下文 + 高频」识别为
+ * 机器行为。本项目此前**原样转发**上千条消息，这是最明确的危险信号。
+ *
+ * ## 保留规则
+ *
+ * - **首条 system（含 `developer`）恒保留**：身份/规则丢了这个会话就废了；
+ *   只认**数组开头那一条** —— 不去别处搜 system（把中间的 system 提到最前面会改变语义，
+ *   上游对 system 的位置也敏感）。
+ * - **保留最近 `limit` 条**。
+ * - 中间插一条摘要提示（`buildTrimNote`）。
+ *
+ * ⇒ 结果条数最多为 `1（system，若有）+ 1（摘要）+ limit`。`limit` 定义的是
+ *   「保留的最近历史条数」，与 `MAX_CONTEXT_MESSAGES` 的语义一致（默认 100）。
+ *
+ * ## ⚠️ 绝不能把 tool_calls 与对应 tool_result 拆散
+ *
+ * 上游要求每个 `role:'tool'` 结果都有**前序** assistant 的 `tool_calls` 与之配对，
+ * 否则对之后每条消息都回 400 `code=11148`（整条会话报废、换号也没用，见
+ * `cleanupToolPairing` 的说明）。裁剪窗口的左边界最容易制造这种孤儿：
+ * 起点若落在一条 `role:'tool'` 上，它对应的 assistant 声明已经在被丢掉的那一段里。
+ *
+ * 处置：把左边界**向后**推进到第一条非 tool 消息（宁可少留几条，也不留半个配对）。
+ * 最后再复用 `cleanupOrphanToolCalls` 按**同一套 id 交集判据**兜一遍 ——
+ * 正常情况下它是空操作（返回同一引用），只在入参本身就带着破损历史时才真删东西。
+ *
+ * 兜底：若整个窗口都是 tool 结果（并行批次长到占满窗口），向后让位会**一条都不剩**，
+ * 只留 `[system, 摘要]` 的请求在部分上游会被判「缺少 user 消息」400 ⇒ 此时改为
+ * 向**前回溯**到发起这批调用的 assistant，把「声明 + 全部结果」整批留下。
+ * 即边界修复只允许**扩张**窗口，绝不拆散配对、也不留空尾巴。
+ *
+ * @param limit ≤ 0 表示**显式不限制**（`0` 是合法配置值，绝不能用 `limit || 默认值` 判）
+ */
+export function trimMessagesByLimit(messages: unknown[], limit: number): TrimMessagesResult {
+  // ⚠️ 判据用 `!(limit > 0)` 而不是 `!limit`：`NaN` 同样该被当成「不限制」的非法输入，
+  // 而 `limit === 0` 是**用户显式要求放开**的合法值。
+  if (!(limit > 0) || messages.length <= limit) return { messages, dropped: 0 }
+
+  const head = messages[0]
+  const keepHead = isObj(head) && (head.role === 'system' || head.role === 'developer')
+  const reserved = keepHead ? 1 : 0
+
+  // 最近 limit 条的左边界。
+  const naiveStart = messages.length - limit
+  if (naiveStart < reserved) return { messages, dropped: 0 } // 防御：窗口与首条重叠 ⇒ 没得剪
+  let start = naiveStart
+
+  // 左边界**向后**推到第一条非 tool 消息（见函数头「绝不能拆散配对」）。
+  while (start < messages.length) {
+    const m = messages[start]
+    if (isObj(m) && m.role === 'tool') start += 1
+    else break
+  }
+
+  // 兜底：窗口整段都是 tool 结果 ⇒ 向后让位会一条不剩，改为回溯到发起这批调用的 assistant。
+  if (start >= messages.length) {
+    for (let back = naiveStart; back > reserved; back -= 1) {
+      const m = messages[back]
+      if (isObj(m) && m.role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls.length > 0) {
+        start = back
+        break
+      }
+    }
+  }
+
+  const dropped = start - reserved
+  if (dropped <= 0) return { messages, dropped: 0 }
+
+  const out: unknown[] = []
+  if (keepHead) out.push(head)
+  const kept = messages.length - start
+  out.push(buildTrimNote(dropped, kept))
+  for (let i = start; i < messages.length; i += 1) out.push(messages[i])
+
+  // 兜底：同一套「id 交集」判据（与出站前的配对修复**共用**一个实现，不重写一遍）。
+  return { messages: cleanupOrphanToolCalls(out), dropped }
+}
+
 /**
  * 工具配对修复：developer 角色处理 + tool_call 修整 + 相邻合并 + 结果重排 + 两侧剪孤儿。
  *

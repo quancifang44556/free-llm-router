@@ -24,11 +24,11 @@
  *    - `11115`/`11135` 是**请求的问题**，不罚号、也不换号。
  */
 
-import { resolveUpstream, type Env } from '../env.js'
+import { resolveMaxContextMessages, resolveUpstream, type Env } from '../env.js'
 import { classify, type ErrorKind } from '../upstream/client.js'
 import { deriveDeviceId, referenceChatHeaders } from '../upstream/headers.js'
 import { deriveIntlConversationId, newTurnRequestId } from '../upstream/conversation.js'
-import { prepareChatBody, sanitizeChatBody } from './payload.js'
+import { prepareChatBody, sanitizeChatBody, trimMessagesByLimit } from './payload.js'
 import { ERROR_CHECK_FRAMES, ERROR_HINT_PATTERN, aggregateSse, createFrameTranslator, detectErrorFrame, doneFrame, errorFrame, mayHaveUsage, parseSseLine, sseHeaders, translateFrame } from './stream.js'
 import { jsonError, parseRetryAfterMs } from './http.js'
 import {
@@ -661,6 +661,41 @@ export async function handleChatCompletions(
     typeof (rawBody as Record<string, unknown>).model === 'string'
       ? ((rawBody as Record<string, unknown>).model as string)
       : ''
+
+  // ── 单请求消息数硬上限（全链路唯一一处裁剪） ──
+  //
+  // ## 为什么插在这里（而不是 `handleProviderChat` 或 `prepareChatBody` 里）
+  //
+  // `handleChatCompletions` 是**所有**对话请求的共同入口：
+  //   ① 聚合路由  → `handleAggregateChat` → `handleProviderChat`
+  //   ② 具名供应商 → `handleProviderChat`
+  //   ③ 默认供应商（buddy）→ `prepareChatBody`
+  //   ④ `/v1/responses` → `toChatBody` → 本函数
+  // 而 `prepareChatBody` 只服务 ③（provider 路径**根本不过它**），
+  // `handleProviderChat` 又接不到 ③。**任何一个都不是唯一落点** ——
+  // 在两个地方各写一遍，正是本项目的旧伤「同一个 bug 只修一半」。
+  // 故裁剪放在 `rawBody` 解析之后、所有分支之前，改一次全覆盖。
+  //
+  // ⚠️ 顺序上有两个刻意的选择：
+  // - 放在 `deriveSessionKey` **之后**：会话粘性 key 必须由**完整**历史算出，
+  //   若先裁剪，裁掉的那几条会影响 key ⇒ 每轮 key 都在变 ⇒ 粘性失效、命中不了上游 prompt cache；
+  // - 放在 `rawModel` **之后**：日志要带模型名（只带名字，不带任何消息内容）。
+  const maxContextMessages = resolveMaxContextMessages(env)
+  if (maxContextMessages > 0 && rawBody !== null && typeof rawBody === 'object' && !Array.isArray(rawBody)) {
+    const withMessages = rawBody as Record<string, unknown>
+    if (Array.isArray(withMessages.messages)) {
+      const beforeTrim = withMessages.messages as unknown[]
+      const trimmed = trimMessagesByLimit(beforeTrim, maxContextMessages)
+      if (trimmed.messages !== beforeTrim) {
+        rawBody = { ...withMessages, messages: trimmed.messages }
+        // ⚠️ 隐私红线：**不打任何消息内容**，只打条数与模型名。
+        console.log(
+          `[context-trim] 消息数超限已压缩：${beforeTrim.length} 条 → ${trimmed.messages.length} 条`
+            + `（省略更早 ${trimmed.dropped} 条）limit=${maxContextMessages} model=${rawModel}`,
+        )
+      }
+    }
+  }
 
   // ── 聚合 provider 分支 ──
   //

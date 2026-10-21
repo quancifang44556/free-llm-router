@@ -164,6 +164,105 @@ export function intlConversationHeaders(input: {
 }
 
 /**
+ * ⚠️ **会话链路 ID**（b3 追踪头）—— 补上「链式请求」这一机器特征。
+ *
+ * ## 为什么需要（同类项目封禁复盘的真实结论）
+ *
+ * 官方 IDE 的请求是**链式**的：同一个对话里 multi-turn 请求共享同一条链路，
+ * 且每请求都带 b3 追踪头；而第三方反代发的是**孤立请求**（既无会话 id、也无 trace），
+ * 这本身就是可识别的机器特征。上游 2026-10-20 起加的渠道校验（`11‑128`）
+ * 判的是「头部身份 + **会话头族**」，故补齐链路能直接缓解。
+ *
+ * ## 各字段的语义（与抓包口径一致）
+ *
+ * | 头 | 稳定性 | 形态 |
+ * |---|---|---|
+ * | `X-Conversation-ID` | 同一客户端会话内**稳定** | 带连字符 UUID（见 `intlConversationHeaders`） |
+ * | `X-Conversation-Request-ID` | 每请求新生成（重试由调用方复用） | 32 位 hex |
+ * | `X-Conversation-Message-ID` | 每请求**必然**新生成 | 32 位 hex |
+ * | `X-B3-TraceId` | 同一会话内**稳定**（一条链路 = 一个 trace） | 32 位 hex |
+ * | `X-B3-SpanId` | 每请求新生成 | 16 位 hex |
+ * | `X-B3-Sampled` | 恒 `1`（官方客户端全量采样） | — |
+ *
+ * ## ⚠️ trace id 为什么跟着**会话**而不是每请求随机
+ *
+ * b3 的语义里 trace 代表**一条调用链**，span 代表链上的一次调用。
+ * 官方 IDE 的多轮对话天然是「一条 trace、多个 span」；若我们每请求换 trace，
+ * 就退回成「一堆互不相干的单 span 请求」，正是复盘里指出的那个特征。
+ * ⇒ `deriveTraceId32(conversationId)`：同会话恒定、跨会话/跨账号互不相同
+ * （会话 id 本身已按「账号+会话」派生，故这里不需要再掺 uid）。
+ *
+ * ⚠️ 会话 id 无法判定时（客户端没给 `user` / `conversation_id`）**退化为每请求随机**，
+ * 且绝不从消息内容推断 —— 本项目纪律：宁可「不粘」也不能「错误地粘」。
+ */
+export function sessionTraceHeaders(input: {
+  /** 客户端显式会话标识派生出的会话 id（空/缺省 ⇒ 每请求随机）。 */
+  conversationId?: string
+  /** 轮级 id：重试须复用（调用方在重试循环外算一次），缺省则现生成。 */
+  turnRequestId?: string
+} = {}): HeaderMap {
+  // ⚠️ 会话头族复用 `intlConversationHeaders`，**不另写一份**：
+  // 两处各写一遍必然分叉（本项目已多次踩过「同一概念两套判据」）。
+  // 它返回的 5 个头一条都不能少（缺任一个上游就回 11‑128）。
+  const conversation = intlConversationHeaders({
+    ...(input.conversationId === undefined ? {} : { conversationId: input.conversationId }),
+    ...(input.turnRequestId === undefined ? {} : { turnRequestId: input.turnRequestId }),
+  })
+  const conversationId = conversation['X-Conversation-ID'] ?? ''
+  return {
+    ...conversation,
+    ...b3TraceHeaders({ conversationId }),
+  }
+}
+
+/**
+ * b3 追踪头三件套（`X-B3-TraceId` 32 hex / `X-B3-SpanId` 16 hex / `X-B3-Sampled: 1`）。
+ *
+ * ⚠️ 头名用 `X-B3-TraceId` 这种 Zipkin 规范写法，与本文件其余头的风格一致
+ *（HTTP 头名大小写不敏感，且 HTTP/2 会统一小写，故不影响上游解析）。
+ */
+export function b3TraceHeaders(input: { conversationId?: string } = {}): HeaderMap {
+  const conversationId = input.conversationId ?? ''
+  return {
+    // 会话可判定 ⇒ 稳定（一条链路）；不可判定 ⇒ 随机（仍必须存在，缺头代价更大）
+    'X-B3-TraceId': conversationId === '' ? randomHex32() : deriveTraceId32(conversationId),
+    'X-B3-SpanId': randomHex16(),
+    'X-B3-Sampled': '1',
+  }
+}
+
+/**
+ * 由种子**稳定派生** 32 位 hex（b3 trace id 形态，同步、无依赖）。
+ *
+ * ⚠️ 与 `deriveDeviceId`（`crypto.subtle`，异步）刻意不同：头构造函数必须同步，
+ * 故用四路 FNV-1a 32 位混合拼出 128 位。它只需要「同种子同值、异种子不撞」，
+ * 不需要密码学强度（trace id 不含任何秘密）。
+ */
+export function deriveTraceId32(seed: string, salt = 'trace'): string {
+  return `${fnv1a32Hex(`${salt}:${seed}#0`)}${fnv1a32Hex(`${salt}:${seed}#1`)}${fnv1a32Hex(
+    `${salt}:${seed}#2`,
+  )}${fnv1a32Hex(`${salt}:${seed}#3`)}`
+}
+
+/**
+ * FNV-1a 32 位 → 8 位 hex（含两轮搅动）。
+ *
+ * ⚠️ 搅动必须写成 `h = (h ^ (h >>> 15)) >>> 0`：复合赋值 `h ^= h >>> 15`
+ * 会把「右移结果」**赋回** h（等价于 `h = h >>> 15`），高位全丢、尾部变短。
+ */
+function fnv1a32Hex(text: string): string {
+  let h = 0x811c9dc5
+  for (let i = 0; i < text.length; i += 1) {
+    h ^= text.charCodeAt(i)
+    h = Math.imul(h, 0x01000193) >>> 0
+  }
+  h = (h ^ (h >>> 15)) >>> 0
+  h = Math.imul(h, 0x2545f491) >>> 0
+  h = (h ^ (h >>> 13)) >>> 0
+  return h.toString(16).padStart(8, '0')
+}
+
+/**
  * 国际服的**设备头**（2 个）：`X-Machine-ID` + `X-Session-ID`。
  *
  * ## ⚠️ 为什么必须补（2026-10-20 二次实测）
@@ -207,21 +306,7 @@ export function intlDeviceHeaders(input: {
  */
 export function deriveUuidLike(seed: string, salt = ''): string {
   /** FNV-1a 32 位 → 8 位 hex（分段用不同后缀，避免各段高度相关）。 */
-  const chunk = (suffix: string): string => {
-    let h = 0x811c9dc5
-    const text = `${salt}${seed}#${suffix}`
-    for (let i = 0; i < text.length; i += 1) {
-      h ^= text.charCodeAt(i)
-      h = Math.imul(h, 0x01000193) >>> 0
-    }
-    // ⚠️ 搅动必须写成 `h = (h ^ (h >>> 15)) >>> 0`。
-    // 这里曾误写成 `h ^= h >>> 15` —— 复合赋值把「右移结果」**赋回** h，
-    // 等价于 `h = h >>> 15`，高位全丢、尾部变短。
-    h = (h ^ (h >>> 15)) >>> 0
-    h = Math.imul(h, 0x2545f491) >>> 0
-    h = (h ^ (h >>> 13)) >>> 0
-    return h.toString(16).padStart(8, '0')
-  }
+  const chunk = (suffix: string): string => fnv1a32Hex(`${salt}${seed}#${suffix}`)
   // ⚠️ 每个字段必须**精确按段宽**取字符（8-4-4-4-12）。
   // 曾写过「把某个数组元素改成 `'4'`」的版本 —— 那会丢掉该字节的高半字节，
   // 整串少一位，产出一个**不报错**的「假 UUID」。这里用纯字符串切片，长度天然守恒。
@@ -434,7 +519,10 @@ function intlReferenceChatHeaders(input: {
       ...(input.machineId === undefined ? {} : { machineId: input.machineId }),
       ...(input.sessionId === undefined ? {} : { sessionId: input.sessionId }),
     }),
-    ...intlConversationHeaders({
+    // ⚠️ 会话头族 + **b3 链路头**（`sessionTraceHeaders` 内部复用会话头族，
+    // 只在这上面追加 trace/span/sampled —— 两者必须一起发，否则「有会话无链路」
+    // 仍是孤立请求的形态，见该函数上方的复盘依据）。
+    ...sessionTraceHeaders({
       ...(input.conversationId === undefined ? {} : { conversationId: input.conversationId }),
       ...(input.turnRequestId === undefined ? {} : { turnRequestId: input.turnRequestId }),
     }),
@@ -508,7 +596,7 @@ export function cliChatHeaders(input: {
   if (input.variant === 'workbuddy') {
     Object.assign(
       headers,
-      intlConversationHeaders({
+      sessionTraceHeaders({
         ...(input.conversationId === undefined ? {} : { conversationId: input.conversationId }),
         turnRequestId: input.conversationRequestId,
       }),
@@ -604,9 +692,19 @@ export function mpHeaders(input: { uid: string; accessToken: string }): HeaderMa
   }
 }
 
-/** 生成 32 位 hex（消息级 ID）。 */
+/** 生成 32 位 hex（消息级 ID / b3 trace id）。 */
 export function randomHex32(): string {
-  const bytes = new Uint8Array(16)
+  return randomHex(16)
+}
+
+/** 生成 16 位 hex（b3 span id）。 */
+export function randomHex16(): string {
+  return randomHex(8)
+}
+
+/** 生成 `byteLength * 2` 位 hex。 */
+function randomHex(byteLength: number): string {
+  const bytes = new Uint8Array(byteLength)
   crypto.getRandomValues(bytes)
   let out = ''
   for (const b of bytes) out += b.toString(16).padStart(2, '0')

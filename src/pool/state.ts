@@ -23,6 +23,8 @@
  * 显式比较长短。
  */
 
+import { BURN_SAMPLE_LIMIT, type BalanceSample } from './burn-rate.js'
+
 /** 冷却种类。`hard` 是余额耗尽（到次日 04:00），`soft` 是可恢复的限流。 */
 export type CoolKind = '' | 'soft' | 'hard'
 
@@ -167,6 +169,17 @@ export interface AccountState {
   creditsExpiring: number
   /** 最早到期时刻（epoch ms）。 */
   creditsEarliestExpiry: number
+  /**
+   * 最近 {@link BURN_SAMPLE_LIMIT} 次余额采样（升序，末位最新）。
+   *
+   * ⚠️ **只由 `updateBalance` 追加**（整点 cron 与面板手动刷新）。
+   * 用途唯一：判断「窗口内烧掉的比例」是否异常（见 `burn-rate.ts`）——
+   * 快照只能回答「还剩多少」，回答不了「掉得多快」，而后者才是账号被盗用 /
+   * 某模型倍率异常高的**唯一**早期信号。
+   *
+   * ⚠️ 旧数据没有这个字段（升级前的记录）⇒ `normalizeAccountState` 补 `[]`，**不清号、不报错**。
+   */
+  samples: BalanceSample[]
 }
 
 /** 连续 12153 达此值才禁用（Go 侧 `entry.go:516`）。 */
@@ -208,7 +221,32 @@ export function createAccountState(input: {
     credits: 0,
     creditsExpiring: 0,
     creditsEarliestExpiry: 0,
+    samples: [],
   }
+}
+
+/**
+ * 归一采样史。
+ *
+ * ⚠️ 这里**不是**「信任已存数据」而是逐条校验：
+ * 采样史参与「是否熔断」的判定，一个 `NaN` / 字符串 `credits` 会让
+ * `burned = from - to` 变成 `NaN` ⇒ `pct < threshold` 恒为 false ⇒
+ * **熔断永不触发**（静默失效，没有任何报错）。故坏条目直接丢弃，
+ * 并在超出上限时只保留**最新**的若干条。
+ */
+function normalizeSamples(raw: unknown): BalanceSample[] {
+  if (!Array.isArray(raw)) return []
+  const out: BalanceSample[] = []
+  for (const item of raw) {
+    if (item === null || typeof item !== 'object' || Array.isArray(item)) continue
+    const s = item as Record<string, unknown>
+    if (typeof s.at !== 'number' || !Number.isFinite(s.at)) continue
+    if (typeof s.credits !== 'number' || !Number.isFinite(s.credits)) continue
+    out.push({ at: s.at, credits: s.credits })
+  }
+  // 升序：判定依赖「窗口内首/尾」，顺序不可信就必须先排好。
+  out.sort((a, b) => a.at - b.at)
+  return out.length > BURN_SAMPLE_LIMIT ? out.slice(-BURN_SAMPLE_LIMIT) : out
 }
 
 /**
@@ -269,6 +307,9 @@ export function normalizeAccountState(raw: unknown): AccountState | undefined {
     credits: num('credits', base.credits),
     creditsExpiring: num('creditsExpiring', base.creditsExpiring),
     creditsEarliestExpiry: num('creditsEarliestExpiry', base.creditsEarliestExpiry),
+    // ⚠️ 旧数据（升级前）没有该字段 ⇒ `[]`。补空是**必须**的：`undefined` 会让
+    // `appendBalanceSample` 的展开抛 `TypeError`（整个余额刷新路径 500）。
+    samples: normalizeSamples(o.samples),
   }
 }
 

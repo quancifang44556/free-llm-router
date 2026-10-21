@@ -82,6 +82,37 @@ export interface QoderFallbackModel {
   contextWindow: number
   supportsImage?: boolean
   supportsThinking?: boolean
+  /**
+   * 可选思考档位（远端 `thinking_config.enabled.efforts` 的**键名**）。
+   *
+   * ## 三个必须记住的口径（照抄参考实现 qoder-product.ts 的实测结论）
+   *
+   * 1. **取键名不取值**：目录形如 `efforts: { xhigh:{}, low:{}, medium:{is_default:true} }`，
+   *    键即档位 id；按**目录原始顺序**保存（官方客户端也按对象键序渲染）。
+   * 2. **`is_default` 是「默认选中」不是「多选」**：IDE 里是下拉单选。
+   * 3. **「关闭思考」不塞进这个数组** —— 它由 {@link supportsDisable} 单独表达
+   *   （客户端会自己追加 `none`）。这里手动塞 `none` 会造成语义重复。
+   *
+   * ⚠️ 档位必须在客户端白名单内（`none/low/medium/high/xhigh/max`），
+   * 不在的会被**静默丢弃**。
+   */
+  efforts?: readonly string[]
+  /**
+   * 默认思考档位（目录 `efforts.<key>.is_default === true` 的那一项）。
+   *
+   * ⚠️ **必须落在 {@link efforts} 内**，否则客户端会拿一个不存在的档位发请求
+   *（本项目已有 `11150`「reasoning_effort 该模型不支持」的上游报错记录）。
+   * 无 `is_default` 时不设，让上游自行决定。
+   */
+  defaultEffort?: string
+  /**
+   * 是否提供「关闭思考」（目录 `thinking_config.disabled` 分支存在即 true）。
+   *
+   * ⚠️ 与 {@link efforts} **相互独立**，不能用一个标志表达：实测 CN 的
+   * `qmodel`/`qmodel_latest` 没有档位但能关闭；而 `gfmodel`/`gmodel` 等
+   * 有档位却不能关闭。
+   */
+  supportsDisable?: boolean
   isFree?: boolean
   /** 计费倍率（目录 `price_factor`）。**0 是合法值（免费）**，不能当缺失。 */
   priceFactor?: number
@@ -107,17 +138,17 @@ export const QODER_FALLBACK_MODELS: readonly QoderFallbackModel[] = [
   { id: 'smodel', name: 'Sonus', contextWindow: 1_000_000, supportsImage: true, supportsThinking: true, priceFactor: 8 },
   { id: 'cmodel', name: 'Cantus', contextWindow: 1_000_000, supportsImage: true, supportsThinking: true, priceFactor: 4 },
   // 免费额度模型（`is_free`）：e2e 探针默认用它们以免消耗积分。
-  { id: 'qmodel_38max', name: 'Qwen3.8-Max', contextWindow: 1_000_000, supportsImage: true, supportsThinking: true, isFree: true, priceFactor: 0.5 },
+  { id: 'qmodel_38max', name: 'Qwen3.8-Max', contextWindow: 1_000_000, supportsImage: true, supportsThinking: true, isFree: true, priceFactor: 0.5, efforts: ['xhigh', 'low', 'medium'], defaultEffort: 'xhigh', supportsDisable: true },
   // ⚠️ `priceFactor: 0` 是**免费**（实测），不是缺失。
-  { id: 'qfmodel', name: 'Qwen3.8-Flash', contextWindow: 1_000_000, supportsImage: true, supportsThinking: true, isFree: true, priceFactor: 0 },
+  { id: 'qfmodel', name: 'Qwen3.8-Flash', contextWindow: 1_000_000, supportsImage: true, supportsThinking: true, isFree: true, priceFactor: 0, efforts: ['xhigh', 'low', 'medium'], defaultEffort: 'medium', supportsDisable: true },
   { id: 'qmodel_latest', name: 'Qwen3.7-Max', contextWindow: 1_000_000, supportsImage: true, priceFactor: 0.5 },
   { id: 'qmodel', name: 'Qwen3.7-Plus', contextWindow: 1_000_000, supportsImage: true, priceFactor: 0.1 },
-  { id: 'kmodel_latest', name: 'Kimi-K3', contextWindow: 1_000_000, supportsImage: true, priceFactor: 1.4 },
-  { id: 'kmodel', name: 'Kimi-K2.8-Preview', contextWindow: 1_000_000, supportsImage: true, priceFactor: 0.8 },
-  { id: 'gmodel', name: 'GLM-5.3', contextWindow: 1_000_000, supportsImage: true, supportsThinking: true, priceFactor: 0.8 },
-  { id: 'gfmodel', name: 'GLM-5.3-Flash', contextWindow: 1_000_000, supportsImage: true, supportsThinking: true, priceFactor: 0.1 },
-  { id: 'dmodel', name: 'DeepSeek-V4-Pro', contextWindow: 1_000_000, supportsImage: true, supportsThinking: true, priceFactor: 0.5 },
-  { id: 'dfmodel', name: 'DeepSeek-Flash', contextWindow: 1_000_000, supportsImage: true, supportsThinking: true, priceFactor: 0.1 },
+  { id: 'kmodel_latest', name: 'Kimi-K3', contextWindow: 1_000_000, supportsImage: true, priceFactor: 1.4, efforts: ['high', 'low', 'max'], defaultEffort: 'max' },
+  { id: 'kmodel', name: 'Kimi-K2.8-Preview', contextWindow: 1_000_000, supportsImage: true, priceFactor: 0.8, efforts: ['high', 'low', 'max'], defaultEffort: 'max' },
+  { id: 'gmodel', name: 'GLM-5.3', contextWindow: 1_000_000, supportsImage: true, supportsThinking: true, priceFactor: 0.8, efforts: ['high', 'low', 'max'], defaultEffort: 'max' },
+  { id: 'gfmodel', name: 'GLM-5.3-Flash', contextWindow: 1_000_000, supportsImage: true, supportsThinking: true, priceFactor: 0.1, efforts: ['high', 'max'], defaultEffort: 'max' },
+  { id: 'dmodel', name: 'DeepSeek-V4-Pro', contextWindow: 1_000_000, supportsImage: true, supportsThinking: true, priceFactor: 0.5, efforts: ['high', 'max'], defaultEffort: 'max', supportsDisable: true },
+  { id: 'dfmodel', name: 'DeepSeek-Flash', contextWindow: 1_000_000, supportsImage: true, supportsThinking: true, priceFactor: 0.1, efforts: ['high', 'max', 'low'], defaultEffort: 'max', supportsDisable: true },
   { id: 'mmodel', name: 'MiniMax-M3', contextWindow: 1_000_000, supportsImage: true, priceFactor: 0.2 },
 ]
 
@@ -444,12 +475,26 @@ export function toProviderModels(models: readonly QoderFallbackModel[]): Provide
     // ⚠️ **必须透传倍率**：面板「资费」列与 `/v1/models` 的名称都靠它显示
     //（早先漏传，面板里 Qoder 一律显示「—」、客户端看不到倍率）。
     ...(m.priceFactor === undefined ? {} : { priceFactor: m.priceFactor }),
+    // ⚠️ **必须透传思考档位**（同款教训：漏传 = 下游一律看不到）。
+    // `/v1/models` 的 `reasoning_efforts` 与面板生成的 DSH `reasoningEfforts`
+    // 都从这三个字段来；漏一个，用户就会看到「这个模型选不了思考强度」。
+    ...(m.efforts === undefined || m.efforts.length === 0 ? {} : { reasoningEfforts: [...m.efforts] }),
+    ...(m.defaultEffort === undefined ? {} : { defaultEffort: m.defaultEffort }),
+    ...(m.supportsDisable === true ? { canDisableThinking: true } : {}),
   }))
 }
 
 /** 远端模型目录的签名路径（签名时去掉 `/algo` 前缀，见 {@link resignQoderHeaders}）。 */
 const QODER_MODEL_LIST_PATH = '/api/v2/model/list'
 /** 远端目录缓存时长：目录变化很慢，但倍率有错峰促销，10 分钟足够跟上。 */
+/**
+ * 客户端接受的思考档位白名单（官方 asar 常量 `Qj`）。
+ *
+ * ⚠️ 不在白名单内的档位会被客户端**静默丢弃**，表现为「设了没生效」。
+ * 另有别名 `disabled`/`off` → `none`，但那是由客户端处理的，这里不重复。
+ */
+const EFFORT_WHITELIST = new Set(['none', 'low', 'medium', 'high', 'xhigh', 'max'])
+
 const QODER_CATALOG_TTL_MS = 10 * 60_000
 /** 拉目录的单次超时（只读接口，不该拖慢 `/v1/models`）。 */
 const QODER_CATALOG_TIMEOUT_MS = 15_000
@@ -567,6 +612,38 @@ export function parseQoderModelCatalog(raw: unknown): QoderFallbackModel[] {
     const displayName = typeof entry.display_name === 'string' && entry.display_name.trim() !== ''
       ? entry.display_name.trim()
       : key
+    // 思考档位：远端 `thinking_config.enabled.efforts` 的**键名**即档位 id。
+    //
+    // ⚠️ 取键不取值（值是 `{}` 或 `{is_default:true}`）；且必须过滤到客户端白名单内，
+    // 不在白名单的档位会被**静默丢弃**（等于没生效）。
+    // ⚠️ 「关闭思考」**不**塞进 efforts —— 它由 supportsDisable 单独表达，
+    // 客户端自己会追加 `none`；这里塞会造成语义重复。
+    const thinkingConfig = typeof entry.thinking_config === 'object' && entry.thinking_config !== null
+      ? entry.thinking_config as Record<string, unknown>
+      : undefined
+    const enabledBranch = thinkingConfig !== undefined && typeof thinkingConfig.enabled === 'object' && thinkingConfig.enabled !== null
+      ? thinkingConfig.enabled as Record<string, unknown>
+      : undefined
+    const rawEfforts = enabledBranch !== undefined && typeof enabledBranch.efforts === 'object' && enabledBranch.efforts !== null
+      ? enabledBranch.efforts as Record<string, unknown>
+      : undefined
+    const efforts: string[] = []
+    let defaultEffort: string | undefined
+    if (rawEfforts !== undefined) {
+      for (const [effortKey, meta] of Object.entries(rawEfforts)) {
+        const id = effortKey.trim().toLowerCase()
+        if (!EFFORT_WHITELIST.has(id) || efforts.includes(id)) continue
+        efforts.push(id)
+        // `is_default` 是「默认选中」，取第一个命中的即可。
+        if (defaultEffort === undefined && typeof meta === 'object' && meta !== null
+          && (meta as Record<string, unknown>).is_default === true) {
+          defaultEffort = id
+        }
+      }
+    }
+    // 默认档位必须落在 efforts 内（否则客户端会发一个不存在的档位）。
+    if (defaultEffort !== undefined && !efforts.includes(defaultEffort)) defaultEffort = undefined
+
     const model: QoderFallbackModel = {
       id: key,
       name: displayName,
@@ -575,6 +652,10 @@ export function parseQoderModelCatalog(raw: unknown): QoderFallbackModel[] {
       supportsThinking: entry.is_reasoning === true,
       ...(entry.is_free === true ? { isFree: true } : {}),
       ...(priceFactor === undefined ? {} : { priceFactor }),
+      ...(efforts.length === 0 ? {} : { efforts }),
+      ...(defaultEffort === undefined ? {} : { defaultEffort }),
+      // 目录存在 `thinking_config.disabled` 分支 ⇒ 可关闭思考（与 efforts 独立）。
+      ...(thinkingConfig !== undefined && thinkingConfig.disabled !== undefined ? { supportsDisable: true } : {}),
     }
     all.push(model)
     if (entry.enable !== false) enabled.push(model)
