@@ -278,6 +278,61 @@ export function parseEnvelope(text: string): Envelope | undefined {
       if (inner !== undefined) return inner
     }
 
+    /**
+     * 🔴 **双层嵌套：`{"error":{"data":{"code":14018,...}}}`**（2026-10-21 实测缺陷）。
+     *
+     * ## 真实故障
+     * workbuddy 的「额度耗尽」回的是：
+     * ```
+     * HTTP 429  {"error":{"data":{"code":14018,
+     *            "msg":"Credits exhausted. Please visit the link below to purchase add-on packs"}}}
+     * ```
+     * 顶层**没有 `code`**，业务码在 `error.data.code` 里（比上面那个 `body` 形态又深一层）。
+     *
+     * ## 后果（比「少一条日志」严重）
+     * `parseEnvelope` 返回 `undefined` ⇒ `classify(429, …)` 拿不到业务码
+     * ⇒ 落到「429 ⇒ `rate_limited`」⇒ **`soft`（60 秒）**
+     * 而 `CODE_KIND[14018] = 'credit_exhausted'` ⇒ 本该 **`hard`（冷却到次日 04:00）**。
+     *
+     * ⇒ 一个**真的没额度**的号每 60 秒被重新选中一次，反复打上游、反复失败，
+     *   而面板上它看起来「只是被限流」，用户完全看不出「这个号没钱了」。
+     *   实测日志：`[punish] uid=workbudd kind=soft reason=workbuddy http=429: {...14018...}`
+     *
+     * ## 兼容形态
+     * 两种都要认（都不带顶层 `code`）：
+     * - `{"error":{"code":X,…}}` —— 标准 OpenAI 风格
+     * - `{"error":{"data":{"code":X,…}}}` —— workbuddy 实测风格
+     *
+     * ⚠️ 只有拿到**有限数字码**才返回信封：否则 `{"error":{"message":"…"}}`
+     * 这类「只有消息没有码」的响应会被误判成「有信封」，
+     * 进而让 `isWafBlocked` 放过真正的 WAF 拦截页。
+     */
+    if (obj.code === undefined && obj.error !== null && typeof obj.error === 'object') {
+      const outer = obj.error as Record<string, unknown>
+      const deep = outer.data !== null && typeof outer.data === 'object'
+        ? (outer.data as Record<string, unknown>)
+        : undefined
+      const carrier = outer.code !== undefined ? outer : deep
+      if (carrier !== undefined) {
+        const rawInner = carrier.code
+        const innerCode =
+          typeof rawInner === 'number'
+            ? rawInner
+            : typeof rawInner === 'string' && rawInner.trim() !== ''
+              ? Number(rawInner)
+              : Number.NaN
+        if (Number.isFinite(innerCode)) {
+          const pickMsg = (o: Record<string, unknown>): string =>
+            typeof o.msg === 'string' ? o.msg : typeof o.message === 'string' ? o.message : ''
+          return {
+            code: innerCode,
+            msg: pickMsg(carrier) || pickMsg(outer),
+            data: carrier.data,
+          }
+        }
+      }
+    }
+
     const raw = obj.code
     // ⚠️ 上游有两种码形态：数字（`6004`）与**带连字符的字符串**（`"11-128"`）。
     // 后者是渠道校验失败的真实形态，`Number("11-128")` = NaN，

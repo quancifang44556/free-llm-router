@@ -2060,7 +2060,25 @@ export async function handleProviderChat(input: {
   const blame: Array<{ uid: string; kind: FailureKindForBlame; reason: string }> = []
   let poolSize = 0
   try {
-    const all = await env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm)).listAccounts(realm, Date.now())
+    /**
+     * 🔴 **必须用 `activeRealm`，不是 `realm`**（2026-10-21 审查发现，M2 指出）。
+     *
+     * `activeRealm` 在 `1997` 处按 provider 修正过
+     *（`workbuddy` ⇒ `'global'`，或按 `X-FLR-Account` 钉号落到另一分片），
+     * 而 `realm` 是**请求参数的原始值**（默认 `'cn'`）。
+     *
+     * ## 后果（静默失效）
+     * `workbuddy` 的号全在 `global` 分片，却去 `cn` 分片数：
+     * `listAccounts('cn')` 里没有 provider 为 `workbuddy` 的号
+     * ⇒ `poolSize` 恒为 **0** ⇒ `deferSoft()` 恒 **false**
+     * ⇒ workbuddy 的单账号池**永远走立即记账**，
+     *   而 `deferSoft` 的设计目的（单账号池不要立刻掐断唯一路径）对它完全没生效。
+     *
+     * ⚠️ 这类「用了名字相近但语义不同的变量」的缺陷不会报错，
+     * 只会让某个 provider 的保护静默失效 —— 正是本项目最难查的一类。
+     * 直接用已经修正过的 `pool`（`2024` 处按 `activeRealm` 构造）最稳妥。
+     */
+    const all = await pool.listAccounts(activeRealm, Date.now())
     poolSize = all.filter((a) => (a.provider ?? '') === providerId && a.disabled !== true).length
   } catch {
     poolSize = 0

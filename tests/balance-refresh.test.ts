@@ -221,3 +221,79 @@ test('⚠️ bindBuddy(env) 产出的是可用的绑定版', async () => {
     db.close()
   }
 })
+
+test('🔴 「解冻」（clearCooldowns）必须清掉**全部**惩罚维度，不能只清账号级', async () => {
+  // 2026-10-21 审查（M2）发现的「解冻语义碎片化」：
+  // 原来只清 until/breakerUntil/degradeUntil/coolKind/fails/… 这几个账号级字段，
+  // **漏了 `modelCooldowns` 与 `restrictedUntil`**。
+  // ⇒ 用户点面板「解冻」，模型级冷却还在、11140 封号标记还在，
+  //    面板显示「正常」但该模型仍然选不到 —— 典型的「状态看着对、行为不对」。
+  const { runtime } = freshRuntime('clear-all')
+  const { env, db } = runtime
+  try {
+    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn'))
+    const now = Date.now()
+    const uid = 'uid-clear-all'
+    const st = createAccountState({ uid, provider: 'buddy', realm: 'cn', now })
+    // 把**五个**维度全部置为「惩罚中」
+    st.until = now + 5 * 60_000
+    st.coolKind = 'soft'
+    st.breakerUntil = now + 30 * 60_000
+    st.degradeUntil = now + 10 * 60_000
+    st.restrictedUntil = now + 2 * 3600_000
+    st.fails = 3
+    st.softStreak = 2
+    st.modelCooldowns['glm-5.3'] = {
+      until: now + 10 * 60_000,
+      resetAt: 0,
+      reason: 'busy',
+      hits: 2,
+      cause: 'busy',
+      auditOnly: false,
+    }
+    st.modelConfirm['glm-5.3'] = 2
+    await pool.upsertAccount(st, now)
+
+    const cleared = await pool.clearCooldowns('cn', uid)
+    assert.equal(cleared, 1, '应清掉 1 个账号')
+
+    const acc = (await pool.listAccounts('cn', now)).find((a) => a.uid === uid)
+    assert.ok(acc !== undefined)
+    assert.equal(acc.until, 0, '账号级冷却必须清')
+    assert.equal(acc.coolKind, '', 'coolKind 必须清')
+    assert.equal(acc.breakerUntil, 0, '熔断必须清')
+    assert.equal(acc.degradeUntil, 0, '降级必须清')
+    assert.equal(acc.restrictedUntil, 0, '⚠️ 11140 封号标记必须清（原来漏了）')
+    assert.equal(acc.fails, 0)
+    assert.equal(acc.softStreak, 0)
+    assert.equal(Object.keys(acc.modelCooldowns).length, 0, '⚠️ 模型级冷却必须清（原来漏了）')
+    assert.equal(Object.keys(acc.modelConfirm).length, 0, '模型确认计数也必须归零，否则下次更快熔断')
+  } finally {
+    db.close()
+  }
+})
+
+test('⚠️ 只有模型级冷却时，clearCooldowns 也必须认为「有事可清」', async () => {
+  // 边界：账号级全干净、只有 modelCooldowns —— 旧的条件判断会认为「无事可清」，
+  // 直接跳过 ⇒ 模型级冷却永远清不掉。
+  const { runtime } = freshRuntime('clear-model-only')
+  const { env, db } = runtime
+  try {
+    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn'))
+    const now = Date.now()
+    const uid = 'uid-clear-model-only'
+    const st = createAccountState({ uid, provider: 'buddy', realm: 'cn', now })
+    st.modelCooldowns['glm-5.3'] = {
+      until: now + 10 * 60_000, resetAt: 0, reason: 'busy', hits: 1, cause: 'busy', auditOnly: false,
+    }
+    await pool.upsertAccount(st, now)
+
+    const cleared = await pool.clearCooldowns('cn', uid)
+    assert.equal(cleared, 1, '只有模型级冷却时也必须算「清掉了东西」')
+    const acc = (await pool.listAccounts('cn', now)).find((a) => a.uid === uid)
+    assert.ok(acc !== undefined)
+    assert.equal(Object.keys(acc.modelCooldowns).length, 0)
+  } finally {
+    db.close()
+  }
+})

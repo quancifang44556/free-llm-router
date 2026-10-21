@@ -170,6 +170,27 @@ const USAGE_STATE_KEY = 'usage:state'
 const LEGACY_USAGE_RING_KEY = 'usage:ring'
 
 /** 模型成本账本的存活时长：6h 外的价格不再采信（Go 侧 `modelCostTTL` 同口径）。 */
+/**
+ * 上游给的 `resetAt` 的**最大前瞻窗口**（2026-10-21 审查补，M2 指出无上限）。
+ *
+ * ## 为什么必须钳制
+ * `applyFailure` 原来直接 `state.until = input.resetAt`，**没有任何上限**。
+ * 而 `resetAt` 来自上游响应里的文本（`parseResetAt` 解析 `reset at … UTC+8`）。
+ * 一旦上游给了**远期时刻**（或文案格式变化让解析跑偏），
+ * 账号/模型就会被锁到任意远的未来 —— 实测过的真实风险：
+ * 一个「日次数上限」的响应若被解析成 2027 年，账号就整整一年不派单，
+ * 而面板上只显示「冷却中」，用户完全不知道要等到哪一年。
+ *
+ * ## 为什么是 24 小时
+ * 已知的合法 `resetAt` 语义都是**日内**的：
+ * - 日次数上限（qoder `110`）⇒ 次日 00:00 或 04:00
+ * - 频率限制 ⇒ 几分钟到几小时
+ * 故 24 小时足以覆盖全部合法情形，同时挡住「解析跑偏到远期」。
+ *
+ * ⚠️ 钳制**只缩短、不延长**：上游说 5 分钟后恢复，仍然 5 分钟。
+ */
+const MAX_RESET_AHEAD_MS = 24 * 60 * 60 * 1000
+
 const MODEL_COST_TTL_MS = 6 * 60 * 60 * 1000
 
 /** 会话粘性默认 TTL。 */
@@ -1040,7 +1061,14 @@ export class AccountPoolDO extends DurableObject<Env> {
 
     switch (input.kind) {
       case 'hard': {
-        // 余额耗尽：冷却到次日 04:00（UTC+8）。签到后余额恢复会自动解冻。
+        // 余额耗尽：冷却到次日 04:00（UTC+8）。
+        //
+        // ⚠️ **不会「余额恢复后自动解冻」**（2026-10-21 审查澄清）。
+        // 这里原先写的是「签到后余额恢复会自动解冻」，但全仓从未实现该路径 ——
+        // 而 `updateBalance` 反而刻意「绝不动惩罚态」（理由见该方法注释：
+        // cron 每轮刷余额，若自动解冻会让探测抖动直接变成账号抖动）。
+        // ⇒ 实际恢复方式：**等次日 04:00**，或**面板点「解冻」**（`clearCooldowns`）。
+        // 用户充了钱却仍被锁到 04:00 是已知取舍，不是 bug；但文案必须说实话。
         state.until = nextDay4AmUtc8(now)
         state.coolKind = 'hard'
         state.reason = input.reason ?? 'credit exhausted'
@@ -1049,9 +1077,13 @@ export class AccountPoolDO extends DurableObject<Env> {
       case 'soft': {
         state.coolKind = 'soft'
         state.reason = input.reason ?? 'rate limited'
-        // 有上游重置墙钟就对齐它，否则按连续次数指数退避（封顶 2h）。
+        // 有上游重置墙钟就对齐它，否则按连续次数指数退避（封顶 30 分钟）。
+        //
+        // ⚠️ 上游墙钟**必须钳制**（见 `MAX_RESET_AHEAD_MS`）：否则一个解析跑偏的
+        // 远期时刻就能把账号锁到任意远，而本地退避本身是有上限的 ——
+        // 「本地封顶、上游不封顶」这种不对称正是漏洞来源。
         if (input.resetAt !== undefined && input.resetAt > now) {
-          state.until = input.resetAt
+          state.until = Math.min(input.resetAt, now + MAX_RESET_AHEAD_MS)
         } else if (!isActive(state.until, now)) {
           state.softStreak += 1
           // 起步时长 = 路由配置 `softCooldownSeconds`（默认 60 秒，对齐上游「Wait about a minute」），之后逐次翻倍、封顶 30 分钟
@@ -1173,9 +1205,12 @@ export class AccountPoolDO extends DurableObject<Env> {
             fallbackCooldown = Math.min(fallbackCooldown, hits === 1 ? 90_000 : fallbackCooldown)
           }
         }
+        // ⚠️ 同样必须钳制（见 `MAX_RESET_AHEAD_MS`）：模型级冷却若被上游
+        // 一个远期时刻拉长，该模型会长期不可用，而账号看起来「健康」——
+        // 用户只会觉得「这个模型坏了」，完全看不出是冷却没上限。
         const until =
           input.resetAt !== undefined && input.resetAt > now
-            ? input.resetAt
+            ? Math.min(input.resetAt, now + MAX_RESET_AHEAD_MS)
             : now + fallbackCooldown
         state.modelCooldowns[model] = {
           until,
@@ -1640,16 +1675,42 @@ export class AccountPoolDO extends DurableObject<Env> {
     let n = 0
     for (const state of states) {
       if (state === undefined) continue
-      if (state.until !== 0 || state.breakerUntil !== 0 || state.degradeUntil !== 0 || state.fails !== 0) {
+      /**
+       * 🔴 **必须把「全部维度」都清掉**（2026-10-21 审查补，M2 指出语义碎片化）。
+       *
+       * 原来只清账号级的 `until / breakerUntil / degradeUntil / coolKind / fails / …`，
+       * **漏了 `modelCooldowns` 与 `restrictedUntil`**：
+       * - 用户点面板「解冻」，模型级冷却还在 ⇒ 该模型仍然选不到，
+       *   面板却显示「正常」⇒ 典型的「状态看着对、行为不对」。
+       * - `restrictedUntil`（11140 上游封号标记）也留着 ⇒ 用户以为解冻了，
+       *   实际仍被排除。
+       *
+       * ⚠️ 「解冻」的语义是**用户显式要求重新开始**，故这里清掉**所有**惩罚态。
+       * 与 `setAccountDisabled` 的区别：那个只切 `disabled` 位，顺带清自动熔断；
+       * 本方法是「把惩罚态归零」，是面板「解冻」按钮的语义。
+       */
+      const hasModelCooldowns = Object.keys(state.modelCooldowns).length > 0
+      if (
+        state.until !== 0
+        || state.breakerUntil !== 0
+        || state.degradeUntil !== 0
+        || state.restrictedUntil !== 0
+        || state.fails !== 0
+        || hasModelCooldowns
+      ) {
         state.until = 0
         state.breakerUntil = 0
         state.degradeUntil = 0
+        state.restrictedUntil = 0
         state.coolKind = ''
         state.fails = 0
         state.retryCount = 0
         state.softStreak = 0
         state.consecutiveFails = 0
         state.sessionDeadFails = 0
+        // 模型级冷却与确认计数一并归零（否则 `modelConfirm` 会让下次更快熔断）
+        state.modelCooldowns = {}
+        state.modelConfirm = {}
         writeAccount(this.ctx.storage.sql, state.uid, state.realm, JSON.stringify(state), Date.now())
         n += 1
       }

@@ -287,3 +287,31 @@ test('🔴 parseBusinessCode 必须同时认「裸数字」与「带引号字符
   assert.equal(parseBusinessCode('Forbidden'), undefined)
   assert.equal(parseBusinessCode('{"msg":"no code"}'), undefined)
 })
+
+test('🔴 双层嵌套 `error.data.code` 必须解析出业务码（workbuddy 14018 实测）', () => {
+  // 2026-10-21 实测缺陷：workbuddy 的「额度耗尽」回的是
+  //   HTTP 429 {"error":{"data":{"code":14018,"msg":"Credits exhausted…"}}}
+  // 顶层没有 code，旧 parseEnvelope 直接返回 undefined
+  // ⇒ classify 落到「429 ⇒ rate_limited」⇒ soft(60s)
+  // 而 14018 应映射到 credit_exhausted ⇒ hard（冷却到次日 04:00）。
+  // 后果：真的没额度的号每 60 秒被重新选中、反复打上游，
+  // 面板上却只显示「被限流」。
+  const body = '{"error":{"data":{"code":14018,"msg":"Credits exhausted. Please visit the link below to purchase add-on packs"}}}'
+
+  const env = parseEnvelope(body)
+  assert.ok(env !== undefined, '双层嵌套必须被识别成信封')
+  assert.equal(env.code, 14018, '业务码必须解析出来')
+
+  const r = classify(429, body)
+  assert.equal(r.kind, 'credit_exhausted', '14018 必须归 credit_exhausted（不是 rate_limited）')
+  assert.equal(r.code, 14018)
+})
+
+test('⚠️ `error.code`（单层）也要认，但不能把「只有 message」误判成信封', () => {
+  const single = classify(429, '{"error":{"code":14018,"message":"Credits exhausted"}}')
+  assert.equal(single.kind, 'credit_exhausted')
+
+  // 只有 message、没有码 ⇒ 不算信封（否则 isWafBlocked 会放过真 WAF 页）
+  assert.equal(parseEnvelope('{"error":{"message":"something went wrong"}}'), undefined,
+    '只有 message 的响应不得被当成业务信封')
+})
