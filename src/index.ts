@@ -2880,7 +2880,28 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
         body: JSON.stringify({
           model,
           messages: [{ role: 'user', content: '1' }],
-          max_tokens: 1,
+          /**
+           * 🔴 **不能给 1**（2026-10-21 实测缺陷）。
+           *
+           * 面板上出现过这样的探测结果：
+           * ```
+           * 探测: upstream_problem
+           * 失败 · 1467ms · 上游返回了空响应（既没有正文/思考内容…）
+           * 上游原文片段: …"model":"hy4-preview"…"delta":{"content":"","reasoning…
+           * ```
+           * 而那个账号的状态是「正常」、积分充足 —— **探测自己报了假警**。
+           *
+           * 原因：`hy4-preview` 是**推理模型**，`max_tokens: 1` 的那 1 个 token
+           * 全被用在「思考」上，正文必然是空串。而网关的「空响应」兜底
+           * （`server.ts` 的 `content === '' && reasoning_content === ''`）
+           * 在 reasoning 也为空时就会如实报「上游返回了空响应」
+           * ⇒ 探测把「我给的预算太小」误报成「上游有问题」。
+           *
+           * ⇒ 给一个能让推理模型「思考完还留一点给正文」的预算。
+           * 32 足够：探测只问一句「1」，正常模型 1-2 个 token 就答完，
+           * 推理模型也能产出非空 reasoning（判据已把 reasoning 算作内容）。
+           */
+          max_tokens: 32,
           stream: false,
         }),
       })
