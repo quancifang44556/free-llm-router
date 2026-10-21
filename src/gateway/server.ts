@@ -31,7 +31,7 @@ import { deriveIntlConversationId, newTurnRequestId } from '../upstream/conversa
 import { cleanupToolPairing, prepareChatBody, sanitizeChatBody, trimMessagesByLimit } from './payload.js'
 import { safetyConfigFor } from './safety.js'
 import { throttleUpstream } from './throttle.js'
-import { ERROR_CHECK_FRAMES, ERROR_HINT_PATTERN, aggregateSse, createFrameTranslator, detectErrorFrame, doneFrame, errorFrame, mayHaveUsage, parseSseLine, sseHeaders, translateFrame } from './stream.js'
+import { ERROR_CHECK_FRAMES, ERROR_HINT_PATTERN, aggregateSse, createFrameTranslator, detectErrorFrame, doneFrame, errorFrame, isEmptyAssistantTurn, mayHaveUsage, parseSseLine, sseHeaders, translateFrame } from './stream.js'
 import { jsonError, parseRetryAfterMs } from './http.js'
 import {
   ZERO_OUTPUT_COOLDOWN_MS,
@@ -3014,14 +3014,19 @@ async function nonStreamingResponse(
   // `finish_reason` 为 `'tool_calls'`）。不排除就会把一次**成功**的工具调用
   // 误报成「上游返回空响应」—— 那是比原缺陷更糟的假阳性
   //（工具调用是 agent 场景的主路径）。
-  const toolCalls = (choice?.message as { tool_calls?: unknown[] } | undefined)?.tool_calls
-  const hasToolCalls = Array.isArray(toolCalls) && toolCalls.length > 0
-  if (
-    choice !== undefined
-    && !hasToolCalls
-    && choice.message.content === ''
-    && (choice.message.reasoning_content ?? '') === ''
-  ) {
+  /**
+   * ⚠️ 判据已抽到 `stream.ts` 的 `isEmptyAssistantTurn`（2026-10-21 审查后）。
+   *
+   * 原来这里手写一遍 `content==='' && reasoning_content===''` + 排除 `tool_calls`，
+   * 而 `responses.ts` 的非流式路径**没有这段** —— 同一概念两套口径，
+   * 结果是 `/v1/chat/completions` 报 502、`/v1/responses` 回 **200 空答案**。
+   *
+   * 换用共用函数后：
+   * - 两条路径**结构上不可能再漂移**；
+   * - 顺带补上原来漏判的 `refusal`（合法拒答）与旧式 `function_call` ——
+   *   漏掉它们会把**有产出的响应**反向误报成「上游空响应」502。
+   */
+  if (isEmptyAssistantTurn(choice)) {
     // ⚠️ **先处理「整个响应体就是一个 JSON（不是 SSE）」的情况**。
     //
     // 实测踩到：某些上游（如 CodeArts 经华为 APIG）在 HTTP **200** 下直接

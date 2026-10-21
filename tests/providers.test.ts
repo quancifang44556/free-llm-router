@@ -1275,7 +1275,7 @@ test('⚠️ loomy 的 matchesShape 与 parseCredential 必须共用同一份判
     '⚠️ 共享判据必须先展开嵌套包装层（与 parseCredential 一致）')
 })
 
-test('🔴 空响应必须显式报错（含「找不到错误帧」的兜底），但**不能**误伤工具调用', () => {
+test('🔴 空响应必须显式报错（含「找不到错误帧」的兜底），但**不能**误伤工具调用', async () => {
   // ## 实测缺陷（用户报「codearts 调用不了」）
   //
   // CodeArts 在「并发会话数已达上限(3个)」时，非流式路径回的是
@@ -1313,10 +1313,33 @@ test('🔴 空响应必须显式报错（含「找不到错误帧」的兜底）
   // ③ ⚠️ 但**必须排除工具调用** —— 那时 content 也是 ''，不排除会把一次
   //    **成功**的工具调用误报成空响应（假阳性比原缺陷更糟：工具调用是
   //    agent 场景的主路径）。
-  assert.ok(/const hasToolCalls = Array\.isArray\(toolCalls\) && toolCalls\.length > 0/.test(block),
-    '必须计算 hasToolCalls')
-  assert.ok(/choice !== undefined\s*\n\s*&& !hasToolCalls/.test(block),
-    '⚠️ 空响应判据必须排除 tool_calls（否则误伤正常的工具调用）')
+  // ③ 判据本身改由**共用函数**承担（2026-10-21 审查后），故这里断言**行为**而不是变量名。
+  //    原来这条断言的是 `/const hasToolCalls = .../` 这个**变量名**——
+  //    属于「读源码文本」的弱测试：它只能证明「有人写过这个变量」，
+  //    不能证明「工具调用不会被误判」。改成直接喂数据给判据函数。
+  const { isEmptyAssistantTurn } = await import('../src/gateway/stream.ts')
+  const turn = (message: Record<string, unknown>, finish: string | null = 'stop') =>
+    ({ index: 0, message: { role: 'assistant', ...message }, finish_reason: finish }) as never
+
+  assert.equal(isEmptyAssistantTurn(turn({ content: '', reasoning_content: '' })), true,
+    '正文与思考都空 ⇒ 判为空响应')
+  assert.equal(isEmptyAssistantTurn(turn({ content: '', tool_calls: [{ id: 'x' }] }, 'tool_calls')), false,
+    '⚠️ 工具调用是**成功**响应，不得误判（假阳性比原缺陷更糟：agent 主路径）')
+  assert.equal(isEmptyAssistantTurn(turn({ content: '', reasoning_content: '想' }, 'length')), false,
+    '只有思考内容也算有产出')
+  assert.equal(isEmptyAssistantTurn(turn({ content: '', refusal: '不行' })), false,
+    '⚠️ 拒答（refusal）是产出 —— 2026-10-21 审查补的漏判')
+  assert.equal(isEmptyAssistantTurn(turn({ content: '', function_call: { name: 'f' } })), false,
+    '⚠️ 旧式 function_call 是产出 —— 同上')
+  assert.equal(isEmptyAssistantTurn(turn({ content: 'hi' })), false)
+  assert.equal(isEmptyAssistantTurn(undefined), false, 'choice 缺失不判为空')
+
+  // ④ 两条路径都必须用同一个判据（防止再退回「各写一遍」而漂移）
+  const responsesSrc = readFileSync('src/gateway/responses.ts', 'utf8')
+  assert.ok(/isEmptyAssistantTurn\(/.test(block),
+    'server.ts 必须使用共用判据 isEmptyAssistantTurn')
+  assert.ok(/isEmptyAssistantTurn\(/.test(responsesSrc),
+    '⚠️ responses.ts 非流式路径也必须使用同一判据（否则又是「只修一半」）')
 })
 
 test('⚠️ aggregateSse 确实会把 tool_calls 放进 message（上一条测试的前提）', () => {
@@ -2354,4 +2377,42 @@ test('⚠️ workbuddy 国际版 matchesShape 必须支持嵌套与顶层 domain
   // 国内版凭据不应误判为国际版
   assert.equal(wb?.matchesShape?.({ domain: 'copilot.tencent.com' }), false)
   assert.equal(wb?.matchesShape?.({ auth: { domain: 'copilot.tencent.com' } }), false)
+})
+
+test('🔴 findErrorFrameInRaw 必须同时认「裸 JSON」与「SSE 帧」两种错误形态', async () => {
+  // 2026-10-21 审查（M1）发现的**严重**缺陷：`/v1/responses` 非流式路径
+  // 读完流直接 aggregateSse → HTTP 200，全程不判错 ⇒ 客户端拿到「成功 + 空答案」。
+  // 修法是把判据抽成共用函数，本测试锁住这个函数的行为。
+  const { findErrorFrameInRaw } = await import('../src/gateway/stream.ts')
+
+  // ① 裸 JSON 错误体（CodeArts 经华为 APIG 的形态：HTTP 200 + 无 data: 前缀）
+  assert.equal(
+    findErrorFrameInRaw('{"error":{"message":"model not found"}}'),
+    'model not found',
+    '裸 JSON 错误体必须认出',
+  )
+
+  // ② 标准 SSE 错误帧（data: 后有空格）
+  assert.equal(
+    findErrorFrameInRaw('data: {"error":{"message":"rate limited"}}\n\n'),
+    'rate limited',
+  )
+
+  // ③ ⚠️ 无空格形态 `data:{...}` —— 历史上手写 startsWith('data: ') 漏过它
+  assert.equal(
+    findErrorFrameInRaw('data:{"error":{"message":"no space"}}'),
+    'no space',
+    '无空格的 data: 前缀也必须认（走 parseSseLine，不手写前缀判断）',
+  )
+
+  // ④ 正常内容帧不得误报
+  assert.equal(
+    findErrorFrameInRaw('data: {"choices":[{"index":0,"delta":{"content":"hi"}}]}'),
+    undefined,
+    '正常帧不得误判成错误',
+  )
+
+  // ⑤ 空串 / 无错误
+  assert.equal(findErrorFrameInRaw(''), undefined)
+  assert.equal(findErrorFrameInRaw('data: [DONE]\n\n'), undefined)
 })

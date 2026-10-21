@@ -49,7 +49,8 @@
  */
 
 import {
-  aggregateSse, createFrameTranslator, detectErrorFrame, parseSseLine,
+  aggregateSse, createFrameTranslator, detectErrorFrame, findErrorFrameInRaw,
+  isEmptyAssistantTurn, parseSseLine,
   type AggregatedCompletion,
 } from './stream.js'
 import { handleChatCompletions } from './server.js'
@@ -946,6 +947,46 @@ export async function handleResponses(
   }
 
   const aggregated = aggregateSse(raw, { model, now: Date.now() })
+
+  /**
+   * 🔴 **必须判错，不能直接 200**（2026-10-21 审查发现的**严重**缺陷，M1 指出）。
+   *
+   * ## 缺陷
+   * 本文件**流式**路径会识别错误帧并发 `response.failed`（见上方 787 行附近），
+   * 而**非流式**路径读完流后直接 `aggregateSse` → `Response.json(..., 200)`，
+   * 全程**一次 `detectErrorFrame` 都没有**。
+   *
+   * 链路：`handleResponses` 把 `chatBody.stream = true` 交给
+   * `handleChatCompletions`，拿到 SSE；上游错误帧被转成
+   * `data: {"error":{...}}`；`aggregateSse` 对该帧 `choices` 非数组 ⇒ `continue`
+   * ⇒ 产出 `content:''`；`toResponsesObject` 于是给出 `text:''`、
+   * `status:'completed'`、`error:null` 的**成功**响应。
+   *
+   * ⇒ 客户端看到「成功，但模型什么都没说」。
+   * `server.ts` 里那条「空响应必须报错」的守卫（`nonStreamingResponse`）
+   * **本路径根本不经过** —— 而它的注释写的正是「**空回复比报错更糟**」。
+   *
+   * ## 修法
+   * 复用抽到 `stream.ts` 的两个共用判据（`findErrorFrameInRaw` /
+   * `isEmptyAssistantTurn`），与 `server.ts` **同一套口径**，结构上不再漂移。
+   * 顺序上先找错误帧：上游若给了明确原因，优先把它透出来（比笼统的「空响应」有用）。
+   */
+  const upstreamError = findErrorFrameInRaw(raw)
+  if (upstreamError !== undefined) {
+    return { response: errorJson(upstreamError, 502) }
+  }
+  if (isEmptyAssistantTurn(aggregated.choices[0])) {
+    const snippet = raw.trim().slice(0, 200)
+    return {
+      response: errorJson(
+        '上游返回了空响应（既没有正文/思考内容，也没有可识别的错误帧）。'
+          + '这通常意味着上游临时拒绝或该模型不可用，请稍后重试。'
+          + (snippet === '' ? '' : `上游原文片段：${snippet}`),
+        502,
+      ),
+    }
+  }
+
   return {
     response: Response.json(toResponsesObject(body, model, aggregated, responseId), {
       headers: { 'cache-control': 'no-store' },

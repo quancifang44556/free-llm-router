@@ -580,6 +580,87 @@ export function sseHeaders(): Record<string, string> {
 // ─────────────────── 非流式聚合（客户端要 stream:false 时用） ───────────────────
 
 /** 聚合后的单次补全（OpenAI 非流式形状）。 */
+/**
+ * 判断一个聚合后的 choice 是否表示「**上游什么都没给**」。
+ *
+ * ## 为什么抽成函数
+ * 这个判据原本在 `server.ts` 的 `nonStreamingResponse` 里手写了一遍，
+ * 而 `responses.ts` 的非流式路径**完全没有**它 —— 于是同一件事两套口径：
+ * `/v1/chat/completions` 会报 502，`/v1/responses` 却回 **HTTP 200 + 空答案**。
+ * 这正是本项目最主要的缺陷形态「**同一概念两处独立实现，口径漂移**」。
+ * 抽到这里之后，两条路径调**同一个函数**，结构上不可能再漂。
+ *
+ * ## 判据（必须同时满足才算「空」）
+ * - `content === ''`
+ * - `reasoning_content === ''`
+ * - **没有** `tool_calls`（只有工具调用的响应是**成功**的，不能误报）
+ * - **没有** `refusal`（拒答也是产出，2026-10-21 审查补）
+ * - **没有**旧式 `function_call`（同上，2026-10-21 审查补）
+ *
+ * ⚠️ `usage` **不参与判断**：它只说明「上游计了费」。
+ * 历史上曾用 `usage === undefined` 当「不是空响应」的理由，
+ * 结果「消耗了 token 但零产出」这种**最该报错**的形态被放过（实测 codearts）。
+ */
+export function isEmptyAssistantTurn(
+  choice: AggregatedCompletion['choices'][number] | undefined,
+): boolean {
+  if (choice === undefined) return false
+  const msg = choice.message as {
+    content?: string
+    reasoning_content?: string
+    tool_calls?: unknown[]
+    refusal?: unknown
+    function_call?: unknown
+  }
+  if (Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0) return false
+  // ⚠️ `refusal` 与旧式 `function_call` 同样是「有产出」——
+  // 漏掉它们会把**合法的拒答/函数调用**反向误报成「上游空响应」（502）。
+  if (msg.refusal !== undefined && msg.refusal !== null && msg.refusal !== '') return false
+  if (msg.function_call !== undefined && msg.function_call !== null) return false
+  if ((msg.content ?? '') !== '') return false
+  if ((msg.reasoning_content ?? '') !== '') return false
+  return true
+}
+
+/**
+ * 在**原始响应体**里找上游的错误帧。
+ *
+ * 上游经常在 **HTTP 200** 里用 SSE 帧或裸 JSON 报错
+ *（限流、模型名错、并发超限…）。不主动扫出来，就会把错误当成「空答案」返回。
+ *
+ * 两种形态都要认（都实测踩过）：
+ * 1. **整个 body 就是一个裸 JSON**（如 CodeArts 经华为 APIG）—— 没有 `data:` 前缀；
+ * 2. **标准 SSE** —— 逐行 `data: {...}`。
+ *
+ * ⚠️ SSE 行解析一律走 `parseSseLine`，不要手写 `startsWith('data:')`：
+ * 它同时容忍 `data: ` 与 `data:` 两种写法（历史上手写漏过无空格形态）。
+ */
+export function findErrorFrameInRaw(raw: string): string | undefined {
+  const trimmed = raw.trim()
+  if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+    try {
+      const whole = JSON.parse(trimmed) as Record<string, unknown>
+      const err = detectErrorFrame(whole)
+      if (err !== undefined) return err
+    } catch {
+      // 不是单个 JSON，继续按 SSE 扫
+    }
+  }
+  for (const line of raw.split('\n')) {
+    const frame = parseSseLine(line)
+    if (frame.kind === 'error' && typeof frame.error === 'string') return frame.error
+    if (frame.kind !== 'chunk' || typeof frame.data !== 'string') continue
+    try {
+      const parsed = JSON.parse(frame.data) as Record<string, unknown>
+      const err = detectErrorFrame(parsed)
+      if (err !== undefined) return err
+    } catch {
+      // 非 JSON 帧，继续
+    }
+  }
+  return undefined
+}
+
 export interface AggregatedCompletion {
   id: string
   object: 'chat.completion'
