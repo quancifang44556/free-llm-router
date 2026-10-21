@@ -122,6 +122,22 @@ export function createNodeRuntime(databasePath?: string): NodeRuntimeContext {
     // `tests/safety-config.test.ts` 的环境变量回落用例抓出来的）。
     // 同为原样透传：解析与「0 = 不限制」的语义归 `resolveMaxContextMessages`。
     MAX_CONTEXT_MESSAGES: process.env.MAX_CONTEXT_MESSAGES?.trim(),
+    /**
+     * 🔴 **这三个曾经漏在白名单外**（2026-10-21 审查补，M6 指出）。
+     *
+     * Node/Docker 部署要靠这段映射把 `process.env` 搬进 `Env`；漏一个的后果是
+     * **文档写了、生产设了、毫无作用、零报错** —— 与上面 `MAX_CONTEXT_MESSAGES`
+     * 记录的是同一型缺陷（那次是被测试抓出来的，这三个没被抓到）。
+     *
+     * - `RATE_LIMIT_QPS` / `RATE_JITTER_MS`：`gateway/safety.ts` 读它们做上游节奏
+     * - `WORKBUDDY_DAILY_CHAT_MODEL`：`taskrunner/actions.ts` 读它选每日对话模型
+     *
+     * 一律**原样透传（含空串）**：解析与默认值归各自的 resolve 函数，
+     * 不在这里兜底（否则形成第二份判据，两处慢慢分叉）。
+     */
+    RATE_LIMIT_QPS: process.env.RATE_LIMIT_QPS?.trim(),
+    RATE_JITTER_MS: process.env.RATE_JITTER_MS?.trim(),
+    WORKBUDDY_DAILY_CHAT_MODEL: process.env.WORKBUDDY_DAILY_CHAT_MODEL?.trim(),
   }
 
   const accountPoolNamespace = new NodeDurableObjectNamespace<AccountPoolDO>(
