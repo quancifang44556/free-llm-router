@@ -341,12 +341,17 @@ test('🔴 延迟记账：全池同样失败**不得**记熔断（否则上游�
   const src = readFileSync('src/gateway/server.ts', 'utf8')
 
   // ① 必须存在 blame 收件箱，且只收累加型维度
-  assert.match(src, /const blame: Array<\{ uid: string; kind: 'breaker' \| 'degrade'; reason: string \}> = \[\]/,
-    'breaker/degrade 必须走延迟记账（blame 只收这两种累加型维度）')
+  // ⚠️ 2026-10-21 扩展：blame 原先只收 breaker/degrade。后来发现**单账号池的 soft
+  // 也必须延迟**（否则唯一路径被掐断 60 秒，用户报「审查时被误判打断」）。
+  assert.match(src, /const blame: Array<\{ uid: string; kind: FailureKindForBlame; reason: string \}> = \[\]/,
+    'breaker/degrade（及单账号池下的 soft）必须走延迟记账')
 
   // ② 这两个维度不得直接 applyFailure
-  assert.match(src, /if \(punishKind === 'breaker' \|\| punishKind === 'degrade'\) \{\s*blame\.push/,
-    'breaker/degrade 应先入 blame，而不是立即记账')
+  assert.match(
+    src,
+    /if \(punishKind === 'breaker' \|\| punishKind === 'degrade' \|\| \(punishKind === 'soft' && deferSoft\(\)\)\) \{\s*blame\.push/,
+    'breaker/degrade（及单账号池的 soft）应先入 blame，而不是立即记账',
+  )
 
   // ③ 成功时必须结算
   assert.match(src, /settleBlame\(pool, blame, Date\.now\(\)\)/,
@@ -486,4 +491,40 @@ test('🔴 版本号三处必须一致（注释声称有测试钉住，实际并
     }
   }
   assert.ok(found, '面板产物里必须能找到渲染版本号（否则说明资源结构变了，这条测试已失效）')
+})
+
+test('🔴 单账号池的 soft 冷却必须延迟（否则唯一路径被掐断 60 秒）', async () => {
+  // ## 用户报障
+  // 「审查的时候会被误判打断」—— 审查是高频并发调用，一次瞬时抖动就让
+  // qodercn（**只有 1 个账号**）进 60 秒软冷却，期间全部请求回 503。
+  // 而账号实测完全健康（successCount 1556、errTotal 仅 9）。
+  //
+  // ## 根因
+  // 延迟记账（blame）只覆盖 breaker/degrade，`soft` 仍然立即记。
+  // 对多账号池那是正确的（罚 A 还能用 B）；但池里只有 1 个号时，
+  // 「立即冷却」= 立即掐断唯一可用路径，冷却换不来任何好处。
+  //
+  // ## 关键陷阱（我第一版写错过）
+  // 判据**不能**用 `tried.length <= 1`：`tried.push` 发生在错误处理**之前**，
+  // 所以「多账号池的第一个号失败」时 tried.length 也是 1 ⇒ 会误判成单账号池
+  // ⇒ 漏记真正的限流。必须用循环外探到的**真实 poolSize**。
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync('src/gateway/server.ts', 'utf8')
+
+  assert.match(src, /let poolSize = 0/, '必须探测真实池大小')
+  assert.match(src, /poolSize === 1/, '单账号池判据必须是 poolSize === 1')
+  // 反向：不能再用 tried.length 当判据（那是错的）
+  assert.ok(
+    !/deferSoft = \(\): boolean => tried\.length/.test(src),
+    '不得用 tried.length 作判据 —— 它在错误处理前已 push，会误判多账号池',
+  )
+  // soft 必须真的进 blame 分支
+  assert.match(
+    src,
+    /punishKind === 'soft' && deferSoft\(\)/,
+    "soft 在单账号池下必须走延迟记账",
+  )
+  // 探测失败必须回落「不延迟」（保持原纪律），不能放宽
+  assert.match(src, /catch \{\s*poolSize = 0\s*\}/, '探测失败必须回落 0（不启用延迟）')
+  assert.match(src, /type FailureKindForBlame = 'breaker' \| 'degrade' \| 'soft'/, 'blame 类型必须容纳 soft')
 })

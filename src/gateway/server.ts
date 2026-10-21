@@ -186,12 +186,16 @@ export function modelCauseFor(kind: ErrorKind): 'busy' | 'absent' | 'denied' | u
  * 3 个请求后全池 `breaker` 30 分钟；而熔断期内没有成功请求来复位计数，
  * 于是**上游恢复后号池仍然不可用** —— 故障被我们自己延长了。
  *
- * 只用于 breaker / degrade（累加型计数）；restricted / model / soft
- * 有明确上游证据，一律立即记账，不走这里。
+ * 用于 breaker / degrade（累加型计数），以及**单账号池下的 soft**
+ *（池里只有一个号时，"立即冷却"等于立即掐断唯一路径 —— 见 `deferSoft`）。
+ * restricted / model 有明确上游证据，一律立即记账，不走这里。
  */
+/** blame 收件箱的元素类型（延迟记账用）。 */
+type FailureKindForBlame = 'breaker' | 'degrade' | 'soft'
+
 async function settleBlame(
   pool: DurableObjectStub<AccountPoolDO>,
-  blame: Array<{ uid: string; kind: 'breaker' | 'degrade'; reason: string }>,
+  blame: Array<{ uid: string; kind: FailureKindForBlame; reason: string }>,
   now: number,
 ): Promise<void> {
   if (blame.length === 0) return
@@ -991,6 +995,25 @@ export async function handleChatCompletions(
   const pinnedHeader = requestedAccount(request)
   const maxRotate = await maxRotateFor(pool)
 
+  /**
+   * 本 provider 在当前 realm 有多少个**可参与轮换**的账号（循环外探一次）。
+   *
+   * 用途见下方 `deferSoft`：池里只有 1 个号时，软冷却 = 掐断唯一路径。
+   *
+   * ⚠️ 探测失败按「多账号」处理（`0` ⇒ 不禁用延迟，即保持原有立即记账行为）：
+   * 读不到池大小时**不应该**放宽记账纪律 —— 那会让真正的限流被漏记。
+   * 宁可偶发误冷却，也不要让限流失去约束。
+   */
+  let poolSize = 0
+  try {
+    const all = await pool.listAccounts(realm, Date.now())
+    poolSize = all.filter(
+      (a) => (a.provider ?? DEFAULT_PROVIDER) === DEFAULT_PROVIDER && a.disabled !== true,
+    ).length
+  } catch {
+    poolSize = 0
+  }
+
   // ⚠️ **延迟记账收件箱**（借鉴 qoder2api-hub #65 的 blame 机制）。
   //
   // 只有「**换号后成功了**」才能证明问题出在之前那个账号上；若所有号都以同样方式
@@ -1001,7 +1024,35 @@ export async function handleChatCompletions(
   // 因此只对「会累加失败计数」的维度（breaker / degrade）延迟记账；
   // restricted（上游明确标记）、model（模型级）、soft（限流）等**仍然立即记** ——
   // 它们都有明确的上游证据，不是「靠换号成功才反推」的推测。
-  const blame: Array<{ uid: string; kind: 'breaker' | 'degrade'; reason: string }> = []
+  const blame: Array<{ uid: string; kind: FailureKindForBlame; reason: string }> = []
+
+  /**
+   * ⚠️ **单账号池的 soft 冷却必须延迟**（2026-10-21 实测踩到）。
+   *
+   * ## 症状（用户报）
+   * 「审查的时候会被误判打断」—— 一次瞬时抖动就让 qodercn（**只有 1 个账号**）
+   * 进 60 秒软冷却，期间所有请求回 503「1 个账号都在冷却中，约 1 分钟后恢复」。
+   * 而账号本身完全健康（实测 successCount 1556、errTotal 仅 9，
+   * 并发 5 连发 + 长上下文并发全部 200）。
+   *
+   * ## 为什么上面的注释「soft 有明确上游证据，立即记」在这情况下站不住
+   * 那个理由对**多账号池**成立：罚了 A 还能用 B，代价可控。
+   * 但池里只有 1 个账号时，「立即记」= **立即把唯一可用路径掐断 60 秒**。
+   * 而此时根本没有别的号可换，冷却换不来任何好处，只有中断。
+   *
+   * ## 判据：**真实的池大小**，不是 `tried.length`
+   *
+   * ⚠️ 第一版我写成 `tried.length <= 1`，那是错的：`tried.push` 发生在错误处理
+   * **之前**，所以「多账号池的第一个号失败」时 `tried.length` 也是 1 ——
+   * 会把它误判成单账号池，从而漏记真正的限流。
+   * 故改成循环外探一次 `poolSize`（只数未停用的同 provider 账号）。
+   *
+   * 只有 `poolSize === 1` 才延迟：**只有后续真的换号成功才记账**，
+   * 全失败则丢弃（与 breaker/degrade 同一套纪律）。
+   * `poolSize === 0`（探测失败或有 0 个可用）**不启用**延迟 ——
+   * 读不到就按原纪律走，宁可偶发误冷却，也不让限流失去约束。
+   */
+  const deferSoft = (): boolean => poolSize === 1
 
   for (let attempt = 0; attempt <= maxRotate; attempt += 1) {
     const now = Date.now()
@@ -1164,8 +1215,10 @@ export async function handleChatCompletions(
         const cause = modelCauseFor(kind)
         const punishKind =
           kind === 'rate_limited' ? dimension : mapped.dimension === 'model' ? 'model' : mapped.dimension
-        // 累加失败的维度延迟到「换号成功」时再记（见 blame 的注释）
-        if (punishKind === 'breaker' || punishKind === 'degrade') {
+        // 累加失败的维度延迟到「换号成功」时再记（见 blame 的注释）。
+        // ⚠️ `soft` 在**单账号池**下也要延迟：池里只有一个号时，立即冷却
+        // 等于立即掐断唯一路径 60 秒，而冷却换不来任何好处（见 deferSoft）。
+        if (punishKind === 'breaker' || punishKind === 'degrade' || (punishKind === 'soft' && deferSoft())) {
           blame.push({ uid: candidate.uid, kind: punishKind, reason: `${kind}: ${msg}`.slice(0, 200) })
         } else {
         await pool
