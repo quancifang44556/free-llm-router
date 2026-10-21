@@ -1281,6 +1281,22 @@ export async function handleChatCompletions(
       const { kind, msg } = classify(200, errText)
       const mapped = mapErrorToPunishment(kind)
       const { dimension, resetAt } = refineModelScoped(kind, errText)
+      /**
+       * 🔴 **流内错误诊断**（`UPSTREAM_DEBUG=1` 开启）。
+       *
+       * ⚠️ 此前诊断开关只覆盖 `!upstream.ok`（非 2xx）分支，而**这条路径是
+       * HTTP 200 但流里藏错误帧** —— qoder / codearts 等上游都用这种形态。
+       * 结果：用户报「误判进冷却」时，日志里**一条记录都没有**，只能猜。
+       *
+       * 这条日志记录「真实的分类结果」——它是判断「我们是否误判」的**唯一依据**：
+       * 若 kind 是 rate_limited 但上游原文其实是别的，就是误判。
+       */
+      if ((globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env?.UPSTREAM_DEBUG === '1') {
+        console.warn(
+          `[stream-error] model=${model} kind=${kind} dim=${dimension} punish=${mapped.punish} ` +
+            `resetAt=${resetAt ?? '-'} text=${errText.slice(0, 300)}`,
+        )
+      }
 
       if (mapped.punish) {
         const cause = modelCauseFor(kind)

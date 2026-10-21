@@ -1015,6 +1015,29 @@ export class AccountPoolDO extends DurableObject<Env> {
     if (state === undefined) return { disabled: false }
     const { now } = input
 
+    /**
+     * 🔴 **统一的失败记账日志**（这是排查「账号莫名进冷却」的唯一可靠依据）。
+     *
+     * ## 为什么必须加在这里
+     * 全项目的 `applyFailure` 调用点有 **12 处**（gateway/server.ts），
+     * 但其中**只有 3 处**带日志。于是无论哪条路径触发冷却，用户都**看不到任何记录** ——
+     * 表现为「账号明明能用，却突然 503 说在冷却中」，而我只能靠猜。
+     *
+     * 放在这里而不是各调用点：**一处覆盖全部路径**，不会再「只修一半」。
+     *
+     * ## 怎么读这条日志
+     * - `kind=soft` + `model=` 空 ⇒ 账号级软冷却（**这就是误判的症状**）
+     * - `kind=model`            ⇒ 只冷却该模型，不罚账号（正常）
+     * - `reason` 里带 `rate_limited: ...` ⇒ 上游返回了限流类错误码
+     *
+     * 若 `kind=soft` 但 `reason` 里的上游原文根本不像限流 ⇒ **分类错了**，要改 `classify`。
+     */
+    console.warn(
+      `[punish] uid=${input.uid.slice(0, 8)} kind=${input.kind}` +
+        `${input.model !== undefined && input.model !== '' ? ` model=${input.model}` : ''}` +
+        ` reason=${(input.reason ?? '').slice(0, 160)}`,
+    )
+
     switch (input.kind) {
       case 'hard': {
         // 余额耗尽：冷却到次日 04:00（UTC+8）。签到后余额恢复会自动解冻。
