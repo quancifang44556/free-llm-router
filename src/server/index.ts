@@ -109,6 +109,9 @@ function strictPort(raw: string | undefined): number {
   return n
 }
 
+/** 进程级兜底是否已安装（只装一次，见 `startServer` 内的说明）。 */
+let unhandledGuardInstalled = false
+
 export function startServer(options: ServerOptions = {}) {
   /**
    * 🔴 **端口不能走 `parseInt`**（2026-10-21 审查补，配置健壮性专项）。
@@ -124,6 +127,26 @@ export function startServer(options: ServerOptions = {}) {
   const host = options.host ?? process.env.HOST ?? '0.0.0.0'
   const autoCron = options.autoCron ?? envFlag(process.env.AUTO_TASK_CRON, true)
   const trustProxy = options.trustProxy ?? envFlag(process.env.TRUST_PROXY, false)
+
+  /**
+   * 🔴 **进程级未捕获异常兜底**（2026-10-21 审查补，并发专项）。
+   *
+   * Node 22+ 默认把未处理的 rejection **直接抛成未捕获异常并退出进程**。
+   * 而这个服务里有多处「后台定时器 / 存储写入」的异步尾巴，
+   * 一次 `SQLITE_FULL` 或「库已关闭」就能让**整个网关**退出
+   *（不是那一个任务失败）—— 实测崩之前还会把未迁移的实例留在缓存里。
+   *
+   * 这里改为**只记日志不退出**：单条后台失败的代价，不该是全租户中断。
+   * 真正的致命错误（端口占用、库损坏到无法迁移）仍在启动阶段直接抛。
+   */
+  // ⚠️ 只注册一次：测试里会反复 startServer，每个都挂监听器会撞
+  // `MaxListenersExceededWarning`（也会让排障时看到一堆重复日志）。
+  if (!unhandledGuardInstalled) {
+    unhandledGuardInstalled = true
+    process.on('unhandledRejection', (error: unknown) => {
+      console.error('[fatal-guard] 未处理的异步异常（已拦截，进程继续）：', error)
+    })
+  }
 
   const runtime = createNodeRuntime(options.databasePath)
   const { env, db, taskRunnerNamespace } = runtime
@@ -334,15 +357,35 @@ export function startServer(options: ServerOptions = {}) {
     console.log('\n🛑 正在停止 free-llm-router 服务...')
     if (cronInterval) clearInterval(cronInterval)
     clearInterval(pruneInterval)
-    server.close(() => {
+    /**
+     * 🔴 **必须带强制超时**（2026-10-21 审查补，并发专项）。
+     *
+     * `server.close()` 的语义是「停止接受新连接，等**现有连接全部结束**才回调」。
+     * 而 SSE / 长连接（推理进行中）**不会自己结束** —— 于是回调永远不执行，
+     * `db.close()` 从未跑过（注释宣称的「安全关闭并落盘 SQLite」不成立，WAL 未 checkpoint），
+     * 10 秒后被 Docker 的默认 `stop_grace_period` SIGKILL 掉。
+     *
+     * 而且被腰斩的那个 alarm，它的 `system_alarms` 行已在触发时删掉 ——
+     * 叠加「start() 早退不补排」就是一次完整的「任务静默停摆」事故。
+     */
+    let closed = false
+    const finish = (reason: string) => {
+      if (closed) return
+      closed = true
       try {
         db.close()
-        console.log('💾 SQLite 数据库连接已安全关闭。')
+        console.log(`💾 SQLite 数据库连接已安全关闭（${reason}）。`)
       } catch (err) {
         console.error('关闭数据库连接失败:', err)
       }
       process.exit(0)
-    })
+    }
+
+    // 8 秒兜底：小于 Docker 默认的 10 秒，保证我们**先于** SIGKILL 收尾
+    setTimeout(() => finish('强制超时，已放弃等待长连接结束'), 8_000).unref?.()
+    // 主动断开长连接（SSE），让 close 的回调能及时执行
+    server.closeAllConnections?.()
+    server.close(() => finish('全部连接已结束'))
   }
 
   process.on('SIGINT', shutdown)

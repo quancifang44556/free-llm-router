@@ -41,6 +41,18 @@ export interface RunState {
   finished: boolean
   /** 最后一步的失败原因（空 = 无失败）。 */
   lastError: string
+  /**
+   * 用户**已请求取消**（2026-10-21 审查补，并发专项）。
+   *
+   * ⚠️ 与 `finished` 是两件事，不能合并：`cancel()` 会把 `finished` 置真，
+   * 但**正在执行的那一步**结束时会把进入本步之前的旧快照整体回写
+   *（`save(state)`），于是 `finished` 又被改回 `false`、`queue` 也回来了，
+   * 接着还会重排 alarm —— 用户看到「已取消」自己翻回「运行中」，
+   * 剩下的步骤（可能含 5 个真实对话）照跑。
+   *
+   * 有了这个标记，回写前就能发现「期间有人取消过」，改为只并入本步结果。
+   */
+  cancelRequested?: boolean
   startedAt: number
   updatedAt: number
 }

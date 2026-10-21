@@ -93,17 +93,48 @@ export async function throttleUpstream(
 ): Promise<void> {
   if (qps <= 0 && jitterMs <= 0) return
 
+  /**
+   * 🔴 **必须先占位、再 await**（2026-10-21 审查补，并发专项）。
+   *
+   * ## 缺陷
+   * 原实现是 `get()` → `await sleep()` → `set()`，典型的**跨 await 的 check-then-act**。
+   * 同一个 uid 上来 N 个并发请求时，N 个都在 `set` 之前读到同一个 `last`，
+   * 于是**同一毫秒一起放行**。实测 qps=5、12 并发：
+   *
+   * ```
+   * 放行时刻直方图 { 0: 1, 200: 11 }   ← 11 个全挤在同一毫秒
+   * ```
+   *
+   * 而「连发」正是限速器唯一要消除的机器特征 —— 用户以为开了刹车，
+   * 实际比不开更糟（还多了个「已限速」的错觉）。
+   *
+   * ## 修法
+   * 在**进入 await 之前**就用当前时刻把「本请求的出场时刻」原子地写进 Map，
+   * 之后只是等这个时刻到来。并发者因此排队，间隔严格 ≥ `minInterval`。
+   *
+   * ⚠️ 抖动**并入预约**（而不是排完队再随机等）：
+   * 否则「槽位 + 随机抖动」可能让相邻两个的**实际**放行时刻反而靠近，
+   * 等于把整形好的节奏又打散回去。
+   */
+  if (lastReleaseAt.size > MAX_KEYS) lastReleaseAt.clear()
+
   if (qps > 0) {
     const minInterval = 1000 / qps
+    const t = now()
     const last = lastReleaseAt.get(key)
-    if (last !== undefined) {
-      const wait = last + minInterval - now()
-      if (wait > 0) await sleep(wait)
-    }
+    // 预约：不早于「现在」，也不早于「上一个出场 + 最小间隔」
+    const slot = (last === undefined ? t : Math.max(t, last + minInterval))
+      + (jitterMs > 0 ? Math.random() * jitterMs : 0)
+    lastReleaseAt.set(key, slot)
+    const wait = slot - t
+    if (wait > 0) await sleep(wait)
+    return
   }
 
-  if (jitterMs > 0) await sleep(Math.random() * jitterMs)
-
-  if (lastReleaseAt.size > MAX_KEYS) lastReleaseAt.clear()
-  lastReleaseAt.set(key, now())
+  // 只开抖动、不限速：仍然把抖动预约进 Map，保持键的语义一致
+  const t0 = now()
+  const slot = t0 + (jitterMs > 0 ? Math.random() * jitterMs : 0)
+  lastReleaseAt.set(key, slot)
+  const wait = slot - t0
+  if (wait > 0) await sleep(wait)
 }

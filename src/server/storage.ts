@@ -127,13 +127,14 @@ export function createNodeDurableObjectState(options: NodeDurableObjectStateOpti
 
   const triggerAlarm = async () => {
     clearTimer()
-    // 执行前从数据库清理记录
-    db.prepare('DELETE FROM system_alarms WHERE id = ?').run(instanceId)
-
     if (!onAlarm) return
 
     running = true
     try {
+      // 🔴 **执行前清理记录**必须在 try 内（2026-10-21 审查补，并发专项）：
+      // 原来写在 try **之外**，`SQLITE_FULL`/只读库时这条语句一抛，
+      // 错误连 `console.error` 都进不去，且直接冒成 unhandledRejection ⇒ 杀进程。
+      db.prepare('DELETE FROM system_alarms WHERE id = ?').run(instanceId)
       await onAlarm()
     } catch (err) {
       console.error(`[Node Alarm Error for ${instanceId}]`, err)
@@ -145,7 +146,9 @@ export function createNodeDurableObjectState(options: NodeDurableObjectStateOpti
          ON CONFLICT(id) DO UPDATE SET scheduled_time = excluded.scheduled_time`,
       ).run(instanceId, retryAt)
       activeTimer = setTimeout(() => {
-        void triggerAlarm()
+        // ⚠️ 必须 catch：`void` 一个会 reject 的 promise = unhandledRejection
+        // ⇒ Node 默认**直接杀进程**（整个网关，不只是这个任务）。
+        void triggerAlarm().catch((e) => console.error('[alarm] 重试调度失败：', e))
       }, ALARM_RETRY_DELAY_MS)
       activeTimer.unref?.()
     } finally {
@@ -162,7 +165,7 @@ export function createNodeDurableObjectState(options: NodeDurableObjectStateOpti
   if (pendingAlarmRow.length > 0) {
     const delay = Math.max(0, pendingAlarmRow[0].scheduled_time - Date.now())
     activeTimer = setTimeout(() => {
-      void triggerAlarm()
+      void triggerAlarm().catch((e) => console.error('[alarm] 恢复调度失败：', e))
     }, delay)
     activeTimer.unref?.()
   }
@@ -226,7 +229,7 @@ export function createNodeDurableObjectState(options: NodeDurableObjectStateOpti
       clearTimer()
       const delay = Math.max(0, timeMs - Date.now())
       activeTimer = setTimeout(() => {
-        void triggerAlarm()
+        void triggerAlarm().catch((e) => console.error('[alarm] 执行失败：', e))
       }, delay)
       // 不阻止 Node.js 进程退出（但在常驻服务中由 HTTP 服务器保持运行）
       activeTimer.unref?.()

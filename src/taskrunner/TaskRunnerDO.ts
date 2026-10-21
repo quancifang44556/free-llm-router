@@ -98,7 +98,23 @@ export class TaskRunnerDO extends DurableObject<Env> {
        * 阈值给足（30 分钟）：正常单步远小于它，只有真被打断才会命中。
        */
       const age = now - existing.updatedAt
-      if (age < STALE_RUN_MS) return existing
+      if (age < STALE_RUN_MS) {
+        /**
+         * 🔴 **早退也必须保证「有活着的 alarm」**（2026-10-21 审查补，并发专项）。
+         *
+         * alarm 触发时适配层会**先删掉** `system_alarms` 那行（见
+         * `src/server/storage.ts` 的 `triggerAlarm`）。若进程恰在那一步执行中
+         * 被重启/OOM 杀掉，这行就永远回不来了 —— 而这里原本**只看 age 就早退**，
+         * 于是：返回 `ok:true`、什么都不做、也不排 alarm ⇒ 任务永久静默卡死
+         *（只能手改 SQLite，或等到 30 分钟后**再有一次** `start()` 才被判死重开）。
+         *
+         * 幂等语义不变：仍返回同一个运行状态，只是确保它**还能被推进**。
+         */
+        if (existing.queue.length > 0 && (await this.ctx.storage.getAlarm()) === null) {
+          await this.ctx.storage.setAlarm(now)
+        }
+        return existing
+      }
       staleNote =
         `上次运行停在整个 ${Math.round(age / 1000)} 秒无进展（多半是重启打断），已判超时并重开`
       existing.finished = true
@@ -140,8 +156,11 @@ export class TaskRunnerDO extends DurableObject<Env> {
     if (state === undefined) return
     state.queue = []
     state.finished = true
+    state.cancelRequested = true
     state.lastError = 'cancelled'
     await this.save(state)
+    // ⚠️ 删 alarm 只是「不再排新的」；**正在执行的那一步**仍会跑完 ——
+    // 它结束时靠 `cancelRequested` 发现自己被取消（见 `alarm()` 收尾处）。
     await this.ctx.storage.deleteAlarm()
   }
 
@@ -179,6 +198,12 @@ export class TaskRunnerDO extends DurableObject<Env> {
       await this.save(state)
       return
     }
+
+    /**
+     * 记录「本步开始前 `done` 的长度」。
+     * 取消并发保护要用它算出「本步新增了哪些 done 条目」（见收尾处的重读逻辑）。
+     */
+    const doneBefore = state.done.length
 
     let result: ActionResult
     try {
@@ -246,6 +271,26 @@ export class TaskRunnerDO extends DurableObject<Env> {
       } catch {}
     }
 
+    /**
+     * 🔴 **回写前先看「期间有没有人取消」**（2026-10-21 审查补，并发专项）。
+     *
+     * `state` 是**进入本步之前**的旧快照；本步可能 `await` 几十秒
+     *（真实对话可达 45s+），期间用户点了取消 —— `cancel()` 写下的
+     * `finished=true / queue=[]` 会被下面这行 `save(state)` 整体覆盖，
+     * 接着还会**重排 alarm**，剩下的步骤照跑。
+     *
+     * 修法：从 **storage 重读**（绕过内存缓存），发现 `cancelRequested`
+     * 就只把本步结果并进 `done`，其余一切以取消为准，且**不再排 alarm**。
+     */
+    const fresh = await this.loadFresh(state.uid)
+    if (fresh?.cancelRequested === true) {
+      fresh.done = [...fresh.done, ...state.done.slice(doneBefore)]
+      fresh.updatedAt = now
+      fresh.lastError = 'cancelled'
+      await this.save(fresh)
+      return
+    }
+
     await this.save(state)
 
     // 排下一步：用本步声明的 delayMs 表达反风控间隔。
@@ -262,6 +307,16 @@ export class TaskRunnerDO extends DurableObject<Env> {
     if (uid === undefined) return undefined
     this.run = await this.load(uid)
     return this.run
+  }
+
+  /**
+   * 从 **storage 强制重读**（不使用 `this.run` 缓存）。
+   *
+   * ⚠️ 只用于「检查期间是否有人改过状态」这类并发判定 ——
+   * 常规读路径仍走 `loadCurrent()` 的缓存，否则每步都多一次 SQLite 往返。
+   */
+  private async loadFresh(uid: string): Promise<RunState | undefined> {
+    return await this.load(uid)
   }
 
   private async load(uid: string): Promise<RunState | undefined> {
