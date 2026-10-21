@@ -291,7 +291,10 @@ export function buildBuddyProvider(config: VariantConfig, env?: Env): Provider {
     return toProviderModels(extractModels(payload))
   }
 
-  async function chat(credential: ProviderCredential, request: ChatRequest): Promise<Response> {
+  /** 「发出请求 → 收到响应头」的预算。超时即中止并交给网关换号（见 `chat()` 的说明）。 */
+const FIRST_FRAME_TIMEOUT_MS = 120_000
+
+async function chat(credential: ProviderCredential, request: ChatRequest): Promise<Response> {
     // 复用网关的请求体准备逻辑（4 处必改 + 工具配对清理）
     let body: string
     try {
@@ -312,7 +315,34 @@ export function buildBuddyProvider(config: VariantConfig, env?: Env): Provider {
       })
     }
 
-    return await fetch(`${bases.chat}/v2/chat/completions`, {
+    /**
+     * 🔴 **首帧超时**（2026-10-21 审查补，M3 指出：buddy.chat 此前**完全没有**超时）。
+     *
+     * 原来直接把 `request.signal` 交给 `fetch` —— 而那个信号只在**客户端断开**时触发。
+     * 于是上游「接了连接但永不回响应头」时（黑洞 / 半开连接 / 网关卡死），
+     * 这条请求会**无限挂起**：客户端等不到任何字节，网关也不会换号。
+     *
+     * ## 为什么计时器必须「首帧到了就撤掉」
+     * qoder 踩过同一个坑（见其 `chat()` 注释）：`AbortSignal.timeout()` 直接挂在
+     * `fetch` 上时，它**同样管着响应体** ⇒ 任何超过阈值的回答都会被**拦腰截断**。
+     * 故这里用 `AbortController` + `setTimeout`，并在 `finally` 里 `clearTimeout`。
+     *
+     * ## 只覆盖「到响应头」这一段
+     * buddy 的首帧错误由网关的 `peekStreamForError` 识别，这里不必再窥探；
+     * 拿到 `Response` 即撤计时器，后续流只受客户端取消约束。
+     */
+    const controller = new AbortController()
+    const onClientAbort = (): void => controller.abort(request.signal.reason)
+    if (request.signal.aborted) controller.abort(request.signal.reason)
+    else request.signal.addEventListener('abort', onClientAbort, { once: true })
+    const timer = setTimeout(() => {
+      const timeout = new Error(`buddy first frame timeout after ${FIRST_FRAME_TIMEOUT_MS}ms`)
+      timeout.name = 'TimeoutError'
+      controller.abort(timeout)
+    }, FIRST_FRAME_TIMEOUT_MS)
+    let gotResponse = false
+    try {
+      const response = await fetch(`${bases.chat}/v2/chat/completions`, {
       method: 'POST',
       // ⚠️ **chat 用参考实现口径的头**（11 个），不是 Go 侧那套。
       //
@@ -336,8 +366,16 @@ export function buildBuddyProvider(config: VariantConfig, env?: Env): Provider {
             }),
       }),
       body,
-      signal: request.signal,
-    })
+      signal: controller.signal,
+      })
+      gotResponse = true
+      return response
+    } finally {
+      // 计时器只管到「拿到响应头」；拿到就撤，否则会掐断正在进行的流。
+      clearTimeout(timer)
+      // 失败路径摘掉客户端取消监听；成功路径**保留**（客户端中途取消仍要能掐断上游）。
+      if (!gotResponse) request.signal.removeEventListener('abort', onClientAbort)
+    }
   }
 
   async function balance(credential: ProviderCredential): Promise<ProviderBalance> {
