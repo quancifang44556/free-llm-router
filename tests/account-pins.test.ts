@@ -21,6 +21,7 @@ import { createNodeRuntime } from '../src/server/env.js'
 import { createAccountState } from '../src/pool/state.js'
 import { handleChatCompletions, handleProviderChat } from '../src/gateway/server.js'
 import { findProvider } from '../src/providers/index.js'
+import { ProviderError } from '../src/providers/types.js'
 import worker from '../src/index.js'
 
 function freshRuntime(name: string) {
@@ -646,6 +647,65 @@ test('🔴 换号时必须重算 conversationId（不得把同一会话 id 发�
       assert.notEqual(seen[0], seen[1], '⚠️ 换号后 conversationId 必须变化（否则是跨账号关联键）')
     } finally {
       provider.chat = originalChat
+      console.log = originalLog
+      console.warn = originalWarn
+    }
+  } finally {
+    rt.cleanup()
+  }
+})
+
+test('🔴 provider.shouldRotate()=false 时不得换号（此前从未被调用）', async () => {
+  // 2026-10-21 审查（M4）指出的高危：`provider.shouldRotate?.(status, text)`
+  // 在**抛 ProviderError 的路径上从未被调用** —— 唯一消费点在那个
+  //「provider 返回非 2xx Response」的分支，而 8 家 provider 都是抛异常。
+  //
+  // 后果是**反向**的：cline 的 `shouldRotate` 明写「403 地域封锁不换号」
+  //（换号会连坐其它健康账号），而网关按通用判据把 403 当 `auth_error.rotate=true`
+  // ⇒ **整池轮转** —— 与作者意图完全相反。
+  //
+  // 本测试把 `shouldRotate` 固定为 false，验证网关真的听它。
+  const rt = freshRuntime('shouldrotate-honored')
+  try {
+    const provider = findProvider('opencode')
+    assert.ok(provider !== undefined)
+    const originalChat = provider.chat
+    const originalShouldRotate = provider.shouldRotate
+    const originalLog = console.log
+    const originalWarn = console.warn
+    let calls = 0
+    console.log = () => {}
+    console.warn = () => {}
+    provider.shouldRotate = (() => false) as never
+    provider.chat = (async () => {
+      calls += 1
+      throw new ProviderError({
+        provider: 'opencode',
+        httpStatus: 403,
+        // ⚠️ 文案必须含中文：`isWafBlocked(403, 英文)` 会判成 WAF，
+        // 那条路径本来就 `rotate=false`，会把本测试要验证的东西**掩盖掉**。
+        message: '上游地域限制：该地区不支持此服务',
+      })
+    }) as never
+    try {
+      const pool = rt.env.ACCOUNT_POOL.get(rt.env.ACCOUNT_POOL.idFromName('cn'))
+      for (const uid of ['cr1', 'cr2']) {
+        await addAccount(pool, uid, { provider: 'opencode' })
+        await pool.putCredential(uid, { uid, nickname: uid, accessToken: `tok-${uid}`, refreshToken: '', expiresAt: Date.now() + 3600_000 }, Date.now())
+      }
+
+      const res = await handleProviderChat({
+        providerId: 'opencode', model: MODEL, wantsStream: false,
+        rawBody: { model: MODEL, messages: [{ role: 'user', content: 'hi' }] },
+        request: new Request('https://example.test/v1/chat/completions', { method: 'POST', headers: {} }),
+        env: rt.env, realm: 'cn', tried: [], sessionKey: '', failoverDepth: 1,
+      })
+      await res.response.text()
+
+      assert.equal(calls, 1, `⚠️ shouldRotate=false 时只应尝试 1 个号（实际 ${calls} 次）`)
+    } finally {
+      provider.chat = originalChat
+      provider.shouldRotate = originalShouldRotate
       console.log = originalLog
       console.warn = originalWarn
     }

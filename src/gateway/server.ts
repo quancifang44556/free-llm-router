@@ -2386,7 +2386,7 @@ export async function handleProviderChat(input: {
       //
       // 修法：把 `ProviderError` 的原始 message 交给 `classify()`（它本来就是
       // 按文本解析业务码的），只有**确实解析不出业务码**时才退回传输层语义。
-      const pe = error as { name?: string; httpStatus?: number; code?: unknown }
+      const pe = error as { name?: string; httpStatus?: number; code?: unknown; retryable?: unknown }
       const peStatus = typeof pe?.httpStatus === 'number' ? pe.httpStatus : 0
       const isProviderErr = pe?.name === 'ProviderError'
       if (isProviderErr) {
@@ -2511,9 +2511,36 @@ export async function handleProviderChat(input: {
           message: `${c.kind}: ${detail}`,
           kind: c.kind,
         }
-        // 业务码判出来的「不可换号」类（如渠道拦截 / 参数错）立刻停，
+        /**
+         * 🔴 **换不换号：先问 provider，再退到 `retryable`，最后才是通用判据**
+         *（2026-10-21 审查补，M4 指出高危）。
+         *
+         * ## 缺陷
+         * 这条路径原来**只用** `pm.rotate`（由业务码推出来的通用判据），于是：
+         * 1. `provider.shouldRotate?.(status, text)` **从未被调用** ——
+         *    cline / minimax 里写好的「403 地域封锁不换号」「5xx 不换号」
+         *    整套判据**一次都没生效**（M4 实测：这两家都抛 `ProviderError`，
+         *    而唯一消费 `shouldRotate` 的地方在「返回 Response」的分支）；
+         * 2. `ProviderError.retryable` 在对话路径**无人消费**
+         *    （只有登录流程读它）⇒ 各家精心标的 `retryable` 全是死字段。
+         *
+         * ## 后果是**反向**的
+         * cline 想「403 别换号」（换号会连坐其它号），实际却按通用判据
+         * `auth_error.rotate = true` **整池轮转** —— 与作者意图完全相反。
+         *
+         * ## 优先级
+         * `shouldRotate`（provider 最了解自己的错误语义）
+         * → `retryable`（provider 的较粗粒度标注）
+         * → `pm.rotate`（通用兜底）。
+         * 三者都缺省时保持原行为，不改变未定义这两项的 provider。
+         */
+        const providerRotate = provider.shouldRotate?.(peStatus, message)
+        const rotate =
+          providerRotate
+          ?? (typeof pe.retryable === 'boolean' ? pe.retryable : pm.rotate)
+        // 判出来的「不可换号」类（如渠道拦截 / 参数错 / 地域封锁）立刻停，
         // 否则会白换号并放大风控。
-        if (!pm.rotate) break
+        if (!rotate) break
         continue
       }
 
