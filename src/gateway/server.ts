@@ -2228,19 +2228,49 @@ export async function handleProviderChat(input: {
         // 「WASM 实例化失败：Import #0 …」）整句吞掉，用户只看到
         // `unknown: unexpected status 0`，完全无从排查。
         const detail = c.code === undefined && c.kind !== 'waf_blocked' ? message : (c.msg || message)
+
+        /**
+         * 🔴 **`waf_blocked` 无条件留证**（2026-10-21，第三次修同一个盲区）。
+         *
+         * ⚠️ 我此前把这条日志加在了 `!upstream.ok` 分支（`handleChatCompletions`
+         * 里），但**8 家 provider 的 `chat()` 在非 2xx 时抛 `ProviderError`**，
+         * 于是那条分支**永远走不到** —— 日志加了等于没加，`[waf-403]` 一条都没有，
+         * 而 `[punish]` 却持续输出 `reason=waf_blocked: ...`。
+         *
+         * 这就是「记录点在 A 路径、故障发生在 B 路径」的第 4 次复发。
+         * ⇒ 判据应该是「**这个 kind 值得留证**」，而不是「我在哪个分支顺手」。
+         */
+        if (c.kind === 'waf_blocked' || c.kind === 'channel_blocked') {
+          console.warn(
+            `[waf-403] model=${model} http=${peStatus} kind=${c.kind} len=${message.length} ` +
+              `body=${message.slice(0, 500)}`,
+          )
+        }
+
         const pm = mapErrorToPunishment(c.kind)
         const pcause = modelCauseFor(c.kind)
         if (pm.punish) {
-          await pool
-            .applyFailure({
-              uid: picked.uid,
-              kind: pm.dimension,
-              now: Date.now(),
-              ...(model !== '' ? { model } : {}),
-              ...(pcause !== undefined ? { modelCause: pcause } : {}),
-              reason: `${c.kind}: ${detail.slice(0, 180)}`,
-            })
-            .catch(logPoolError('applyFailure'))
+          /**
+           * ⚠️ **与另两条路径同一套纪律**：累加型维度 + 单账号池的 soft 都延迟记账。
+           *
+           * 这是「延迟记账」的第 3 条路径（前两条：buddy 主循环、provider 的
+           * `peekStreamForError` 分支）。三处必须一致，否则又是「只修一半」。
+           */
+          const pPunishKind = pm.dimension
+          if (pPunishKind === 'breaker' || pPunishKind === 'degrade' || (pPunishKind === 'soft' && deferSoft())) {
+            blame.push({ uid: picked.uid, kind: pPunishKind, reason: `${c.kind}: ${detail}`.slice(0, 200) })
+          } else {
+            await pool
+              .applyFailure({
+                uid: picked.uid,
+                kind: pPunishKind,
+                now: Date.now(),
+                ...(model !== '' ? { model } : {}),
+                ...(pcause !== undefined ? { modelCause: pcause } : {}),
+                reason: `${c.kind}: ${detail.slice(0, 180)}`,
+              })
+              .catch(logPoolError('applyFailure'))
+          }
         }
         lastError = {
           status: clientStatusFor(peStatus || 502, c.kind),
