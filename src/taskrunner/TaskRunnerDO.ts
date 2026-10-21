@@ -37,6 +37,9 @@ import { migrate, readProgress, writeProgress } from '../store/db.js'
 import { executeAction, type ActionContext, type ActionResult } from './actions.js'
 import { GAP, needsCredentialFetch, effectiveAccessToken, type RunContext, type RunState, type TaskStep } from './steps.js'
 
+/** 「多久没动过」即判上次运行已被打断（见 `start()` 里的说明）。 */
+const STALE_RUN_MS = 30 * 60_000
+
 export class TaskRunnerDO extends DurableObject<Env> {
   /** 当前运行状态（内存镜像；权威副本在 SQLite）。 */
   private run: RunState | undefined
@@ -58,8 +61,34 @@ export class TaskRunnerDO extends DurableObject<Env> {
    */
   async start(uid: string, steps: TaskStep[], context: RunContext, now: number): Promise<RunState> {
     const existing = await this.load(uid)
+    /** 判死时记下的原因，要带进**新一轮**（否则面板只看到「凭空重来」）。 */
+    let staleNote = ''
     if (existing !== undefined && !existing.finished && existing.queue.length > 0) {
-      return existing
+      /**
+       * 🔴 **陈旧运行必须判死，否则永久卡死**（2026-10-21 审查补，M6 指出高危）。
+       *
+       * ## 缺陷链（三步一起才致命）
+       * 1. `storage.ts` 在**执行前**就 `DELETE system_alarms`；
+       * 2. 进程在执行中被**重启/被杀**（不是抛异常，走不到兜底重排）
+       *    ⇒ `restorePendingAlarms` **扫不到记录**，任务不会续跑；
+       * 3. 本函数看到「未完成且有队列」就**直接 return**，且**不重排 alarm**。
+       *
+       * ⇒ 该账号的任务**永久停在「进行中」**：面板一直转圈，
+       *   点「手动执行」返回 ok:true 却什么都不做，只能手改 SQLite 才能恢复。
+       *
+       * ## 修法
+       * 用 `updatedAt` 判「多久没动过」。超过阈值即认定那次运行已被打断，
+       * **先把它标成失败收尾**（面板能看到原因，而不是永远转圈），再开新一轮。
+       * 阈值给足（30 分钟）：正常单步远小于它，只有真被打断才会命中。
+       */
+      const age = now - existing.updatedAt
+      if (age < STALE_RUN_MS) return existing
+      staleNote =
+        `上次运行停在整个 ${Math.round(age / 1000)} 秒无进展（多半是重启打断），已判超时并重开`
+      existing.finished = true
+      existing.lastError = staleNote
+      existing.updatedAt = now
+      await this.save(existing)
     }
 
     const state: RunState = {
@@ -67,7 +96,8 @@ export class TaskRunnerDO extends DurableObject<Env> {
       queue: steps,
       done: [],
       finished: false,
-      lastError: '',
+      // 判死重开时把原因带过来，面板能看到「为什么重来」，而不是凭空重置。
+      lastError: staleNote,
       startedAt: now,
       updatedAt: now,
     }
