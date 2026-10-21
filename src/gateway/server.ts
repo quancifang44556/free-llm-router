@@ -1176,6 +1176,17 @@ export async function handleChatCompletions(
 
     let upstream: Response
     try {
+      /**
+       * 🔴 **防封节奏也必须在这里做**（2026-10-21 审查补，M3 指出高危）。
+       *
+       * `throttleUpstream` 此前**只**接在 provider 分支（`2198` / `2220`），
+       * buddy 主分支完全没接 ⇒ 面板「防封」分区里的**节奏/抖动开关对 buddy 静默无效**。
+       *
+       * 而 buddy 恰恰是默认 provider（`DEFAULT_PROVIDER`），也就是**主要流量路径**。
+       * ⇒ 用户打开「防封节奏」以为在保护账号，实际只有带前缀模型生效。
+       * 这是本项目「配置只在一处生效」模式的又一次复现。
+       */
+      await throttleUpstream(candidate.uid)
       upstream = await fetch(`${bases.chat}/v2/chat/completions`, {
         method: 'POST',
         // ⚠️ 与 provider 路径用**同一套**参考实现口径的头（见 referenceChatHeaders）。
@@ -1463,6 +1474,23 @@ export async function handleChatCompletions(
           const settle = settleBlame(pool, blame, Date.now())
           if (ctx !== undefined) ctx.waitUntil(settle)
           else void settle
+          /**
+           * 🔴 **会话粘性必须在主成功路径也绑定**（2026-10-21 审查补，M3 指出高危）。
+           *
+           * `bindSession` 此前只在**续期重试分支**调用（`2242` / `2500`）。
+           * 而续期重试是**罕见路径** ⇒ 绝大多数请求从未建立会话粘性
+           * ⇒ 同一会话的后续轮次会落到**不同账号**。
+           *
+           * 后果有两层（都不是「功能坏了」而是「优化静默失效」）：
+           * 1. 上游 prompt cache **命中率为 0**（缓存是按账号隔离的）⇒ 更慢更贵；
+           * 2. 同一段对话在不同账号间跳，对上游是**指纹异常**
+           *   （本项目防封的核心顾虑之一）。
+           *
+           * ⇒ 首帧到达即绑定（与 provider 分支的续期分支同一时机）。
+           */
+          if (sessionKey !== '' && ctx !== undefined) {
+            ctx.waitUntil(pool.bindSession(sessionKey, candidate.uid, Date.now()).catch(logPoolError('bindSession')))
+          }
         },
         onFinish: (usage) => {
           // 记账用量（面板的「用量」视图靠它）
@@ -2790,6 +2818,11 @@ export async function handleProviderChat(input: {
           const settle = settleBlame(pool, blame, Date.now())
           if (ctx !== undefined) ctx.waitUntil(settle)
           else void settle
+          // 🔴 **会话粘性**（2026-10-21 审查补，M3 指出）：主成功路径此前从不绑定
+          // ⇒ 同一会话的后续轮次落到不同账号 ⇒ prompt cache 命中率 0 + 指纹跳变。
+          if (sessionKey !== '' && ctx !== undefined) {
+            ctx.waitUntil(pool.bindSession(sessionKey, picked.uid, Date.now()).catch(logPoolError('bindSession')))
+          }
         },
         onError: (message) => {
           const t = pool

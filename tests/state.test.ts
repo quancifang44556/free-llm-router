@@ -630,6 +630,23 @@ test('🔴 两条 chat 路径都必须有延迟记账（本项目「只修一半
     `有 ${orphans.length} 处 noteSuccess 之后缺少 settleBlame（偏移：${orphans.join(', ')}）`
       + ' —— 成功路径必须结算 blame，否则 breaker/degrade 永不落账',
   )
+
+  // ④ 每一处成功（`noteSuccess`）之后也必须有**会话粘性绑定**（2026-10-21 审查补，M3 指出）。
+  //
+  // 缺陷：`bindSession` 原来只在**续期重试分支**调用（罕见路径），
+  // 主成功路径一次都不绑 ⇒ 同一会话的后续轮次落到不同账号
+  // ⇒ prompt cache 命中率 0（缓存按账号隔离）+ 指纹在同一对话内跳变。
+  //
+  // 与 ③ 同一类断言（结构而非计数）：新增一条成功路径却忘了绑定会被立刻抓到。
+  // ⚠️ 必须用 `pool\.bindSession`，否则会把 `unbindSession` 也算进来（假通过）。
+  const bindIdx = [...src.matchAll(/pool\.bindSession\(sessionKey/g)].map((m) => m.index ?? -1)
+  const bindOrphans = noteIdx.filter((i) => !bindIdx.some((j) => j > i && j - i < 1500))
+  assert.equal(
+    bindOrphans.length,
+    0,
+    `有 ${bindOrphans.length} 处 noteSuccess 之后缺少 bindSession（偏移：${bindOrphans.join(', ')}）`
+      + ' —— 成功路径必须绑定会话，否则 prompt cache 永远不命中',
+  )
   const discardLogs = [...src.matchAll(/丢弃 \$\{blame\.length\} 条失败记录/g)]
   assert.ok(discardLogs.length >= 2, `两条路径都应有全失败丢弃日志，实际 ${discardLogs.length} 处`)
 
