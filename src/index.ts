@@ -3386,6 +3386,31 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
     return json({ ok: true, realm, note: '已解除 IP 级拦截（若实际是账号级问题，相关账号仍处于各自的冷却中）' })
   }
 
+  // ── 11140 账号级限制波次：查询与人工解除 ──
+  //
+  // 与 IP 级 gate **分开**（判据不同，见 AccountPoolDO 的 RESTRICTION_* 注释）。
+  // 同样必须留人工纠正入口：波次暂停是「保守停手」，若实际是误判
+  //（比如多个号同时因别的原因返回了形似 11140 的错误），用户要能立刻恢复。
+  if (path === '/admin/restriction/status' && request.method === 'GET') {
+    const realm = url.searchParams.get('realm') ?? 'cn'
+    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
+    const status = await pool.restrictionGateStatus(Date.now()).catch(() => null)
+    if (status === null) return json({ realm, active: false, until: 0, recentUids: 0, unsupported: true })
+    return json({ realm, ...status, windowMs: 15 * 60_000, threshold: 2 })
+  }
+
+  if (path === '/admin/restriction/clear' && request.method === 'POST') {
+    const body = (await request.json().catch(() => ({}))) as { realm?: string }
+    const realm = body.realm ?? 'cn'
+    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
+    await pool.clearRestrictionGate()
+    return json({
+      ok: true,
+      realm,
+      note: '已解除账号级限制波次暂停（若账号确实被上游标记，它们各自的 restrictedUntil 仍然生效）',
+    })
+  }
+
   // ── 账号导入（兼容 Go 的 auths/*.json 双形态） ──
   if (path === '/admin/import' && request.method === 'POST') {
     let payload: unknown

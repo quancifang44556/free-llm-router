@@ -160,6 +160,8 @@ function makeEnv(input: {
     },
     noteWaf: async () => false,
     wafGateActive: async () => false,
+    noteRestriction: async () => false,
+    restrictionGateActive: async () => false,
   }
   next += 0
   return {

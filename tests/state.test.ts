@@ -168,3 +168,81 @@ test('过期的模型冷却被剪枝后不算限流', () => {
   assert.equal(modelExempt(s, now), false)
   assert.equal(Object.keys(s.modelCooldowns).length, 0, '过期条目应被删除')
 })
+
+test('🔴 11140（账号级限制）必须**单次即生效**且默认不换号', async () => {
+  // ## 两条独立的口径，都来自 workbuddy2api-hub #422/#425 的真实事故
+  //
+  // ### 1. 单次即罚
+  // `breaker` 要连续 3 次失败才冷却，语义是「我们自己怀疑这个号不行」。
+  // 而 11140 是上游**明确标记**（"this account has been restricted"），
+  // 用 breaker 意味着前 2 次继续把请求打到一个已被封的号上。
+  // 故 `request_illegal` 走独立的 `restricted` 维度，一次即罚、固定 2 小时。
+  //
+  // ### 2. 默认不换号
+  // 事故原文：11140 上「冷却该号后立刻换下一个号继续同一请求」，
+  // 一个请求最多遍历整个池子，**用户 7 个号在一次任务里全被封**。
+  // 社区红线：「看到 11140 立即停手，解封前严禁换号继续打同一设备」。
+  const { mapErrorToPunishment } = await import('../src/gateway/server.ts')
+  const p = mapErrorToPunishment('request_illegal')
+  assert.equal(p.punish, true, '11140 必须罚号（不罚就等于继续用被封的号）')
+  assert.equal(p.dimension, 'restricted', '11140 必须是独立的账号级限制维度，不能复用 breaker')
+  assert.equal(p.rotate, false, '11140 **默认不换号**（换号会把池子逐个拖进设备级限制）')
+
+  // 反向对照：11128（渠道指纹）也不换号，但**不罚号** —— 罚的是请求指纹，不是账号。
+  const ch = mapErrorToPunishment('channel_blocked')
+  assert.equal(ch.punish, false, '11128 罚的是渠道指纹，不该罚账号')
+  assert.equal(ch.rotate, false, '11128 不换号（同样的指纹打给更多号也没用）')
+
+  // 常规 5xx 仍然换号 —— 别把「不换号」误伤到正常轮转。
+  assert.equal(mapErrorToPunishment('server').rotate, true, '5xx 仍应换号')
+})
+
+test('🔴 受限账号**选不到**（restrictedUntil 参与健康判定，且老数据自动兼容）', async () => {
+  const { createAccountState, healthy, normalizeAccountState, RESTRICTED_HOLD_MS } = await import(
+    '../src/pool/state.ts'
+  )
+  const now = 1_000_000
+
+  // 新号默认不受限
+  const fresh = createAccountState({ uid: 'u1', nickname: 'n', realm: 'cn', provider: 'buddy' })
+  assert.equal(fresh.restrictedUntil, 0, '新账号默认 restrictedUntil=0')
+  assert.equal(healthy(fresh, now), true, '新账号可选')
+
+  // 受限期内**必须**不可选（这是「不派单给已被封的号」的唯一保障）
+  const limited = { ...fresh, restrictedUntil: now + RESTRICTED_HOLD_MS }
+  assert.equal(healthy(limited, now), false, '受限期内必须选不到')
+
+  // 到期后自动恢复（不需要人工清状态）
+  assert.equal(healthy(limited, now + RESTRICTED_HOLD_MS + 1), true, '到期后应自动恢复')
+
+  // 老数据（没有该字段）绝不能被判成受限
+  const legacy = normalizeAccountState({ uid: 'u2', nickname: 'n', realm: 'cn', provider: 'buddy' })
+  assert.ok(legacy !== undefined)
+  assert.equal(legacy!.restrictedUntil, 0, '缺字段的老记录必须补 0，不能读成 undefined/NaN')
+  assert.equal(healthy(legacy!, now), true, '老记录应仍然可选')
+})
+
+test('🔴 11140 波次判定：同号重复不算波次，不同号达标才整池暂停', async () => {
+  // 依据 workbuddy2api-hub #425：同一区域 900s 内 2 个**不同**账号被限制
+  // ⇒ 暂停该区域派发 1800s。判「几个不同的号被打标」，
+  // 一个号反复撞不构成波次（它自己已被 restrictedUntil 挡住）。
+  //
+  // 这里直接对纯逻辑做断言（DO 的 storage 依赖不便在单测里造假）：
+  // 只钉住「阈值与窗口的语义」，实现细节留给集成。
+  const { RESTRICTED_HOLD_MS } = await import('../src/pool/state.ts')
+
+  // 单账号口径是 2 小时（与整池暂停的 30 分钟刻意不同，见常量注释）
+  assert.equal(RESTRICTED_HOLD_MS, 2 * 60 * 60 * 1000, '单账号限制冷却应为 2 小时')
+
+  // 该常量必须**大于** IP 级 WAF 的 60s 窗口：账号级风控是小时级现象，
+  // 用分钟级去试探只会重复撞墙（社区红线「立即停手」）。
+  assert.ok(RESTRICTED_HOLD_MS > 60_000, '账号级冷却必须长于 IP 级窗口')
+
+  // 源码层面确认波次常量存在且取值合理（防止有人调成 60 秒把风控当抖动）
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync('src/pool/AccountPoolDO.ts', 'utf8')
+  const m = /const RESTRICTION_POOL_HOLD_MS = ([^\n]+)/.exec(src)
+  assert.ok(m !== null, '必须有 RESTRICTION_POOL_HOLD_MS 常量')
+  assert.match(m![1]!, /30 \* 60 \* 1000/, '整池暂停应为 30 分钟')
+  assert.match(src, /RESTRICTION_WAVE_THRESHOLD = 2/, '波次阈值为 2 个不同账号')
+})

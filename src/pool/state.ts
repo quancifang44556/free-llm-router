@@ -95,6 +95,19 @@ export interface TokenUsage {
  * `0` 在 JS 里是 falsy 但**语义明确**，且 JSON 里可省略。
  * 判据统一走 {@link isActive}，不靠 truthiness。
  */
+/**
+ * 上游账号级限制（`11140`）的保守冷却时长：**2 小时**。
+ *
+ * 依据 workbuddy2api-hub #422 的 `restrictedUntil` 口径。上游官方对申诉的答复是
+ * 「1-3 工作日自动解除」，但那是人工工单的时间线；这个常量要表达的是
+ * **「多久之后值得再探一次」**，而不是「保证那时已解封」——
+ * 探到仍然 11140 会顺延下一次 2 小时，代价只是一个请求。
+ *
+ * 取 2 小时而非更短：11140 是设备/账号维度的风控标记，短时间内反复试探
+ * 本身就会被记为异常行为（社区复盘：「看到 11140 立即停手」）。
+ */
+export const RESTRICTED_HOLD_MS = 2 * 60 * 60 * 1000
+
 export interface AccountState {
   /** 上游 uid（账号主键）。 */
   uid: string
@@ -138,6 +151,19 @@ export interface AccountState {
   // ── 熔断域 ──
   /** 熔断截止（epoch ms，0 = 无）。 */
   breakerUntil: number
+  /**
+   * 上游**账号级限制**（`11140`）的解除时刻（epoch ms，0 = 未受限）。
+   *
+   * 与 `breakerUntil` 刻意分开（两者语义不同，不能共用一个字段）：
+   * - `breakerUntil`：**我们自己**怀疑这个号不行（连续 5xx），指数退避，
+   *   上游并没有对它做任何标记 —— 换个时间重试就可能好；
+   * - `restrictedUntil`：**上游明确标记**了该账号（"account has been restricted"），
+   *   一次即生效，固定 2 小时。它与请求内容无关、与其它账号无关。
+   *
+   * ⚠️ 持久化在 SQLite 里，重启 / 刷新 token 都不会丢 —— 这正是
+   * workbuddy2api-hub #422 修掉的那个 bug（冷却只存内存，重启就重新送死）。
+   */
+  restrictedUntil: number
   /** 已熔断次数（指数退避的指数）。 */
   retryCount: number
   /** 连续失败计数（喂熔断器）。**唯一**权威连续失败计数。 */
@@ -206,6 +232,7 @@ export function createAccountState(input: {
     modelCooldowns: {},
     modelConfirm: {},
     breakerUntil: 0,
+    restrictedUntil: 0,
     retryCount: 0,
     fails: 0,
     degradeUntil: 0,
@@ -329,6 +356,9 @@ export function healthy(state: AccountState, now: number): boolean {
   if (isActive(state.until, now)) return false
   if (isActive(state.breakerUntil, now)) return false
   if (isActive(state.degradeUntil, now)) return false
+  // 上游账号级限制（11140）：区别于上面三个「我们自己怀疑它不行」的维度 ——
+  // 这条是上游**明确标记**过该账号，必须真的不派单，否则会持续撞同一堵墙。
+  if (isActive(state.restrictedUntil, now)) return false
   return true
 }
 

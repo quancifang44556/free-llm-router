@@ -36,6 +36,7 @@ import {
   modelExempt,
   normalizeAccountState,
   pruneExpired,
+  RESTRICTED_HOLD_MS,
 } from './state.js'
 import {
   deleteAccount,
@@ -206,6 +207,36 @@ export const SPREAD_WINDOW_MS = 3_000
 const WAF_IP_WINDOW_MS = 60_000
 const WAF_IP_THRESHOLD = 2
 
+/**
+ * `11140`（账号级限制）**波次暂停**参数 —— 对齐 workbuddy2api-hub #425。
+ *
+ * ## 与上面 `WAF_IP_*` 的区别（不能共用一个 gate）
+ *
+ * | | IP 级（`WAF_IP_*`） | 账号级波次（本组） |
+ * |---|---|---|
+ * | 触发 | 短窗内多号接连 **403/WAF** | 短窗内多号被 **11140 标记** |
+ * | 含义 | 出口 IP 被拦 | 上游在对这一批账号做风控 |
+ * | 处置 | 暂停 60s | 暂停 30 分钟（上游风控是小时级） |
+ *
+ * 两者都导致「一个上游请求都不发」，但判据与恢复节奏完全不同，
+ * 混用会让 IP 偶发拦截拖住半小时、或让真正的账号波次只停 1 分钟。
+ *
+ * ## 为什么必须整池暂停（事故依据）
+ *
+ * workbuddy2api-hub #425：同一区域在 900 秒内被限制 2 个账号，就暂停该区域派发
+ * 1800 秒。依据是社区复盘的红线「看到 11140 立即停手」——
+ * **风控惩罚与持续请求正相关**，继续送号只会让更多号进标记。
+ */
+const RESTRICTION_WAVE_WINDOW_MS = 15 * 60 * 1000
+const RESTRICTION_WAVE_THRESHOLD = 2
+/**
+ * 整池暂停时长。⚠️ 与 `state.ts` 的 {@link RESTRICTED_HOLD_MS}（**单账号** 2 小时）
+ * 是两个不同层次的口径，名字刻意区分：
+ * - `RESTRICTED_HOLD_MS`：这一个号多久后再探；
+ * - `RESTRICTION_POOL_HOLD_MS`：整个区域多久不发任何上游请求。
+ */
+const RESTRICTION_POOL_HOLD_MS = 30 * 60 * 1000
+
 /** 选号候选上限（Go 侧 top5）。 */
 const TOP_N = 5
 
@@ -335,6 +366,7 @@ function unavailableReason(
     isActive(state.until, now) ? state.until : 0,
     isActive(state.breakerUntil, now) ? state.breakerUntil : 0,
     isActive(state.degradeUntil, now) ? state.degradeUntil : 0,
+    isActive(state.restrictedUntil, now) ? state.restrictedUntil : 0,
   )
   if (cool > 0) return `冷却中，${minutesLeft(cool, now)}后恢复`
   if (model !== '') {
@@ -934,7 +966,7 @@ export class AccountPoolDO extends DurableObject<Env> {
    */
   async applyFailure(input: {
     uid: string
-    kind: 'soft' | 'hard' | 'breaker' | 'degrade' | 'session_dead' | 'model'
+    kind: 'soft' | 'hard' | 'breaker' | 'degrade' | 'session_dead' | 'model' | 'restricted'
     now: number
     /** `kind === 'model'` 时的目标模型。 */
     model?: string
@@ -985,6 +1017,18 @@ export class AccountPoolDO extends DurableObject<Env> {
         }
         // ⚠️ 「已在冷却中」时**不推进不延长**（Go 侧 `cooldown.go:321`）——
         // 那会让一个持续失败的号被无限推远。
+        break
+      }
+      // `11140` 账号级限制：上游明说 "this account has been restricted"，
+      // **第一次就生效**，且固定 2 小时（对齐 workbuddy2api-hub #422 的
+      // `restrictedUntil`；社区复盘给的官方口径是「1-3 工作日自动解除」，
+      // 2 小时只是保守的重试间隔，真正解除靠上游）。
+      //
+      // ⚠️ 为什么不能用 `breaker`：breaker 要**连续 3 次**失败才冷却，而 11140
+      // 是账号级封禁 —— 前 2 次会继续把请求打到一个已被封的号上，期间如果发生
+      // 换号（默认已禁止），被牵连的号会更多。账号级限制必须一次即罚。
+      case 'restricted': {
+        state.restrictedUntil = Math.max(state.restrictedUntil, now + RESTRICTED_HOLD_MS)
         break
       }
       case 'breaker': {
@@ -1751,6 +1795,75 @@ export class AccountPoolDO extends DurableObject<Env> {
 
     await this.saveWafGate(gate)
     return false
+  }
+
+  /**
+   * 记录一个账号被上游 `11140` 限制，判定是否形成**波次**（整池暂停）。
+   *
+   * 判据与 {@link noteWaf} 同一个形状（不同账号数），但窗口/时长按账号级风控取值。
+   * 同号重复命中**覆盖**而不累计 —— 判的是「几个不同的号被打标」，
+   * 一个号反复撞不构成波次（它自己已被 `restrictedUntil` 挡住）。
+   */
+  async noteRestriction(uid: string, now: number): Promise<boolean> {
+    const gate = await this.loadRestrictionGate()
+    if (gate.until > now) return true
+
+    gate.hits[uid] = now
+    for (const [u, t] of Object.entries(gate.hits)) {
+      if (now - t > RESTRICTION_WAVE_WINDOW_MS) delete gate.hits[u]
+    }
+
+    if (Object.keys(gate.hits).length >= RESTRICTION_WAVE_THRESHOLD) {
+      gate.until = now + RESTRICTION_POOL_HOLD_MS
+      gate.hits = {}
+      await this.saveRestrictionGate(gate)
+      console.warn(
+        `[restriction] 账号级限制波次：${RESTRICTION_WAVE_WINDOW_MS / 60_000} 分钟内 ` +
+          `${RESTRICTION_WAVE_THRESHOLD} 个不同账号被 11140 标记，` +
+          `暂停该区域派发 ${RESTRICTION_POOL_HOLD_MS / 60_000} 分钟`,
+      )
+      return true
+    }
+
+    await this.saveRestrictionGate(gate)
+    return false
+  }
+
+  /** 账号级限制波次是否仍在暂停期（只读，不记账）。 */
+  async restrictionGateActive(now: number): Promise<boolean> {
+    const gate = await this.loadRestrictionGate()
+    return gate.until > now
+  }
+
+  /** 波次暂停的完整状态（面板展示用）。 */
+  async restrictionGateStatus(now: number): Promise<{ active: boolean; until: number; recentUids: number }> {
+    const gate = await this.loadRestrictionGate()
+    let recent = 0
+    for (const t of Object.values(gate.hits)) {
+      if (now - t <= RESTRICTION_WAVE_WINDOW_MS) recent += 1
+    }
+    return { active: gate.until > now, until: gate.until, recentUids: recent }
+  }
+
+  /** 人工解除波次暂停（与 `clearWafGate` 同样的可纠正入口）。 */
+  async clearRestrictionGate(): Promise<void> {
+    await this.ctx.storage.put('restrictionGate', { until: 0, hits: {} })
+  }
+
+  private async loadRestrictionGate(): Promise<{ until: number; hits: Record<string, number> }> {
+    const raw = await this.ctx.storage.get<{ until?: unknown; hits?: unknown }>('restrictionGate')
+    const until = typeof raw?.until === 'number' ? raw.until : 0
+    const hits: Record<string, number> = {}
+    if (raw !== undefined && raw.hits !== null && typeof raw.hits === 'object') {
+      for (const [k, v] of Object.entries(raw.hits as Record<string, unknown>)) {
+        if (typeof v === 'number' && Number.isFinite(v)) hits[k] = v
+      }
+    }
+    return { until, hits }
+  }
+
+  private async saveRestrictionGate(gate: { until: number; hits: Record<string, number> }): Promise<void> {
+    await this.ctx.storage.put('restrictionGate', gate)
   }
 
   /** IP 级拦截是否激活（只读，不记账）。 */

@@ -136,6 +136,22 @@ export async function maxRotateFor(pool: DurableObjectStub<AccountPoolDO>, now =
   return value
 }
 
+/**
+ * `11140`（账号被限制）默认**不换号**，与 workbuddy2api-hub #422/#425 口径一致。
+ *
+ * 设 `RESTRICTED_ROTATE_MAX` 为正数可恢复旧行为（同一请求内换号继续），仅供排查 ——
+ * 旧行为会把池子里的号逐个拖进上游的**设备级**限制（社区实测 7 号一次任务全封），
+ * 生产环境**不要**开。
+ */
+function restrictRotateAllowed(): boolean {
+  const raw = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env?.[
+    'RESTRICTED_ROTATE_MAX'
+  ]
+  if (raw === undefined || raw.trim() === '') return false
+  const n = Number(raw)
+  return Number.isFinite(n) && n > 0
+}
+
 /** 上游错误类别 → 账号池的惩罚维度。 */
 /**
  * 把错误类别翻译成「模型级冷却的成因」，供 `applyFailure({ modelCause })` 使用。
@@ -159,7 +175,7 @@ export function modelCauseFor(kind: ErrorKind): 'busy' | 'absent' | 'denied' | u
 
 export function mapErrorToPunishment(kind: ErrorKind): {
   punish: boolean
-  dimension: 'soft' | 'hard' | 'breaker' | 'degrade' | 'session_dead' | 'model'
+  dimension: 'soft' | 'hard' | 'breaker' | 'degrade' | 'session_dead' | 'model' | 'restricted'
   /** 该错误是否值得**换号重试**。 */
   rotate: boolean
 } {
@@ -221,9 +237,27 @@ export function mapErrorToPunishment(kind: ErrorKind): {
     // 一个被封的号会把整个 provider 拖死（每次都只撞它，好号永远轮不到），
     // 实测就出现过「三个 WB 号里只有 z 被封，另两个完好却全线不可用」。
     //
-    // ⇒ 正确处置：**罚该号（breaker）+ 换下一个号**。11128（渠道指纹）才是不换号的那个。
+    // ⇒ 罚该号（breaker），但**绝不换号继续打**。
+    //
+    // ⚠️⚠️ **2026-10-21 修正**：此前这里判 `rotate: true`，依据是「罚的是单号、
+    // 所以换号有用」。换号**确实能绕过**这个坏号，但那正是上游风控要抓的行为：
+    //
+    //   workbuddy2api-hub #422/#425 实测 —— 在 11140 上「冷却该号后立刻换下一个号
+    //   继续同一请求」，一个请求最多遍历整个池子，**用户 7 个号在一次任务里全被封**。
+    //   社区复盘（Zhengyuuuui/workbuddy2api 事件复盘）的红线原文是：
+    //   「看到 11140 立即停手，解封前严禁换号继续打同一设备 —— 设备指纹会连坐」。
+    //
+    // 机制：11140 是**设备/出口维度**的账号标记（同一台"设备"上的其它号会被连带
+    // 判定），所以「换号」不改变被盯上的设备，只会把更多无辜账号送进同一个标记里。
+    // 本项目实测的「三个 WB 号里只有 z 被封、另两个完好」是**封禁前**的状态；
+    // 一旦开始轮转，完好的号也会被逐个拖进去（这正是连坐）。
+    //
+    // ⇒ 正确处置：罚该号 + **不换号**，把限制原因如实交给客户端。
+    //    下一次**独立**请求自然会落到别的号（上游已给它记上 `restrictedUntil`，
+    //    见 AccountPoolDO 的持久化），不需要在同一个请求里硬换。
+    //    要把旧行为调回来的运维口子见 `RESTRICTED_ROTATE_MAX`。
     case 'request_illegal':
-      return { punish: true, dimension: 'breaker', rotate: true }
+      return { punish: true, dimension: 'restricted', rotate: restrictRotateAllowed() }
     // session 死亡：连续 3 次才禁用；换号有用
     case 'session_dead':
       return { punish: true, dimension: 'session_dead', rotate: true }
@@ -889,6 +923,29 @@ export async function handleChatCompletions(
     }
   }
 
+  // ⚠️ **账号级限制波次**的前置检查（与上面 IP 级并列、判据不同）。
+  // 依据 workbuddy2api-hub #425：短时间内多个账号被 11140 标记 ⇒ 上游正在对这批号
+  // 做风控，继续送号只会让更多号进标记（社区红线「看到 11140 立即停手」）。
+  // 期间**一个上游请求都不发**，直接返回可读原因。
+  // ⚠️ **先判方法存在**再调用：波次暂停是保护措施，不是请求前置条件。
+  // 读不到状态（测试替身缺该方法 / 老 DO 未升级）时应放行请求，
+  // 而不是让整条 chat 路径崩掉 —— 保护措施本身不能成为新的故障点。
+  // 注意不能只靠 `.catch()`：方法**不存在**时是同步 TypeError，promise 链接不住。
+  const gateProbe = (pool as { restrictionGateActive?: (now: number) => Promise<boolean> })
+  const restrictionPaused =
+    typeof gateProbe.restrictionGateActive === 'function'
+      ? await gateProbe.restrictionGateActive(Date.now()).catch(() => false)
+      : false
+  if (restrictionPaused) {
+    return {
+      response: jsonError(
+        429,
+        '多个账号近期被上游风控限制（11140 账号存在异常行为），已暂停该区域派发以避免更多账号被牵连。稍后自动恢复；如确认是误判可在面板解冻。',
+        'restriction_wave',
+      ),
+    }
+  }
+
   // ⚠️ **会话/轮级 id 在重试循环外算一次**（实测语义）。
   //
   // 官方客户端：`X-Conversation-ID` 在同一对话里恒定，`X-Conversation-Request-ID`
@@ -1023,6 +1080,15 @@ export async function handleChatCompletions(
       // ① 账号级软冷却（下方 applyFailure）—— 让这个号暂时别用；
       // ② **IP 级判定**（noteWaf）—— 若短窗内多个不同号都命中，说明是出口 IP 被拦，
       //    此时继续轮转毫无意义（撞的是同一堵墙），必须 fail-fast。
+      // ②-b **账号级限制波次判定**（noteRestriction）—— 与上面的 IP 级并列。
+      //     短窗内多个不同号被 11140 标记 ⇒ 上游正在对这一批号做风控，
+      //     继续送号会让更多号被牵连（workbuddy2api-hub #425）。
+      //     ⚠️ 与 `waf_blocked` 分开判：11128 是渠道指纹（不罚号），
+      //     11140 是账号级限制（罚号），两者混判会让处置互相串味。
+      if (kind === 'request_illegal') {
+        await pool.noteRestriction(candidate.uid, Date.now()).catch(() => false)
+      }
+
       if (kind === 'waf_blocked') {
         const ipBlocked = await pool.noteWaf(candidate.uid, Date.now()).catch(() => false)
         if (ipBlocked) {

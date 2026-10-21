@@ -431,16 +431,33 @@ test('⚠️ WAF 拦截不换号（可能是 IP 级，换号无用）', () => {
   assert.equal(m.rotate, false, 'IP 级拦截换号无用，只会放大请求')
 })
 
-test('🔴 11140 是账号级封禁 ⇒ 要罚该号且换号（不再拖垮整个 provider）', () => {
+test('🔴 11140 是账号级封禁 ⇒ 罚该号，但**不换号硬重试**', () => {
   // 上游原文（2026-10-21，HTTP 403）：
   //   {"code":11140,"msg":"request illegal",
   //    "displayMsg":{"zh":"账号存在异常行为，已被限制使用",
   //                  "en":"Your account has been restricted due to unusual activity"}}
-  // 「this account has been restricted」⇒ 罚的是这一个号，换号有用。
-  // 旧断言写成 rotate: false，导致一个被封的号把整个 provider 拖死。
+  //
+  // ## 本测试的两次修正（保留了每一次的教训）
+  //
+  // ① 最初断言 `rotate: false`，理由「换号无用（同样的非法请求）」。
+  //    对了一半：换号确实绕不过**这个**号，但当时把 11140 与 11128 混为一谈。
+  //
+  // ② 后来改成 `rotate: true`，理由「上游说的是 this account has been restricted，
+  //    罚的是这一个号 ⇒ 换号有用」。这条推理**仍然漏了一层**：
+  //    换号改变的是「谁发请求」，不改变「从哪台设备发」。
+  //    workbuddy2api-hub #422/#425 实测：在 11140 上「冷却该号后立刻换下一个号
+  //    继续同一请求」，一个请求最多遍历整个池子，**用户 7 个号在一次任务里全被封**。
+  //    社区复盘的红线原文：「看到 11140 立即停手，解封前严禁换号继续打同一设备
+  //    —— 设备指纹会连坐」。
+  //
+  // ③ 现在：罚该号（一次即生效，见 `restricted` 维度）+ **不换号**，
+  //    把原因如实交给客户端。下一次**独立**请求自然会落到别的号
+  //   （该号已被持久化标记 restrictedUntil，选号时直接跳过），
+  //    不需要在同一个请求里硬换。
   const m = mapErrorToPunishment('request_illegal')
   assert.equal(m.punish, true, '是强信号，要罚')
-  assert.equal(m.rotate, true, '账号级封禁，换号有用')
+  assert.equal(m.dimension, 'restricted', '账号级限制专用维度（breaker 要 3 次才生效，太迟）')
+  assert.equal(m.rotate, false, '不换号硬重试：换号会把池子逐个拖进设备级限制')
 })
 
 test('余额耗尽 / session 死亡 / 5xx 应换号', () => {
