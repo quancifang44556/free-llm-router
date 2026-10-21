@@ -4722,13 +4722,23 @@ async function scheduled(event: ScheduledController, env: Env): Promise<void> {
        * ⚠️ 只对 **cron 扇出**去重，**不影响**面板上的「手动执行」：
        * 用户点了就是要现在再跑一遍，那是显式意图。
        */
-      const status = await env.TASK_RUNNER.get(env.TASK_RUNNER.idFromName(account.uid)).status(account.uid)
-      if (
-        status !== undefined
-        && status.finished
-        && status.plan === planToRun
-        && utc8DayKey(status.startedAt) === utc8DayKey(now)
-      ) {
+      // ⚠️ **读状态失败不得阻止任务**：去重是「优化」，漏跑才是「故障」。
+      // 若这里抛错并被外层 catch 吞掉，该账号今天就不会跑了 —— 方向反了。
+      let alreadyDoneToday = false
+      try {
+        const status = await env.TASK_RUNNER.get(env.TASK_RUNNER.idFromName(account.uid)).status(account.uid)
+        alreadyDoneToday =
+          status !== undefined
+          && status.finished
+          && status.plan === planToRun
+          && utc8DayKey(status.startedAt) === utc8DayKey(now)
+      } catch (error) {
+        console.warn(
+          `[cron] 读 ${account.uid} 的运行状态失败，改为直接入队（去重让位于不漏跑）：`,
+          error instanceof Error ? error.message : String(error),
+        )
+      }
+      if (alreadyDoneToday) {
         console.log(`[cron] 账号 ${account.uid} 今天已跑完 ${planToRun}，跳过（防重复烧配额）`)
         continue
       }
