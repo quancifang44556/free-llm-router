@@ -3587,12 +3587,27 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
    *（不另写一套，避免本项目反复踩的「双判据」坑）。
    */
   if (path === '/admin/accounts/diagnose' && request.method === 'GET') {
-    const realm = url.searchParams.get('realm') ?? 'cn'
-    const stub = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
+    /**
+     * ⚠️ **不传 realm 时必须聚合全部分片**（2026-10-21 修）。
+     *
+     * 早先是 `?? 'cn'` —— 于是 `curl /admin/accounts/diagnose` 只回 `cn` 分片的号，
+     * **`workbuddy`（国际版，realm=`global`）整个消失**，看起来像「号丢了」。
+     * 实测踩到：排查时以为 workbuddy 的 3 个号不见了，其实是没查 global 分片。
+     *
+     * ⚠️ 面板的账号列表没这个问题（它按 `realm` 分别请求 `/admin/accounts`），
+     * 但本端点面向**运维/排障**，默认就该给出全景。
+     */
+    const requested = url.searchParams.get('realm')
+    const realms = requested === null || requested === '' ? ['cn', 'global'] : [requested]
     const now = Date.now()
-    const accounts = await stub.listAccounts(realm, now)
+    const accounts = []
+    for (const realm of realms) {
+      const stub = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
+      accounts.push(...(await stub.listAccounts(realm, now)))
+    }
     return json({
-      realm,
+      realm: realms.length === 1 ? realms[0] : 'all',
+      realms,
       now,
       accounts: accounts.map((a) => diagnoseAccount(a, now)),
     })
