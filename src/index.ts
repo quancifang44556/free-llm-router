@@ -2982,7 +2982,29 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
     const cleared = await pool.clearModelCooldowns(realm, body.uid, body.model)
     // 同时清账号级熔断/冷却（排查「明明健康却选不到号」时用）
     const resetCount = await pool.clearCooldowns(realm, body.uid)
-    return json({ ok: true, realm, cleared, resetCount })
+    /**
+     * 🔴 **「清空冷却」必须连两道全局闸门一起解**（2026-10-21 审查补，M5 指出高危）。
+     *
+     * ## 缺陷
+     * 两道闸门（IP 级 WAF / 11140 波次暂停）是**分片级**状态，
+     * 只有 `clearWafGate()` / `clearRestrictionGate()` 能解，
+     * 而本端点原来只清 `modelCooldowns` + `clearCooldowns`（账号级），**不碰闸门**。
+     *
+     * ⇒ 用户点「清空冷却」看到 toast 成功、列表里账号也确实「正常」，
+     * 但请求仍然**全部失败**，最长 30 分钟（波次暂停的窗口）。
+     * 这是最难查的一类：UI 说好了，链路说没好。
+     *
+     * ## 为什么只在「整个分片」时解
+     * 传了 `uid` 表示「只处理这一个号」，此时去解全分片闸门属于**越权副作用**
+     *（用户以为只动了一个号，实际放开了整片）。故只在 `uid` 缺省时解。
+     */
+    let gatesCleared = false
+    if (body.uid === undefined || body.uid === '') {
+      await pool.clearWafGate().catch(() => undefined)
+      await pool.clearRestrictionGate().catch(() => undefined)
+      gatesCleared = true
+    }
+    return json({ ok: true, realm, cleared, resetCount, gatesCleared })
   }
 
   // ── 供应商目录（面板用：显示每家的能力与登录阻塞原因） ──
@@ -3866,6 +3888,21 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
         // 线上实测踩过：库里 rst=2h 已写入，但 /admin/accounts 不返回该字段，
         // 于是误判「三个号都没被封」。记账失效是**静默**的，这条字段就是唯一的显示出口。
         restrictedUntil: a.restrictedUntil,
+        /**
+         * 🔴 **`degradeUntil` 必须暴露**（2026-10-21 审查补，M5 指出高危）。
+         *
+         * ## 缺陷
+         * `AccountPoolDO` 有「连续 5 次业务失败 ⇒ 降权 10 分钟不派单」的机制
+         *（`degradeUntil`），但本白名单**没有它** ⇒ 面板**连字段都拿不到**。
+         *
+         * ⇒ 后果是**自相矛盾**：侧栏角标走 `counts()/healthy()` 把这个号算进
+         * 「冷却中」，而账号列表因为拿不到字段，显示这个号**「正常」**。
+         * 用户看到「角标说 3 个冷却 / 列表说 0 个异常」，无法定位是哪个号。
+         *
+         * 与 `restrictedUntil` 是**同一类缺陷**（记账有、显示出口没有），
+         * 只是那个已修、这个漏了 —— 又一处「只修一半」。
+         */
+        degradeUntil: a.degradeUntil,
         softStreak: a.softStreak,
         // ⚠️ 不只给模型名，还要给**到期时间与原因** ——
         // 面板的「模型限流」弹窗要显示「还剩多久 / 为什么被限」，
