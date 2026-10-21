@@ -375,8 +375,17 @@ test('⚠️ 模型目录的候选筛选必须与 chat 的健康判据一致', (
   const i = src.indexOf("if (path === '/admin/providers/models'")
   const block = src.slice(i, i + 6000)
   assert.ok(/a\.disabled === true/.test(block), '应跳过 disabled 账号')
-  assert.ok(/a\.until > Date\.now\(\)/.test(block), '应跳过冷却中的账号')
-  assert.ok(/a\.breakerUntil > Date\.now\(\)/.test(block), '应跳过熔断的账号')
+  // ⚠️ 判据必须是**四个字段全都查**：
+  // 2026-10-21 审查（M5）发现这里只查了三个，漏了 `restrictedUntil`（上游封号）
+  // 与 `degradeUntil`（连续业务失败降权）—— 这两种号会被排到前面去白打上游，
+  // 表现仍是「模型列表报登录态过期，而池里明明有好号」。
+  // 也就是说：上一段注释说的「选号策略不一致」，只修了「取第一个」，没修「坏号的定义」。
+  for (const field of ['until', 'breakerUntil', 'restrictedUntil', 'degradeUntil']) {
+    assert.ok(
+      new RegExp(`a\\.${field} > nowMs`).test(block) || new RegExp(`a\\.${field} > Date\\.now\\(\\)`).test(block),
+      `应跳过 ${field} 未到期的账号（与 pick() 的健康判据保持一致）`,
+    )
+  }
 })
 
 test('🔴 供应商关闭必须真的关掉（服务端状态 + 双向拦截）', () => {

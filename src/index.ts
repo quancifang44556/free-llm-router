@@ -3249,7 +3249,20 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
         //（也避免在 refresh_token 已失效时反复尝试续期 —— 那是**终态**，
         // 重试只会浪费一次请求）。判据与 `pick()` 的健康检查保持一致。
         if (a.disabled === true) continue
-        if (a.until > Date.now() || a.breakerUntil > Date.now()) continue
+        /**
+         * 🔴 判据必须与 `pick()` **完全一致**（2026-10-21 审查补，M5 指出）。
+         *
+         * 原注释自称「与 `pick()` 的健康检查保持一致」，但只查了三个字段，
+         * **漏了 `restrictedUntil`（上游封号）与 `degradeUntil`（连续业务失败降权）**。
+         * ⇒ 这两种号会被排到队列前面去白打上游，第一步就失败，
+         * 用户看到「模型列表又报登录态过期」，而池里明明有好号。
+         *
+         * 这正是本段注释上一段在描述的那个缺陷（「选号策略不一致」）的**另一半**：
+         * 换了「逐个尝试」解决了「第一个是坏号」，但坏号的**定义**仍然不同。
+         */
+        const nowMs = Date.now()
+        if (a.until > nowMs || a.breakerUntil > nowMs) continue
+        if (a.restrictedUntil > nowMs || a.degradeUntil > nowMs) continue
         candidates.push({ pool: candidatePool, uid: a.uid })
       }
     }
@@ -3588,7 +3601,40 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
     }
 
     // ⚠️ 只回 uid/nickname 等非敏感字段，**绝不回 token**
-    return json({ ok: imported.length > 0, imported, skipped })
+    /**
+     * 🔴 **一条都没导入时不能回 200**（2026-10-21 审查补，M5 指出）。
+     *
+     * 原来无论成不成，都回 `200 + {ok:false, imported:[], skipped:[...]}`。
+     * 而面板的 `useAction` 只认 HTTP 状态：`L()` 在 `!res.ok` 时才抛错，
+     * 于是**一条都没导入也照弹「账号已导入」**，`skipped[].reason` 全库无人读。
+     *
+     * 用户以为导入成功，列表里却没有新账号 —— 只能怀疑「是不是要刷新」。
+     *
+     * 面板包装器（`web/src/lib/api.ts` 的 `api()`）在非 2xx 时会抛
+     * `ApiError(status, body)` 并读 `body.error.message`，所以这里按标准
+     * 错误信封返回，提示能一路显示到 toast 上。
+     *
+     * 状态码用 **422**：请求格式是对的，只是内容全都不可用（不是 400 语法错）。
+     */
+    if (imported.length === 0) {
+      const first = skipped[0]
+      const why = first === undefined
+        ? '没有解析出任何账号'
+        : `第一条原因：${first.reason}`
+      return json(
+        {
+          error: {
+            message: `没有导入任何账号（${skipped.length} 条被跳过）。${why}`,
+            type: 'import_failed',
+          },
+          ok: false,
+          imported,
+          skipped,
+        },
+        422,
+      )
+    }
+    return json({ ok: true, imported, skipped })
   }
 
   // ── 凭据状态（**不回 token**，只回是否已存 + 脱敏提示） ──
