@@ -1179,7 +1179,24 @@ export async function handleChatCompletions(
        * 完全不同的处置。之前正是因为看不到原文，把模型下线误判成封号。
        * 默认关闭（正文可能含用户内容），排障时打开。
        */
-      if ((globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env?.QODER_DEBUG_UPSTREAM === '1') {
+      /**
+       * ⚠️ **`waf_blocked` 无条件留证**（2026-10-21 加，这是排查误判的关键）。
+       *
+       * 数据库里存到的真实 reason 是：
+       *   `waf_blocked: WAF blocked (403 without business envelope)`
+       * 而 `waf_blocked` 的处置是 `punish: true, dimension: 'soft'` ⇒ **账号级软冷却**。
+       * 也就是说：只要上游回一个「403 且解析不出业务信封」，该账号就会被冷却 60 秒，
+       * 单账号池下等于整条链路中断 —— 而**我们从来没记录过那个 403 的原文**，
+       * 导致反复误判却无从定位。
+       *
+       * 该分支默认开启（不依赖环境变量）：它是**误判的唯一证据来源**，
+       * 而 WAF 403 本身应是低频事件，不会刷屏。
+       */
+      if (kind === 'waf_blocked') {
+        console.warn(
+          `[waf-403] model=${model} http=${upstream.status} len=${text.length} body=${text.slice(0, 500)}`,
+        )
+      } else if ((globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env?.UPSTREAM_DEBUG === '1') {
         console.warn(`[upstream] http=${upstream.status} kind=${kind} body=${text.slice(0, 300)}`)
       }
       const mapped = mapErrorToPunishment(kind)

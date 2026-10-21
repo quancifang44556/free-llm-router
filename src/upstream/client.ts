@@ -229,6 +229,30 @@ export function parseEnvelope(text: string): Envelope | undefined {
     const value = JSON.parse(trimmed) as unknown
     if (value === null || typeof value !== 'object' || Array.isArray(value)) return undefined
     const obj = value as Record<string, unknown>
+
+    /**
+     * 🔴 **【实测缺陷】qoder 的「外层信封包内层业务码」形态**（2026-10-21）。
+     *
+     * qoder 加密端点在**鉴权失败时也回 HTTP 200**，错误装在第一帧：
+     * ```
+     * data:{"headers":{…},"body":"{\"code\":\"105\",\"message\":\"Login expired\"}",
+     *       "statusCodeValue":403,…}
+     * ```
+     * 特征：**顶层没有 `code`，业务码藏在 `body` 字符串里**，真实状态码在 `statusCodeValue`。
+     *
+     * 旧实现只认顶层 `code` ⇒ 这个信封被判为「不是信封」⇒
+     * `isWafBlocked(403, …)` 命中 ⇒ **`waf_blocked` ⇒ 罚账号 + 软冷却 60 秒**。
+     * 而它其实是 `105 Login expired`（**登录过期**），正确处置是**触发续期**，
+     * 完全不该罚号 —— 单账号池下这等于整条链路中断 60 秒。
+     *
+     * 这一层不负责 unwrap（provider 的 `asError` 已经做了），只负责**认出**：
+     * 只要有 `body` 字符串里含业务码，就把内层码当信封码返回。
+     */
+    if (obj.code === undefined && typeof obj.body === 'string' && obj.body.trim() !== '') {
+      const inner = parseEnvelope(obj.body)
+      if (inner !== undefined) return inner
+    }
+
     const raw = obj.code
     // ⚠️ 上游有两种码形态：数字（`6004`）与**带连字符的字符串**（`"11-128"`）。
     // 后者是渠道校验失败的真实形态，`Number("11-128")` = NaN，

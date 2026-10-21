@@ -617,3 +617,40 @@ test('🔴 两条 chat 路径都必须有延迟记账（本项目「只修一半
   const applyCalls = [...src.matchAll(/\n(\s*)\.applyFailure\(\{/g)]
   assert.ok(applyCalls.length >= 2, `applyFailure 至少有 2 处调用，实际 ${applyCalls.length}`)
 })
+
+test('🔴 qoder 外层信封（body 套业务码）不得被判成 WAF', async () => {
+  // ## 真实故障（2026-10-21，从数据库 reason 字段挖出）
+  // 持久化的 reason 是 `waf_blocked: WAF blocked (403 without business envelope)`。
+  // 而 `waf_blocked` 的处置是 `punish: true, dimension: 'soft'` ⇒ **账号级冷却 60 秒**，
+  // 单账号池下等于整条链路中断 —— 用户报「审查时被打断」的真正原因。
+  //
+  // 上游真实形态（qoder 加密端点，鉴权失败也回 HTTP 200）：
+  //   data:{"headers":{},"body":"{\"code\":\"105\",\"message\":\"Login expired\"}",
+  //        "statusCodeValue":403}
+  // 顶层**没有 `code`** ⇒ 旧 parseEnvelope 判「不是信封」⇒ isWafBlocked 命中。
+  // 而它其实是 `105 Login expired`（**登录过期**），正确处置是**触发续期**，不该罚号。
+  const { classify, isWafBlocked, parseEnvelope } = await import('../src/upstream/client.ts')
+
+  // ① qoder 外层信封（带 data: 前缀）
+  const withPrefix =
+    'data:{"headers":{},"body":"{\\"code\\":\\"105\\",\\"message\\":\\"Login expired\\"}","statusCodeValue":403}'
+  assert.ok(parseEnvelope(withPrefix) !== undefined, '必须认得 qoder 外层信封')
+  assert.equal(isWafBlocked(403, withPrefix), false, 'qoder 外层信封不是 WAF')
+  assert.equal(classify(403, withPrefix).kind, 'auth_error', '105 Login expired 必须归为 auth_error（要续期）')
+
+  // ② 无 data: 前缀的同一形态
+  const bare =
+    '{"headers":{},"body":"{\\"code\\":\\"105\\",\\"message\\":\\"Login expired\\"}","statusCodeValue":403}'
+  assert.equal(classify(403, bare).kind, 'auth_error', '无前缀形态同样要认出来')
+
+  // ③ **反向守卫：真 WAF 判据不得被放宽**
+  for (const realWaf of ['Forbidden', '<html><body>403 Forbidden</body></html>', '']) {
+    assert.equal(
+      isWafBlocked(403, realWaf),
+      true,
+      `真 WAF 形态必须仍然判为 WAF：${JSON.stringify(realWaf.slice(0, 40))}`,
+    )
+  }
+  // ④ 常规信封不受影响
+  assert.equal(classify(403, '{"code":6004,"msg":"rate"}').kind, 'rate_limited', '普通信封行为不变')
+})
