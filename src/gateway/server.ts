@@ -28,7 +28,7 @@ import { resolveUpstream, type Env } from '../env.js'
 import { classify, type ErrorKind } from '../upstream/client.js'
 import { deriveDeviceId, referenceChatHeaders } from '../upstream/headers.js'
 import { deriveIntlConversationId, newTurnRequestId } from '../upstream/conversation.js'
-import { prepareChatBody, sanitizeChatBody, trimMessagesByLimit } from './payload.js'
+import { cleanupToolPairing, prepareChatBody, sanitizeChatBody, trimMessagesByLimit } from './payload.js'
 import { safetyConfigFor } from './safety.js'
 import { throttleUpstream } from './throttle.js'
 import { ERROR_CHECK_FRAMES, ERROR_HINT_PATTERN, aggregateSse, createFrameTranslator, detectErrorFrame, doneFrame, errorFrame, mayHaveUsage, parseSseLine, sseHeaders, translateFrame } from './stream.js'
@@ -704,6 +704,39 @@ export async function handleChatCompletions(
   // - 放在 `deriveSessionKey` **之后**：会话粘性 key 必须由**完整**历史算出，
   //   若先裁剪，裁掉的那几条会影响 key ⇒ 每轮 key 都在变 ⇒ 粘性失效、命中不了上游 prompt cache；
   // - 放在 `rawModel` **之后**：日志要带模型名（只带名字，不带任何消息内容）。
+  // ── 消息归一：`developer` → `system`、工具配对修复（**全链路唯一一处**）──
+  //
+  // ## 为什么必须放在这里
+  //
+  // 同一段逻辑原本只在 `prepareChatBody` 里，而它**只服务默认供应商（buddy）**；
+  // 具名/聚合 provider 走 `handleProviderChat`，`rawBody` 被原样展开就发上游
+  // ⇒ 归一从未生效。实测（2026-10-21）用户用 DSH 选 Qoder 中国版：
+  //
+  //   HTTP 400 {"code":"provider_error",
+  //     "details":"Failed to deserialize the JSON body into the target type:
+  //                messages[0].role: unknown variant `developer`,
+  //                expected one of `system`, `user`, `assistant`, `tool`"}
+  //
+  // 上游只认 system/user/assistant/tool，而 OpenAI 新规范里 DSH 用
+  // `role: 'developer'` 承载系统提示词。buddy 路径因为有 `prepareChatBody` 侥幸没事，
+  // provider 路径全线报错 —— 正是本项目旧伤「同一个 bug 只修一半」的又一次复现。
+  //
+  // ⇒ 落点选在**所有分支之前**（与下面的消息数裁剪同理）：聚合路由、具名供应商、
+  // 默认供应商、`/v1/responses` 四条路都从这里过，改一次全覆盖。
+  // `cleanupToolPairing` 是幂等的，buddy 路径再经 `prepareChatBody` 跑第二遍也无副作用。
+  if (rawBody !== null && typeof rawBody === 'object' && !Array.isArray(rawBody)) {
+    const msgBody = rawBody as Record<string, unknown>
+    if (Array.isArray(msgBody.messages)) {
+      const before = msgBody.messages as unknown[]
+      const normalized = cleanupToolPairing(before)
+      if (normalized !== before) {
+        rawBody = { ...msgBody, messages: normalized }
+        // ⚠️ 隐私红线：只打模型名，不打任何消息内容。
+        console.log(`[msg-normalize] 已归一消息角色/工具配对 model=${rawModel}`)
+      }
+    }
+  }
+
   const maxContextMessages = safety.maxContextMessages
   if (maxContextMessages > 0 && rawBody !== null && typeof rawBody === 'object' && !Array.isArray(rawBody)) {
     const withMessages = rawBody as Record<string, unknown>

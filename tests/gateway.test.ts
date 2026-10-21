@@ -1307,6 +1307,58 @@ test('⚠️ 渠道拦截与 WAF 必须是两个独立类别（形态不同、�
   assert.equal(mapErrorToPunishment('waf_blocked').punish, true, 'HTTP 403 仍要软冷却')
 })
 
+// ───── 消息归一必须接在**公共入口**（provider 路径曾完全绕过） ─────
+
+test('🔴 消息归一（developer→system）必须在 handleChatCompletions 内、且早于 provider 派发', () => {
+  // ## 实测事故（2026-10-21，用户报「Qoder 中国版 502」）
+  //
+  // 上游返回：
+  //   HTTP 400 {"code":"provider_error",
+  //     "details":"Failed to deserialize the JSON body into the target type:
+  //                messages[0].role: unknown variant `developer`,
+  //                expected one of `system`, `user`, `assistant`, `tool`"}
+  //
+  // `cleanupToolPairing` 早就实现了 developer→system 降级，但**只在
+  // `prepareChatBody` 里被调用**，而它只服务默认供应商（buddy）。
+  // 具名/聚合 provider 走 `handleProviderChat`，`rawBody` 原样展开就发上游
+  // ⇒ 归一从未生效。buddy 路径侥幸没事，Qoder 全线 400。
+  //
+  // 这与本项目「同一个 bug 只修一半」是同一类错误：**修在了某一条路上**。
+  // 故此处钉住两件事：① 调用点在公共入口；② 位置早于所有派发分支。
+  const server = stripComments(readFileSync('src/gateway/server.ts', 'utf8'))
+  const fnAt = server.indexOf('export async function handleChatCompletions')
+  assert.ok(fnAt >= 0, 'handleChatCompletions 必须存在')
+
+  const callAt = server.indexOf('cleanupToolPairing(')
+  assert.ok(callAt > fnAt, '归一必须在 handleChatCompletions 内调用（不能在 provider 各自实现）')
+
+  // 必须早于聚合分支与 provider 派发 —— 否则那两条路径拿到的是未归一的 rawBody
+  const aggAt = server.indexOf('handleAggregateChat({')
+  const providerFnAt = server.indexOf('export async function handleProviderChat')
+  assert.ok(aggAt > callAt, '聚合分支必须拿到归一后的 rawBody')
+  assert.ok(providerFnAt > callAt, 'handleProviderChat 的派发必须拿到归一后的 rawBody')
+
+  // server.ts 里只允许这一处调用：重复实现正是旧伤的来源
+  assert.equal(
+    [...server.matchAll(/cleanupToolPairing\s*\(/g)].length,
+    1,
+    'server.ts 里必须只有一处归一调用',
+  )
+})
+
+test('🔴 归一幂等：buddy 路径经 prepareChatBody 跑第二遍不得改变结果', () => {
+  // 归一点上移到公共入口后，buddy 路径会经过它**和** `prepareChatBody` 两次。
+  // 若不幂等，第二次会把已转成 system 的消息再处理一遍（或丢掉合法消息）。
+  const once = cleanupToolPairing([
+    { role: 'developer', content: 'You are an expert coding assistant.' },
+    { role: 'user', content: 'hi' },
+  ]) as Array<Record<string, unknown>>
+  const twice = cleanupToolPairing(once) as Array<Record<string, unknown>>
+  assert.deepEqual(twice, once, '第二次归一不得改变结果')
+  assert.equal(twice[0]!.role, 'system')
+})
+
+
 // ───── `role: 'developer'` 导致 11128（用户报两处 502 的根因） ─────
 
 test("🔴 `role:'developer'` 必须被降级为 system（否则上游判「首条不是 system」→ 11128）", () => {
