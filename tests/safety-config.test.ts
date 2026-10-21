@@ -20,6 +20,7 @@ import {
   sessionTraceHeaders,
   setSessionTraceEnabled,
   isSessionTraceEnabled,
+  referenceChatHeaders,
 } from '../src/upstream/headers.js'
 import {
   configureThrottle,
@@ -330,4 +331,58 @@ test('裁剪上限接线：服务端读的是配置值而不是环境变量', ()
     !callSites[0].includes('resolveMaxContextMessages'),
     '裁剪上限不得再直接读环境变量（否则面板改了不生效）',
   )
+})
+
+// ───────────────────── ⑦ 国内版绝不可发 b3（真实封号事故） ─────────────────────
+
+test('🔴 国内版 buddy 的 chat 头里**不能**有 b3（曾导致三个号全线 11-128）', () => {
+  setSessionTraceEnabled(true)
+  const cn = referenceChatHeaders({ uid: 'u1', accessToken: 't', variant: 'buddy' })
+  assert.ok(!('X-B3-TraceId' in cn), '国内版不得带 X-B3-TraceId')
+  assert.ok(!('X-B3-SpanId' in cn), '国内版不得带 X-B3-SpanId')
+  assert.ok(!('X-B3-Sampled' in cn), '国内版不得带 X-B3-Sampled')
+})
+
+test('国际版仍要 b3（渠道要求链路可串联）', () => {
+  setSessionTraceEnabled(true)
+  const intl = referenceChatHeaders({ uid: 'u1', accessToken: 't', variant: 'workbuddy' })
+  assert.ok('X-B3-TraceId' in intl, '国际版应当带 b3')
+})
+
+test('源码级：会话头族只在国际版路径出现（防止又被「统一一下」改回去）', () => {
+  // ⚠️ 这条断言钉的是**契约**（谁该发 b3），不是某个具体写法。前两版都写错了：
+  //  v1「国内版分支必须传 false」—— 国内版分支根本没有这个调用；
+  //  v2「每处调用都被 variant==='workbuddy' 包住」—— 有一处位于
+  //     `intlReferenceChatHeaders`，那个函数**本身**就是国际版专用
+  //     （上层 `if (input.variant === 'workbuddy') return intlReferenceChatHeaders(input)`）。
+  // 用**行号**判定函数归属（字符偏移会被注释里的同名文字骗到）。
+  const src = fs.readFileSync(path.join(process.cwd(), 'src/upstream/headers.ts'), 'utf8')
+  const lines = src.split('\n')
+
+  const fnAt = (needle: string): number => lines.findIndex((l) => l.includes(needle))
+  const defLine = fnAt('export function sessionTraceHeaders')
+  const intlLine = fnAt('function intlReferenceChatHeaders')
+  const cliLine = fnAt('export function cliChatHeaders')
+  assert.ok(defLine > 0 && intlLine > defLine && cliLine > intlLine, '函数边界定位失败')
+
+  // 所有调用点（排除定义）
+  const callLines = lines
+    .map((l, idx) => ({ idx, l }))
+    .filter((x) => /sessionTraceHeaders\s*\(/.test(x.l) && x.idx !== defLine)
+    .map((x) => x.idx)
+  assert.ok(callLines.length >= 2, `应至少有 2 处调用（实际 ${callLines.length}）`)
+
+  for (const at of callLines) {
+    if (at > intlLine && at < cliLine) continue // intlReferenceChatHeaders 内 ⇒ 国际版专用
+    assert.ok(at > cliLine, `第 ${at + 1} 行的调用不在国际版路径内`)
+    const before = lines.slice(Math.max(cliLine, at - 12), at).join('\n')
+    assert.ok(
+      before.includes("variant === 'workbuddy'"),
+      `第 ${at + 1} 行的调用必须被 variant==='workbuddy' 包住`,
+    )
+  }
+
+  // 国内版主分支（referenceChatHeaders → intlReferenceChatHeaders 之间）不得直接调用
+  const refSeg = lines.slice(fnAt('export function referenceChatHeaders'), intlLine).join('\n')
+  assert.ok(!refSeg.includes('sessionTraceHeaders('), '国内版主分支不得直接调用 sessionTraceHeaders')
 })

@@ -226,7 +226,7 @@ export function sessionTraceHeaders(input: {
   conversationId?: string
   /** 轮级 id：重试须复用（调用方在重试循环外算一次），缺省则现生成。 */
   turnRequestId?: string
-} = {}): HeaderMap {
+} = {}, includeB3 = true): HeaderMap {
   // ⚠️⚠️ 这里**千万不能**整段 return {}。
   //
   // `intlConversationHeaders` 那 5 个会话头是 v0.1.2 为修「11‑128 渠道拦截
@@ -246,8 +246,11 @@ export function sessionTraceHeaders(input: {
   const conversationId = conversation['X-Conversation-ID'] ?? ''
   return {
     ...conversation,
-    // 只有 b3 受开关控制：它是**可选**的链路特征；会话头族是必需的。
-    ...(sessionTraceEnabled ? b3TraceHeaders({ conversationId }) : {}),
+    // b3 受两道闸门控制：
+    // ① `includeB3`（调用方按变体决定）—— ⚠️ **国内版必须传 false**，
+    //    否则上游判「两套 trace 并存」回 `11-128 request illegal`；
+    // ② 面板开关 `sessionTraceEnabled`。
+    ...(sessionTraceEnabled && includeB3 ? b3TraceHeaders({ conversationId }) : {}),
   }
 }
 
@@ -555,13 +558,30 @@ function intlReferenceChatHeaders(input: {
       ...(input.machineId === undefined ? {} : { machineId: input.machineId }),
       ...(input.sessionId === undefined ? {} : { sessionId: input.sessionId }),
     }),
-    // ⚠️ 会话头族 + **b3 链路头**（`sessionTraceHeaders` 内部复用会话头族，
-    // 只在这上面追加 trace/span/sampled —— 两者必须一起发，否则「有会话无链路」
-    // 仍是孤立请求的形态，见该函数上方的复盘依据）。
-    ...sessionTraceHeaders({
-      ...(input.conversationId === undefined ? {} : { conversationId: input.conversationId }),
-      ...(input.turnRequestId === undefined ? {} : { turnRequestId: input.turnRequestId }),
-    }),
+    // 会话头族 + **仅国际版**追加 b3 链路头。
+    //
+    // ⚠️⚠️ **国内版发 b3 会让 WorkBuddy 全线 `11-128 request illegal`**
+    //（2026-10-21 实测：三个国内版账号逐一熔断，用户报「WB 号好像都被封了」）。
+    //
+    // 定位过程：把 `sessionTrace` 开关关掉后，同一个请求立刻 200 并正常出字；
+    // 打开就 `request_illegal: request illegal`。这是**唯一变量**，故根因确定。
+    //
+    // 原因：国内版指纹是 **CLI 口径**（`cliChatHeaders` 已自带 `X-Trace-ID`），
+    // 而 b3 是**另一套 trace 体系**。两套并存 ⇒ 上游看到自相矛盾的链路标识，
+    // 判为非法调用。参考实现的对照表也写着「我们多发了一批头，
+    // 在国际版端点上不被认可」—— b3 正好又犯了一次同样的错。
+    //
+    // 正确切分：**国际版**（workbuddy）要 b3（渠道要求链路可串联）；
+    // **国内版**（buddy）不要，它只认自己那套 CLI 头。
+    ...sessionTraceHeaders(
+      {
+        ...(input.conversationId === undefined ? {} : { conversationId: input.conversationId }),
+        ...(input.turnRequestId === undefined ? {} : { turnRequestId: input.turnRequestId }),
+      },
+      // 国际版**要** b3：渠道要求链路可串联，且它的指纹是桌面口径，
+      // 与 b3 不冲突（国内版才冲突，见 `referenceChatHeaders` 主分支的说明）。
+      true,
+    ),
   }
   if (input.accessToken !== '') {
     headers.Authorization = `Bearer ${input.accessToken}`
