@@ -134,6 +134,34 @@ export function detectBurnRate(
   // 只取窗口内的采样：窗口外的消耗已经「太旧」，拿来算会把慢速消耗误判成爆发。
   const cutoff = now - config.windowMs
   const inWindow = samples.filter((s) => s.at >= cutoff && s.at <= now)
+  /**
+   * 🔴 **窗口内只剩一个点时，补一个「窗口外最后一个点」当基线**
+   *（2026-10-21 审查补，M6 指出）。
+   *
+   * ## 缺陷
+   * 采样是**每小时**一次，而默认窗口也恰好是**1 小时** ⇒ 两次采样在窗口
+   * 边界上「刚好卡住」。只要这一次采样比上一次**晚**几秒（网络抖动、
+   * 整点对齐偏差），上一个点就落到 `cutoff` 之外 ⇒ `inWindow.length < 2`
+   * ⇒ **静默不判**，整整一小时的爆发检测被跳过，而且没有任何日志。
+   *
+   * ## 为什么补「更老的那个点」是安全的
+   * 速率 = Δ消耗 / Δt。把基线往更早挪 ⇒ Δt **变大** ⇒ 算出的速率**更小**
+   * ⇒ 只会更**不容易**触发熔断。也就是失败方向朝「宁可不报」，
+   * 不会把慢速消耗误判成爆发（那正是本条注释上一句在防的事）。
+   */
+  if (inWindow.length === 1) {
+    const older = [...samples].reverse().find((s) => s.at < cutoff)
+    /**
+     * ⚠️ **只补「刚好越界」的那一个**，不是「随便找个更老的点」。
+     *
+     * 容差取 `max(10 秒, 窗口的 5%)`：
+     * - 1 小时窗口 ⇒ 容差 3 分钟，足够吸收「整点采样晚了几秒」
+     * - 5 分钟窗口 ⇒ 容差 10 秒，仍然**不会**把 10 分钟前的采样当基线
+     *   （既有测试 `burn-rate.test.ts` 明确要求「跨窗口不得判为 5 分钟爆发」）
+     */
+    const tolerance = Math.max(10_000, Math.floor(config.windowMs * 0.05))
+    if (older !== undefined && cutoff - older.at <= tolerance) inWindow.unshift(older)
+  }
   if (inWindow.length < 2) return undefined
 
   const first = inWindow[0]
