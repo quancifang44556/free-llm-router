@@ -24,6 +24,7 @@
  *    - `11115`/`11135` 是**请求的问题**，不罚号、也不换号。
  */
 
+import type { UsageRecord } from '../store/usage.js'
 import { resolveUpstream, type Env } from '../env.js'
 import { classify, type ErrorKind } from '../upstream/client.js'
 import { deriveDeviceId, referenceChatHeaders } from '../upstream/headers.js'
@@ -751,6 +752,38 @@ export interface GatewayResult {
 /**
  * 处理 `/v1/chat/completions`：**选号 → 转发 → 记账 → 失败换号**。
  */
+/**
+ * 记一条**请求级**失败用量（2026-10-21 审查补，M6 指出）。
+ *
+ * ## 缺陷
+ * 全库 `recordUsage` 的 4 个调用点**全部**写 `ok: true`，**没有任何**
+ * `ok: false` 的生产者 ⇒ 用量表里「失败」恒为 0 ⇒ **面板成功率恒 100%**。
+ * 用户据此判断「网关很稳」，而实际上整池失败全被静默吞掉。
+ *
+ * ## 口径
+ * 每个**请求**记一条（不是每个尝试记一条）：
+ * 一次请求轮了 3 个账号最终失败，若记 3 条会把「请求数」放大 3 倍、
+ * 把成功率进一步压低到失真。故用最后一个尝试的账号作为归属，并在
+ * `errorKind` 里带上分类原因（该字段此前从未被写过）。
+ */
+function recordRequestFailure(
+  pool: { recordUsage: (record: UsageRecord) => Promise<unknown> },
+  input: { uid: string; model: string; errorKind: string; startedAt: number },
+): void {
+  void pool
+    .recordUsage({
+      at: Date.now(),
+      uid: input.uid,
+      model: input.model,
+      input: 0,
+      output: 0,
+      ok: false,
+      errorKind: input.errorKind,
+      ms: Math.max(0, Date.now() - input.startedAt),
+    })
+    .catch(() => undefined)
+}
+
 export async function handleChatCompletions(
   request: Request,
   env: Env,
@@ -982,6 +1015,8 @@ export async function handleChatCompletions(
   // ⚠️ `tried` 必须**跨重试保留**，否则会在两个账号之间无限来回
   // （Go 侧 account-pool.ts:905-914 记录过这个缺陷）。
   const tried: string[] = []
+  // 请求级开始时刻（用于失败用量的 `ms`，见 `recordRequestFailure`）。
+  const requestStartedAt = Date.now()
   let lastError: { status: number; message: string; kind: string } | undefined
 
   // ⚠️ IP 级 WAF 拦截的**前置检查**：激活期内直接失败，**连一个号都不试**。
@@ -1164,6 +1199,15 @@ export async function handleChatCompletions(
         }
       }
 
+      // 🔴 记一条**请求级失败**（否则面板成功率恒 100%，见 `recordRequestFailure`）。
+      // ⚠️ 必须在 `if` **之外**：`lastError === undefined` 的那条「池里根本没账号」
+      // 同样是失败请求，漏记会让「零账号」场景完全不出现在用量里。
+      recordRequestFailure(pool, {
+        uid: tried[tried.length - 1] ?? '',
+        model,
+        errorKind: lastError?.kind ?? 'no_available_account',
+        startedAt: requestStartedAt,
+      })
       // 没有可用账号了：若之前有过失败，报最后一次的真实原因（更有信息量）
       if (lastError !== undefined) {
         return {
@@ -2087,6 +2131,7 @@ export async function handleProviderChat(input: {
       ? { ...(rawBody as Record<string, unknown>), model }
       : (rawBody as Record<string, unknown>)
   const tried = input.tried
+  const requestStartedAt = Date.now()
   let lastError: { status: number; message: string; kind?: string } | undefined
 
   // ⚠️ 会话 / 轮级 id 在重试循环**外**算一次（实测语义）：
@@ -3055,6 +3100,13 @@ export async function handleProviderChat(input: {
         blame.map((b) => `${b.uid.slice(0, 8)}/${b.kind}`).join(','),
     )
   }
+  // 🔴 请求级失败用量（emit 一次，不按尝试次数重复记）。
+  recordRequestFailure(pool, {
+    uid: tried[tried.length - 1] ?? '',
+    model: `${providerId}/${model}`,
+    errorKind: lastError?.kind ?? 'provider_error',
+    startedAt: requestStartedAt,
+  })
   return {
     response: jsonError(
       lastError?.status ?? 503,
