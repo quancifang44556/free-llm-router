@@ -347,8 +347,24 @@ test('🔴 裁剪只在 handleChatCompletions 接线一次（本项目吃过「�
   const prepareAt = payload.indexOf('export function prepareChatBody')
   assert.ok(!/trimMessagesByLimit/.test(payload.slice(prepareAt)), 'prepareChatBody 内不得再裁一次')
 
-  // 上限必须来自 env 解析入口，不能在业务代码里就地读字段
-  assert.ok(/resolveMaxContextMessages\(env\)/.test(server), '必须走 env.ts 的解析入口')
+  // 上限的**解析入口**必须唯一：面板配置（`SafetyConfig`）优先，
+  // 而它的默认值由 `resolveMaxContextMessages` 在 DO 内解析。
+  //
+  // ⚠️ 这条断言随架构改过一次：早先要求 server.ts 直接调 `resolveMaxContextMessages(env)`，
+  // 但那样「面板改了上限」就永远不生效（server 读 env、面板写 DO，两条路）。
+  // 现在 server.ts 只能读 `safety.maxContextMessages`，解析入口移到
+  // AccountPoolDO.getSafetyConfig —— 断言跟着钉住「唯一的解析入口」这个**意图**，
+  // 而不是钉住某个具体函数名出现在某个具体文件里。
+  assert.ok(server.includes('safety.maxContextMessages'), '上限必须来自面板配置')
+  assert.ok(
+    !/resolveMaxContextMessages/.test(server),
+    'server.ts 不得再直接解析环境变量（否则面板开关失效）',
+  )
+  const poolSrc = stripComments(readFileSync('src/pool/AccountPoolDO.ts', 'utf8'))
+  assert.ok(
+    /resolveMaxContextMessages\(this\.env\)/.test(poolSrc),
+    '解析入口必须仍走 env.ts（只在 DO 一处）',
+  )
 })
 
 test('裁剪日志只打条数与模型名，绝不打任何消息内容（隐私红线）', () => {

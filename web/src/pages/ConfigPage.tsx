@@ -1,4 +1,4 @@
-import { CalendarClock, Copy, Eye, EyeOff, Gauge, Lock, Route, ShieldAlert, ShieldCheck, Snowflake, Terminal } from 'lucide-react'
+import { CalendarClock, Copy, Eye, EyeOff, Gauge, Lock, Route, ShieldAlert, ShieldCheck, ShieldCog, Snowflake, Terminal } from 'lucide-react'
 import { useEffect, useMemo, useState, type ReactNode } from 'react'
 import { PageHeader } from '@/components/layout/PageHeader'
 import { Badge } from '@/components/ui/badge'
@@ -10,13 +10,16 @@ import { ProviderAvatar, Segmented, Skeleton } from '@/components/ui/misc'
 import { auth } from '@/lib/api'
 import {
   type RoutingConfig,
+  type SafetyConfig,
   type Strategy,
   useClearCooldowns,
   useClearWaf,
   useCredentialCount,
   usePermanentLocks,
   useRoutingConfig,
+  useSafetyConfig,
   useSaveRouting,
+  useSaveSafety,
   useSetPermanentLock,
   useWaf,
 } from '@/lib/config'
@@ -34,6 +37,7 @@ export function ConfigPage() {
         <div className="space-y-4 xl:col-span-3">
           <ConnectCard />
           <RoutingCard />
+          <SafetyCard />
         </div>
         <div className="space-y-4 xl:col-span-2">
           <StatusCard />
@@ -308,6 +312,8 @@ function NumField({
   min,
   max,
   ok,
+  step = 1,
+  zero,
   onChange,
 }: {
   label: string
@@ -316,18 +322,25 @@ function NumField({
   min: number
   max: number
   ok: boolean
+  /** 步长；`'any'` 表示这一项允许小数（QPS、分钟数都是小数量级）。 */
+  step?: number | 'any'
+  /** `value === 0` 时贴在标签旁的语义。0 不是「没填」，各字段含义不同，必须写出来。 */
+  zero?: string
   onChange: (v: number) => void
 }) {
   const id = `num-${label}`
+  const decimal = step === 'any' || !Number.isInteger(step)
   return (
     <div>
-      <label htmlFor={id} className="mb-1.5 block text-[13px] font-medium">
+      <label htmlFor={id} className="mb-1.5 flex items-center gap-2 text-[13px] font-medium">
         {label}
+        {zero && value === 0 && <Badge tone="neutral">{zero}</Badge>}
       </label>
       <Input
         id={id}
         type="number"
-        inputMode="numeric"
+        inputMode={decimal ? 'decimal' : 'numeric'}
+        step={step === 'any' ? 'any' : step}
         min={min}
         max={max}
         value={Number.isNaN(value) ? '' : value}
@@ -349,6 +362,150 @@ function ToggleRow({ title, desc, checked, onChange }: { title: string; desc: st
       </div>
       <Switch label={title} checked={checked} onCheckedChange={onChange} />
     </div>
+  )
+}
+
+// ── 防封 ──
+
+/** 熔断窗口在界面上用「分钟」呈现：毫秒没人能一眼读懂，而运维真正在算的是「60 分钟够不够覆盖采样间隔」。 */
+const MS_PER_MINUTE = 60_000
+
+/** 毫秒 → 分钟（保留 0.1 秒精度）。不这么归一化，33.333333 这类输入会回显成 33.333333333333336。 */
+const minutesOf = (ms: number) => (Number.isFinite(ms) ? Math.round(ms / 6) / 10_000 : Number.NaN)
+
+function SafetyCard() {
+  const q = useSafetyConfig()
+  const save = useSaveSafety()
+  const [form, setForm] = useState<SafetyConfig | null>(null)
+  useEffect(() => {
+    if (q.data) setForm(q.data)
+  }, [q.data])
+  const dirty = !!form && !!q.data && JSON.stringify(form) !== JSON.stringify(q.data)
+  const set = <K extends keyof SafetyConfig>(k: K, v: SafetyConfig[K]) => setForm((f) => (f ? { ...f, [k]: v } : f))
+
+  // 范围与后端一致。后端对越界值的选择是「忽略并保持原值」，前端若不先拦，用户会以为保存成功了。
+  const ctxOk = !!form && Number.isInteger(form.maxContextMessages) && form.maxContextMessages >= 0 && form.maxContextMessages <= 100_000
+  const windowOk = !!form && Number.isFinite(form.burnRateWindowMs) && form.burnRateWindowMs >= 0 && form.burnRateWindowMs <= 86_400_000
+  const pctOk = !!form && Number.isFinite(form.burnRateThresholdPct) && form.burnRateThresholdPct >= 0 && form.burnRateThresholdPct <= 100
+  const qpsOk = !!form && Number.isFinite(form.rateLimitQps) && form.rateLimitQps >= 0 && form.rateLimitQps <= 50
+  const jitterOk = !!form && Number.isInteger(form.rateJitterMs) && form.rateJitterMs >= 0 && form.rateJitterMs <= 10_000
+  const allOk = ctxOk && windowOk && pctOk && qpsOk && jitterOk
+
+  return (
+    <Card>
+      <Head
+        icon={<ShieldCog />}
+        title="防封"
+        desc="降低被上游风控判成机器行为的开关，可按需开关。五个数值项填 0 都有明确含义（不限制 / 关闭 / 不限速 / 不抖动），不是「没设置」。"
+        action={
+          form && (
+            <div className="flex gap-2">
+              {dirty && (
+                <Button variant="ghost" size="sm" onClick={() => q.data && setForm(q.data)}>
+                  还原
+                </Button>
+              )}
+              <Button size="sm" disabled={!dirty || !allOk || save.isPending} onClick={() => form && save.mutate(form)}>
+                {save.isPending ? '保存中…' : '保存'}
+              </Button>
+            </div>
+          )
+        }
+      />
+      {!form ? (
+        <div className="space-y-3 px-5 pb-5">
+          {q.isError ? (
+            <div className="border-danger/30 bg-danger/[0.06] rounded-lg border px-3.5 py-3">
+              <div className="text-danger flex items-center gap-2 text-[13px] font-medium">
+                <ShieldAlert className="size-4" /> 读取防封配置失败
+              </div>
+              <div className="text-muted-foreground mt-1 text-xs leading-relaxed">{q.error.message}</div>
+              <Button size="sm" variant="outline" className="mt-2.5" disabled={q.isFetching} onClick={() => q.refetch()}>
+                {q.isFetching ? '重试中…' : '重试'}
+              </Button>
+            </div>
+          ) : (
+            <>
+              <Skeleton className="h-14" />
+              <Skeleton className="h-28" />
+            </>
+          )}
+        </div>
+      ) : (
+        <div className="space-y-5 px-5 pb-5">
+          {q.isError && (
+            <div className="text-warning bg-warning/10 rounded-md px-3 py-2 text-xs leading-relaxed">
+              没读到最新配置（{q.error.message}），下面是上次读到的值；保存仍以表单为准。
+            </div>
+          )}
+
+          <div className="divide-y rounded-lg border">
+            <ToggleRow
+              title="会话链（b3 + x-conversation-*）"
+              desc="关掉 = 不再发 b3 三件套，请求失去可串联的链路特征；x-conversation-* 那 5 个是必需头（缺了上游直接回 11‑128），仍照发。"
+              checked={form.sessionTrace}
+              onChange={(v) => set('sessionTrace', v)}
+            />
+          </div>
+
+          <div className="grid gap-4 sm:grid-cols-2">
+            <NumField
+              label="单请求消息数上限"
+              hint="0 = 不限制；建议 300 —— 已观测到的封禁样本最少也带了 434 条消息。"
+              value={form.maxContextMessages}
+              min={0}
+              max={100_000}
+              ok={ctxOk}
+              zero="不限制"
+              onChange={(v) => set('maxContextMessages', v)}
+            />
+            <NumField
+              label="消耗熔断窗口（分钟）"
+              hint="0 = 关闭；窗口不能短于采样间隔（整点 cron ⇒ 至少 60 分钟），否则每轮都在跟自己的起点比，检测永远不会触发。"
+              value={minutesOf(form.burnRateWindowMs)}
+              min={0}
+              max={1440}
+              step="any"
+              ok={windowOk}
+              zero="已关闭"
+              onChange={(v) => set('burnRateWindowMs', Math.round(v * MS_PER_MINUTE))}
+            />
+            <NumField
+              label="消耗熔断阈值（%）"
+              hint="0 = 关闭；窗口内消耗掉的积分占窗口起点余额的百分比，超过就熔断。"
+              value={form.burnRateThresholdPct}
+              min={0}
+              max={100}
+              ok={pctOk}
+              zero="已关闭"
+              onChange={(v) => set('burnRateThresholdPct', v)}
+            />
+            <NumField
+              label="每账号 QPS 上限"
+              hint="0 = 不限速；开了之后同一账号的上游请求要排队，吞吐明显下降，只在上游 429 咬过之后才建议开（可填 0.5）。"
+              value={form.rateLimitQps}
+              min={0}
+              max={50}
+              step="any"
+              ok={qpsOk}
+              zero="不限速"
+              onChange={(v) => set('rateLimitQps', v)}
+            />
+            <NumField
+              label="请求前随机抖动（毫秒）"
+              hint="0 = 不抖动；每次请求前随机等 0~N 毫秒，把固定节奏打散。"
+              value={form.rateJitterMs}
+              min={0}
+              max={10_000}
+              step={100}
+              ok={jitterOk}
+              zero="不抖动"
+              onChange={(v) => set('rateJitterMs', v)}
+            />
+          </div>
+        </div>
+      )}
+    </Card>
   )
 }
 

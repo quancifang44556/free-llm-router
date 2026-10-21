@@ -71,6 +71,7 @@ import type { LoginCredential } from './upstream/auth.js'
 import { parseAuthDocument, parseAuthPayload } from './upstream/import.js'
 import { handleResponses } from './gateway/responses.js'
 import { handleChatCompletions, resetMaxRotateCache } from './gateway/server.js'
+import { resetSafetyConfigCache } from './gateway/safety.js'
 import {
   emptyApiKeyUsage,
   generateApiKey,
@@ -2992,6 +2993,26 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
     const cnPool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn'))
     await cnPool.setProviderSettings({ order, disabled })
     return json({ ok: true, order, disabled })
+  }
+
+  // ── 防封（风控规避）配置 ──
+  //
+  // ⚠️ 与 `/admin/config/routing` **同款双分片镜像**：配置读的是「发起该请求的
+  // realm」，只写 cn 会让国际版账号那一侧读到旧值（与永久积分锁同一个坑）。
+  if (path === '/admin/config/safety' && request.method === 'GET') {
+    const cnPool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn'))
+    const config = await cnPool.getSafetyConfig()
+    return json({ ok: true, config })
+  }
+  if (path === '/admin/config/safety' && request.method === 'POST') {
+    const body = (await request.json().catch(() => ({}))) as Record<string, unknown>
+    const cnPool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn'))
+    const config = await cnPool.setSafetyConfig(body)
+    const globalPool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('global'))
+    await globalPool.setSafetyConfig(config)
+    // 立刻失效网关侧缓存：否则面板点完还要等 TTL 才看到效果，用户会以为没保存。
+    resetSafetyConfigCache()
+    return json({ ok: true, config })
   }
 
   // ── 路由与调度策略配置 ──

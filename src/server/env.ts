@@ -115,6 +115,13 @@ export function createNodeRuntime(databasePath?: string): NodeRuntimeContext {
     // 在这里做任何兜底都会形成第二份判据，两处慢慢分叉（本项目已吃过多次亏）。
     BURN_RATE_WINDOW_MS: process.env.BURN_RATE_WINDOW_MS?.trim(),
     BURN_RATE_THRESHOLD_PCT: process.env.BURN_RATE_THRESHOLD_PCT?.trim(),
+    // ⚠️ **这个字段曾经漏在这里**：Workers 部署下 `env` 由平台直接绑定，
+    // 但 Node/Docker 部署要靠这段映射把 `process.env` 搬进 `Env`。
+    // 漏了它的后果是「文档里写了 `MAX_CONTEXT_MESSAGES`，Docker 里设了却毫无作用」
+    // —— 而且**没有任何报错**，只能靠实测发现（这条是被
+    // `tests/safety-config.test.ts` 的环境变量回落用例抓出来的）。
+    // 同为原样透传：解析与「0 = 不限制」的语义归 `resolveMaxContextMessages`。
+    MAX_CONTEXT_MESSAGES: process.env.MAX_CONTEXT_MESSAGES?.trim(),
   }
 
   const accountPoolNamespace = new NodeDurableObjectNamespace<AccountPoolDO>(

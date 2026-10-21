@@ -195,12 +195,47 @@ export function intlConversationHeaders(input: {
  * ⚠️ 会话 id 无法判定时（客户端没给 `user` / `conversation_id`）**退化为每请求随机**，
  * 且绝不从消息内容推断 —— 本项目纪律：宁可「不粘」也不能「错误地粘」。
  */
+/**
+ * 会话链**运行时开关**（面板「防封」分区控制，见 `SafetyConfig.sessionTrace`）。
+ *
+ * ## ⚠️ 为什么是模块级变量而不是参数
+ *
+ * 组装头的调用点有三处（`models.ts` 列目录、`buddy.ts` 发对话、内部委派），
+ * 而后者在 provider 内部、拿不到网关层的配置。要一路透传就得改
+ * `Provider.chat` 的签名 —— 为一个**全局唯一**的开关改一层接口不划算。
+ *
+ * ## ⚠️ 并发安全
+ *
+ * 该配置是**全局单值**（整个服务一个值），不存在「不同请求要不同值」的情况，
+ * 故模块级变量不会读串。若将来要按账号区分配置，必须改成参数透传。
+ */
+let sessionTraceEnabled = true
+
+/** 设置会话链开关（由网关按面板配置刷新）。 */
+export function setSessionTraceEnabled(enabled: boolean): void {
+  sessionTraceEnabled = enabled
+}
+
+/** 当前开关状态（供测试断言）。 */
+export function isSessionTraceEnabled(): boolean {
+  return sessionTraceEnabled
+}
+
 export function sessionTraceHeaders(input: {
   /** 客户端显式会话标识派生出的会话 id（空/缺省 ⇒ 每请求随机）。 */
   conversationId?: string
   /** 轮级 id：重试须复用（调用方在重试循环外算一次），缺省则现生成。 */
   turnRequestId?: string
 } = {}): HeaderMap {
+  // ⚠️⚠️ 这里**千万不能**整段 return {}。
+  //
+  // `intlConversationHeaders` 那 5 个会话头是 v0.1.2 为修「11‑128 渠道拦截
+  // 被误判成限流」而加的**必需头**：缺任一个上游直接回 11‑128，请求根本发不出去。
+  // 我第一版把开关写成「关掉 ⇒ 一个头都不发」，等于把这个开关做成了
+  // 「一键封掉国际服」—— 比不做开关更糟。
+  //
+  // 所以开关只作用在**本轮新增的 b3 三件套**上（那是可选的行为化特征，
+  // 没有它服务照常工作）；会话头族**恒发**。
   // ⚠️ 会话头族复用 `intlConversationHeaders`，**不另写一份**：
   // 两处各写一遍必然分叉（本项目已多次踩过「同一概念两套判据」）。
   // 它返回的 5 个头一条都不能少（缺任一个上游就回 11‑128）。
@@ -211,7 +246,8 @@ export function sessionTraceHeaders(input: {
   const conversationId = conversation['X-Conversation-ID'] ?? ''
   return {
     ...conversation,
-    ...b3TraceHeaders({ conversationId }),
+    // 只有 b3 受开关控制：它是**可选**的链路特征；会话头族是必需的。
+    ...(sessionTraceEnabled ? b3TraceHeaders({ conversationId }) : {}),
   }
 }
 

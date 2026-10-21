@@ -24,11 +24,13 @@
  *    - `11115`/`11135` 是**请求的问题**，不罚号、也不换号。
  */
 
-import { resolveMaxContextMessages, resolveUpstream, type Env } from '../env.js'
+import { resolveUpstream, type Env } from '../env.js'
 import { classify, type ErrorKind } from '../upstream/client.js'
 import { deriveDeviceId, referenceChatHeaders } from '../upstream/headers.js'
 import { deriveIntlConversationId, newTurnRequestId } from '../upstream/conversation.js'
 import { prepareChatBody, sanitizeChatBody, trimMessagesByLimit } from './payload.js'
+import { safetyConfigFor } from './safety.js'
+import { throttleUpstream } from './throttle.js'
 import { ERROR_CHECK_FRAMES, ERROR_HINT_PATTERN, aggregateSse, createFrameTranslator, detectErrorFrame, doneFrame, errorFrame, mayHaveUsage, parseSseLine, sseHeaders, translateFrame } from './stream.js'
 import { jsonError, parseRetryAfterMs } from './http.js'
 import {
@@ -657,6 +659,12 @@ export async function handleChatCompletions(
   // ⚠️ 在这里算一次、两条路径共用 —— 不各算一份（会分叉）。
   const sessionKey = await deriveSessionKey(rawBody)
 
+  // ── 防封配置（面板可改，10 秒 TTL 缓存）──
+  // ⚠️ 必须**早于裁剪**：裁剪上限本身来自这份配置。
+  // ⚠️ 这里单独建一个 stub 只为读配置：真正的 `pool` 要到分支里才建，
+  //    而裁剪必须在所有分支之前完成（否则又变成「只修一半」）。
+  const safety = await safetyConfigFor(env, env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm)))
+
   const rawModel =
     typeof (rawBody as Record<string, unknown>).model === 'string'
       ? ((rawBody as Record<string, unknown>).model as string)
@@ -680,7 +688,7 @@ export async function handleChatCompletions(
   // - 放在 `deriveSessionKey` **之后**：会话粘性 key 必须由**完整**历史算出，
   //   若先裁剪，裁掉的那几条会影响 key ⇒ 每轮 key 都在变 ⇒ 粘性失效、命中不了上游 prompt cache；
   // - 放在 `rawModel` **之后**：日志要带模型名（只带名字，不带任何消息内容）。
-  const maxContextMessages = resolveMaxContextMessages(env)
+  const maxContextMessages = safety.maxContextMessages
   if (maxContextMessages > 0 && rawBody !== null && typeof rawBody === 'object' && !Array.isArray(rawBody)) {
     const withMessages = rawBody as Record<string, unknown>
     if (Array.isArray(withMessages.messages)) {
@@ -1766,6 +1774,8 @@ export async function handleProviderChat(input: {
     let refreshFailure = ''
     let upstream: Response
     try {
+      // 防封：按账号排队 + 抖动（默认关闭，开关在面板「防封」分区）。
+      await throttleUpstream(picked.uid)
       upstream = await provider.chat(credential, {
         model, body, signal: request.signal,
         conversation: { conversationId: providerConversationId, turnRequestId: providerTurnRequestId },
@@ -1787,6 +1797,7 @@ export async function handleProviderChat(input: {
           const fresh = await provider.refresh(credential, AbortSignal.timeout(30_000))
           await pool.putCredential(picked.uid, fresh, Date.now())
           console.warn(`[refresh] ${providerId} 续期成功（catch 分支），已回写凭据`)
+          await throttleUpstream(picked.uid)
           const retry = await provider.chat(fresh, {
             model, body, signal: request.signal,
             conversation: { conversationId: providerConversationId, turnRequestId: providerTurnRequestId },

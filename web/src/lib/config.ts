@@ -38,6 +38,46 @@ export function useSaveRouting() {
   })
 }
 
+/**
+ * 防封（风控规避）配置。**全部即时生效**，改完不用重启。
+ *
+ * ⚠️ `0` 在五个数值字段上的语义**各不相同**（不限制 / 关闭 / 关闭 / 不限速 / 不抖动），
+ * 所以 UI 既不能把 0 当「没填」显示成空，也不能用 `|| 默认值` 兜底 ——
+ * 那是本项目反复吃过亏的 `parseInt(x) || 默认值` 同型缺陷。
+ */
+export interface SafetyConfig {
+  sessionTrace: boolean
+  maxContextMessages: number
+  burnRateWindowMs: number
+  burnRateThresholdPct: number
+  rateLimitQps: number
+  rateJitterMs: number
+}
+
+export function useSafetyConfig() {
+  return useQuery({
+    queryKey: ['safety'],
+    queryFn: () => api<{ config: SafetyConfig }>('/admin/config/safety').then((r) => r.config),
+    staleTime: 60_000,
+  })
+}
+
+export function useSaveSafety() {
+  const qc = useQueryClient()
+  return useMutation<SafetyConfig, Error, SafetyConfig>({
+    mutationFn: (v) => api<{ config: SafetyConfig }>('/admin/config/safety', { json: v }).then((r) => r.config),
+    onSuccess: (cfg) => {
+      // 后端会把越界值夹到合法区间，故必须用返回值覆盖缓存：表单跟着回到「真实生效值」，
+      // 否则用户看到的仍是自己填的那个数，会以为没保存成功。
+      qc.setQueryData(['safety'], cfg)
+      toast.success('防封配置已保存', {
+        description: '国内版和国际版分片都已生效，表单已回填后端实际生效的值。',
+      })
+    },
+    onError: (e) => toast.error('保存失败', { description: e.message }),
+  })
+}
+
 export function usePermanentLocks() {
   return useQuery({
     queryKey: ['perm-locks'],

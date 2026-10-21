@@ -25,7 +25,7 @@
 
 import { DurableObject } from 'cloudflare:workers'
 import type { Env } from '../env.js'
-import { resolveBurnRate } from '../env.js'
+import { resolveBurnRate, resolveMaxContextMessages } from '../env.js'
 import { appendBalanceSample, detectBurnRate } from './burn-rate.js'
 import {
   type AccountState,
@@ -354,6 +354,48 @@ export interface RoutingConfig {
   softCooldownSeconds: number
   autoTaskCron: boolean
   autoRefreshCredential: boolean
+}
+
+/**
+ * 防封（风控规避）配置。**全部即时生效**，改完不用重启 —— 面板写 DO，网关照读。
+ *
+ * ## ⚠️ 为什么单独于 {@link RoutingConfig} 一个键
+ *
+ * 两者的**受众**不同：`RoutingConfig` 影响「用哪个号」，`SafetyConfig` 影响
+ * 「请求长什么样」。混在一个键里会让「只想调限速」的写入也必须携带路由字段，
+ * 一旦某次合并写漏字段就会把路由策略悄悄重置。
+ *
+ * ## ⚠️ 默认值来自环境变量（不是硬编码）
+ *
+ * 本项目原先只有环境变量能配这些，已有部署依赖那一套。故 `getSafetyConfig()`
+ * 在**没有存过值**时回落到 `resolveMaxContextMessages` / `resolveBurnRate`，
+ * 保证「升级到有面板的版本」不会把一个原本配好的部署悄悄改回默认。
+ *
+ * ## ⚠️ `0` 的语义各不相同，每个字段都在注释里写清
+ */
+export interface SafetyConfig {
+  /**
+   * 会话链：补 `x-b3-*` 三件套与 `x-conversation-*` 链。
+   *
+   * 关掉 = 退回「孤立请求」形态（更像脚本、更不像官方客户端）。
+   * 默认 **true** —— 复盘里这是 P1 的核心对抗项。
+   */
+  sessionTrace: boolean
+  /** 单请求消息数上限。**`0` = 不限制**（不是「默认值」）。 */
+  maxContextMessages: number
+  /** 消耗速率熔断的观察窗口（ms）。**`0` = 关闭检测**。 */
+  burnRateWindowMs: number
+  /** 消耗速率熔断的阈值（百分比）。**`0` = 关闭检测**。 */
+  burnRateThresholdPct: number
+  /**
+   * 每账号 QPS 上限。**`0` = 不限速**（默认）。
+   *
+   * ⚠️ 限速是「刹车」不是「加速」：开启后同一账号的上游请求会被**排队**，
+   * 吞吐必然下降。只在被 429 咬过之后才值得开。
+   */
+  rateLimitQps: number
+  /** 每次上游请求前的随机抖动上限（ms）。**`0` = 不抖动**（默认）。 */
+  rateJitterMs: number
 }
 
 export class AccountPoolDO extends DurableObject<Env> {
@@ -686,6 +728,7 @@ export class AccountPoolDO extends DurableObject<Env> {
    * 缓存的系统路由与调度配置（避免每次 pick 高频读 storage）。
    */
   private cachedRoutingConfig?: RoutingConfig
+  private cachedSafetyConfig?: SafetyConfig
 
   /**
    * 解密凭据的内存缓存（避免每次对话高频执行 SQLite 读取与 AES-GCM 解密，节约 CPU 预算）。
@@ -773,6 +816,48 @@ export class AccountPoolDO extends DurableObject<Env> {
     }
     await this.ctx.storage.put('systemRoutingConfig', next)
     this.cachedRoutingConfig = next
+    return next
+  }
+
+  /** 获取防封配置（未存过 ⇒ 回落到环境变量，见 {@link SafetyConfig} 的说明）。 */
+  async getSafetyConfig(): Promise<SafetyConfig> {
+    if (this.cachedSafetyConfig !== undefined) return this.cachedSafetyConfig
+    const raw = await this.ctx.storage.get<Partial<SafetyConfig>>('systemSafetyConfig')
+    const envMax = resolveMaxContextMessages(this.env)
+    const envBurn = resolveBurnRate(this.env)
+    // 只接受范围内的有限数：越界/非数一律当「没存」，回落默认。
+    // ⚠️ 不能用 `||`：`0` 是合法且**有意义**的值（不限制 / 关闭 / 不限速）。
+    const num = (v: unknown, min: number, max: number): number | undefined =>
+      typeof v === 'number' && Number.isFinite(v) && v >= min && v <= max ? v : undefined
+    const config: SafetyConfig = {
+      // ⚠️ 只认显式 `false` 才算关；`undefined` / 非法值都保持开启。
+      sessionTrace: raw?.sessionTrace !== false,
+      maxContextMessages: num(raw?.maxContextMessages, 0, 100_000) ?? envMax,
+      burnRateWindowMs: num(raw?.burnRateWindowMs, 0, 86_400_000) ?? envBurn.windowMs,
+      burnRateThresholdPct: num(raw?.burnRateThresholdPct, 0, 100) ?? envBurn.thresholdPct,
+      // 限速与抖动是**新增**能力，环境变量里没有对应项 ⇒ 默认关闭。
+      rateLimitQps: num(raw?.rateLimitQps, 0, 50) ?? 0,
+      rateJitterMs: num(raw?.rateJitterMs, 0, 10_000) ?? 0,
+    }
+    this.cachedSafetyConfig = config
+    return config
+  }
+
+  /** 更新防封配置（部分字段；未提供的保持原值）。 */
+  async setSafetyConfig(input: Partial<SafetyConfig>): Promise<SafetyConfig> {
+    const cur = await this.getSafetyConfig()
+    const num = (v: unknown, min: number, max: number, fallback: number): number =>
+      typeof v === 'number' && Number.isFinite(v) && v >= min && v <= max ? v : fallback
+    const next: SafetyConfig = {
+      sessionTrace: typeof input.sessionTrace === 'boolean' ? input.sessionTrace : cur.sessionTrace,
+      maxContextMessages: num(input.maxContextMessages, 0, 100_000, cur.maxContextMessages),
+      burnRateWindowMs: num(input.burnRateWindowMs, 0, 86_400_000, cur.burnRateWindowMs),
+      burnRateThresholdPct: num(input.burnRateThresholdPct, 0, 100, cur.burnRateThresholdPct),
+      rateLimitQps: num(input.rateLimitQps, 0, 50, cur.rateLimitQps),
+      rateJitterMs: num(input.rateJitterMs, 0, 10_000, cur.rateJitterMs),
+    }
+    await this.ctx.storage.put('systemSafetyConfig', next)
+    this.cachedSafetyConfig = next
     return next
   }
 
@@ -1147,7 +1232,10 @@ export class AccountPoolDO extends DurableObject<Env> {
    * 分开写让这条「写完再判」的时序在代码上就看得见，不会被后人误合并成一次读改写。
    */
   private async enforceBurnRate(state: AccountState, now: number): Promise<void> {
-    const config = resolveBurnRate(this.env)
+    // ⚠️ 读**面板配置**而不是环境变量：面板改完要能立刻生效，
+    // 否则「关掉熔断」还得重启容器，用户会以为开关坏了。
+    const safety = await this.getSafetyConfig()
+    const config = { windowMs: safety.burnRateWindowMs, thresholdPct: safety.burnRateThresholdPct }
     // 关闭时直接返回：连判定函数都不进，省掉每条账号一次遍历。
     if (config.windowMs <= 0 || config.thresholdPct <= 0) return
 
