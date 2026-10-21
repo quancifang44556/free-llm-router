@@ -87,6 +87,7 @@ import {
   toApiKeyView,
 } from './store/apikeys.js'
 import { authenticate, countUse } from './gateway/authz.js'
+import { utc8DayKey } from './store/usage.js'
 import { fetchBalance } from './upstream/checkin.js'
 import { claimCompensation, fetchCompensationStatus } from './upstream/compensation.js'
 import { listTasks } from './upstream/tasks.js'
@@ -4367,7 +4368,7 @@ async function startRun(
     accessToken: input.accessToken,
   }
   const stub = env.TASK_RUNNER.get(env.TASK_RUNNER.idFromName(input.uid))
-  await stub.start(input.uid, steps, context, Date.now())
+  await stub.start(input.uid, steps, context, Date.now(), input.plan)
   return {
     ok: true,
     queued: steps.length,
@@ -4649,6 +4650,31 @@ async function scheduled(event: ScheduledController, env: Env): Promise<void> {
     const includeRealChat = isBuddy ? (job.includeRealChat ?? false) : false
 
     try {
+      /**
+       * 🔴 **按日去重**（2026-10-21 审查补，M6 指出「同一函数两套判据」）。
+       *
+       * 国际版的扇出（`fanOutIntlDailyChat`）会跳过「今天已成功」的账号，
+       * 而**国内这条循环没有**。于是只要 cron 在同一个小时窗口里被触发两次
+       *（进程恰在整点后 2 分钟内重启 —— `lastDispatchedHour` 是**进程内**变量，
+       * 重启即归零），`growth` 计划（含 5 个真实对话）就会**再烧一遍配额**。
+       *
+       * 修法：与「上一次已跑完同一计划且落在今天（UTC+8）」的账号直接跳过。
+       * 日键用 `utc8DayKey` —— 与项目其它日界（签到、额度）同一条纪律，
+       * 不能用本机时区。
+       *
+       * ⚠️ 只对 **cron 扇出**去重，**不影响**面板上的「手动执行」：
+       * 用户点了就是要现在再跑一遍，那是显式意图。
+       */
+      const status = await env.TASK_RUNNER.get(env.TASK_RUNNER.idFromName(account.uid)).status(account.uid)
+      if (
+        status !== undefined
+        && status.finished
+        && status.plan === planToRun
+        && utc8DayKey(status.startedAt) === utc8DayKey(now)
+      ) {
+        console.log(`[cron] 账号 ${account.uid} 今天已跑完 ${planToRun}，跳过（防重复烧配额）`)
+        continue
+      }
       await startRun(env, {
         uid: account.uid,
         nickname: account.nickname,

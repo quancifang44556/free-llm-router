@@ -59,7 +59,23 @@ export class TaskRunnerDO extends DurableObject<Env> {
    * 幂等：若已有未完成的运行，**不覆盖**，直接返回当前状态 ——
    * 避免 Cron 重复触发把队列重置成初始态（Go 侧靠 `q.running` 防重入）。
    */
-  async start(uid: string, steps: TaskStep[], context: RunContext, now: number): Promise<RunState> {
+  async start(
+    uid: string,
+    steps: TaskStep[],
+    context: RunContext,
+    now: number,
+    /**
+     * 计划名（`daily` / `growth` / `intlDaily` …）。
+     *
+     * 🔴 **必须传**（2026-10-21 审查补，M6 #8）：`RunState.plan` 此前**从未被写入**，
+     * 于是任务日志里每一行的计划名都恒为 `daily` —— 用户分不清「这次跑的是签到
+     * 还是含 5 个真实对话的 growth」，也就无法判断配额被谁烧掉。
+     *
+     * 它同时是**按日去重**的键：cron 扇出要跳过「今天已经跑完同一计划」的账号，
+     * 没有 plan 就无法区分「今天跑过 growth」和「今天只跑过签到」。
+     */
+    plan?: string,
+  ): Promise<RunState> {
     const existing = await this.load(uid)
     /** 判死时记下的原因，要带进**新一轮**（否则面板只看到「凭空重来」）。 */
     let staleNote = ''
@@ -93,6 +109,7 @@ export class TaskRunnerDO extends DurableObject<Env> {
 
     const state: RunState = {
       uid,
+      plan,
       queue: steps,
       done: [],
       finished: false,
