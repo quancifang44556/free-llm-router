@@ -552,3 +552,52 @@ test('🔴 provider 路径必须受 WAF / 11140 全局闸门保护（此前完�
     rt.cleanup()
   }
 })
+
+test('🔴 provider 返回非 2xx 时必须按业务语义罚，不能一律熔断', async () => {
+  // 2026-10-21 审查（M4）指出的**严重**项：`handleProviderChat` 的 HTTP 非 2xx 分支
+  // 把 `classify()` 的结论只用于 channel_blocked，其余一律硬编码 `breaker`。
+  // 而 opencode / trae 两家**返回非 2xx Response**（其余家抛异常），
+  // 于是它们的 400/401/403 全部把健康号熔断 30 分钟起（还按 2^retryCount 递增到 6h）。
+  //
+  // 同文件的 SSE 预读分支**已经**用了 mapErrorToPunishment —— 又是一处「只修一半」。
+  // 本测试钉住：400（参数类，不罚号）不得产生任何冷却。
+  const rt = freshRuntime('non2xx-no-breaker')
+  try {
+    const provider = findProvider('opencode')
+    assert.ok(provider !== undefined)
+    const originalChat = provider.chat
+    const originalLog = console.log
+    const originalWarn = console.warn
+    console.log = () => {}
+    console.warn = () => {}
+    provider.chat = (async () => new Response(
+      '{"code":11101,"message":"invalid parameter: messages"}',
+      { status: 400, headers: { 'content-type': 'application/json' } },
+    )) as never
+    try {
+      const pool = rt.env.ACCOUNT_POOL.get(rt.env.ACCOUNT_POOL.idFromName('cn'))
+      await addAccount(pool, 'n1', { provider: 'opencode' })
+      await pool.putCredential('n1', { uid: 'n1', nickname: 'n1', accessToken: 't', refreshToken: '', expiresAt: Date.now() + 3600_000 }, Date.now())
+
+      const res = await handleProviderChat({
+        providerId: 'opencode', model: 'm', wantsStream: false,
+        rawBody: { model: 'm', messages: [{ role: 'user', content: 'hi' }] },
+        request: new Request('https://example.test/v1/chat/completions', { method: 'POST', headers: {} }),
+        env: rt.env, realm: 'cn', tried: [], sessionKey: '', failoverDepth: 1,
+      })
+      await res.response.text()
+
+      const acc = (await pool.listAccounts('cn', Date.now())).find((a) => a.uid === 'n1')
+      assert.ok(acc !== undefined)
+      assert.equal(acc.breakerUntil, 0, '⚠️ 400 参数错误不得熔断账号')
+      assert.equal(acc.fails, 0, '失败计数也不该涨')
+      assert.equal(acc.until, 0, '也不该产生冷却')
+    } finally {
+      provider.chat = originalChat
+      console.log = originalLog
+      console.warn = originalWarn
+    }
+  } finally {
+    rt.cleanup()
+  }
+})

@@ -2632,7 +2632,38 @@ export async function handleProviderChat(input: {
       //
       // 复用与 buddy 路径相同的细分判据，避免两条路径口径分叉
       //（此前 buddy 路径已细分、这里没有 —— 同一个 bug 修了一半）。
-      const refined = refineModelScoped(upstream.status === 429 ? 'rate_limited' : 'unknown', text)
+      /**
+       * 🔴 **必须用 `classify()` 的结论决定「罚不罚、罚哪个维度」**
+       *（2026-10-21 审查补，M4 指出的**严重**项）。
+       *
+       * ## 缺陷
+       * 本分支原来把 `classified.kind` **只**用于判 `channel_blocked`，
+       * 其余非 2xx 一律硬编码：
+       * ```
+       * const failureKind = 402 ? 'hard' : 429 ? refined.dimension : 'breaker'
+       * ```
+       * ⇒ opencode / trae 这两家（**返回非 2xx Response** 而非抛异常）的
+       * `400 / 401 / 403 / 404` 全部落 `breaker` ⇒ 3 次熔断健康号 30 分钟起，
+       * 且 `AccountPoolDO` 还按 `2^retryCount` 递增到 6 小时。
+       *
+       * ## 为什么这是「只修一半」的第 N 次
+       * **同一个文件里**的 SSE 预读分支（`2681` 起）**已经**用
+       * `mapErrorToPunishment(kind)` 正确判定了 —— 只有这条 HTTP 非 2xx 分支没改。
+       * 于是「上游用 SSE 帧报错」和「上游用 HTTP 状态码报错」表现完全不同，
+       * 而这两条路径**服务的是同一批 provider**。
+       *
+       * ## 修法
+       * 与 SSE 分支同口径：`mapErrorToPunishment` 决定 `punish` 与 `dimension`，
+       * `refineModelScoped` 在 `rate_limited` 时细分到模型级，
+       * `modelCauseFor` 把「无此模型/档位拒绝」的结构化成因一并带给池。
+       */
+      const pm = mapErrorToPunishment(classified.kind)
+      const refined = refineModelScoped(
+        // 429 一律按「限流」细分（`classify` 对无信封的 429 也返回 rate_limited，
+        // 这里显式兜一层，避免上游回 429 但文案没码时被判成 unknown 而失去模型级细分）
+        upstream.status === 429 ? 'rate_limited' : classified.kind,
+        text,
+      )
       // ⚠️ **文案解析不到时，退回标准的 `Retry-After` 头**。
       //
       // 上游文案格式**随时可能改**（`reset at … UTC+8` 是我们逆向出来的），
@@ -2647,25 +2678,39 @@ export async function handleProviderChat(input: {
         : undefined
       const resolvedResetAt = refined.resetAt
         ?? (retryAfterMs === undefined ? undefined : Date.now() + retryAfterMs)
-      const failureKind: 'soft' | 'hard' | 'model' | 'breaker' =
+      /**
+       * `punish === false` 的一律**不写冷却**（如 `bad_request` / `auth_error` /
+       * `model_unavailable` 之类参数或凭据问题）—— 罚健康账号是本项目最贵的错误。
+       * 402 例外保留：它语义上就是「余额耗尽」，必须硬冷却。
+       */
+      // ⚠️ 直接透传 `pm.dimension`，**不做有损映射**：
+      // 一度写成 `model/soft/else breaker`，结果把 hard / session_dead / restricted
+      // 三个维度全并成了 breaker —— 那正是本项目反复出现的「映射时丢语义」。
+      const failureKind: typeof pm.dimension | undefined =
         upstream.status === 402
           ? 'hard'
-          : upstream.status === 429
-            ? refined.dimension
-            : 'breaker'
-      await pool
-        .applyFailure({
-          uid: picked.uid,
-          kind: failureKind,
-          now: Date.now(),
-          ...(model !== '' ? { model } : {}),
-          // ⚠️ 带上上游给的重置时刻（文案里的 `reset at … UTC+8`，
-          // 或标准 `Retry-After` 头）：模型级冷却据此对齐上游墙钟，
-          // 而不是我们自己猜 6 小时。
-          ...(resolvedResetAt !== undefined ? { resetAt: resolvedResetAt } : {}),
-          reason: `${providerId} http=${upstream.status}: ${text.slice(0, 160)}`,
-        })
-        .catch(logPoolError('applyFailure'))
+          : pm.punish
+            ? (upstream.status === 429 || classified.kind === 'rate_limited'
+              ? refined.dimension
+              : pm.dimension)
+            : undefined
+      if (failureKind !== undefined) {
+        const cause = modelCauseFor(classified.kind)
+        await pool
+          .applyFailure({
+            uid: picked.uid,
+            kind: failureKind,
+            now: Date.now(),
+            ...(model !== '' ? { model } : {}),
+            // ⚠️ 带上上游给的重置时刻（文案里的 `reset at … UTC+8`，
+            // 或标准 `Retry-After` 头）：模型级冷却据此对齐上游墙钟，
+            // 而不是我们自己猜 6 小时。
+            ...(resolvedResetAt !== undefined ? { resetAt: resolvedResetAt } : {}),
+            reason: `${providerId} http=${upstream.status}: ${text.slice(0, 160)}`,
+            ...(cause !== undefined ? { modelCause: cause } : {}),
+          })
+          .catch(logPoolError('applyFailure'))
+      }
       // ⚠️ 同上：不原样透传上游状态码（避免把网关故障伪装成客户端的 400）
       lastError = {
         status: clientStatusFor(upstream.status, 'unknown'),

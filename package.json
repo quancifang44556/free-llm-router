@@ -1,6 +1,6 @@
 {
   "name": "free-llm-router",
-  "version": "0.9.27",
+  "version": "0.9.28",
   "private": true,
   "type": "module",
   "description": "free-llm-router —— 多供应商账号池 + 任务自动化 + OpenAI 兼容 API 聚合（Cloudflare Workers）",
