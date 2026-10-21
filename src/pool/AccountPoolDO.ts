@@ -32,6 +32,7 @@ import {
   createAccountState,
   healthy,
   healthyForModel,
+  dispatchGapOk,
   isActive,
   modelExempt,
   normalizeAccountState,
@@ -627,6 +628,27 @@ export class AccountPoolDO extends DurableObject<Env> {
       candidates.push(state)
     }
 
+    // ── 派发节奏（单号最小间隔，借鉴 qoder2api-hub 的 traffic guard）──
+    //
+    // 把「刚发过、还没到间隔」的账号**排到末尾**，而不是滤掉：
+    // - 滤掉会让单账号池永久选不到号（一个请求都发不出去）；
+    // - 排到末尾在有多号时自然分散节奏，只有一号时退化为「照发」——
+    //   这正是我们要的：宁可节奏差一点，也不能把服务卡死。
+    //
+    // ⚠️ 排序必须**稳定**：同一批候选每次排出来的顺序要一致，否则
+    // 会话粘性会在两个号之间反复横跳（那是更明显的异常画像）。
+    if (candidates.length > 1) {
+      const paced: AccountState[] = []
+      const rushed: AccountState[] = []
+      for (const c of candidates) {
+        if (dispatchGapOk(c, now)) paced.push(c)
+        else rushed.push(c)
+      }
+      // 只有真的存在「节奏已就绪」的账号时才重排：全部未就绪 = 池子太小，
+      // 保持原顺序（原顺序里含粘性/权重等既有优先级，不要破坏它）。
+      if (paced.length > 0) candidates.splice(0, candidates.length, ...paced, ...rushed)
+    }
+
     // ── 指定账号命中 / 不可用 ──
     //
     // ⚠️ 放在「候选为空」判断**之前**：「只用它」时即便别的号全挂了，
@@ -781,9 +803,42 @@ export class AccountPoolDO extends DurableObject<Env> {
     return this.recentlyPicked.get(uid) ?? 0
   }
 
-  /** 记录该账号刚被选中。 */
+  /**
+   * 记录该账号刚被选中：内存一份（"最近选中"排序）+ **落库一份**（派发节奏）。
+   *
+   * ⚠️ 两件事必须在**同一个入口**发生：选号有 5 处调用点（指定号/粘性号/
+   * 兜底号等），若只在其中一处落库，走其他分支的请求就绕过了最小间隔，
+   * 守卫会出现"时灵时不灵"的间歇性失效 —— 这种缺陷最难查。
+   */
   private notePicked(uid: string, now: number): void {
     this.recentlyPicked.set(uid, now)
+    this.recordDispatch(uid, now)
+  }
+
+  /**
+   * 持久化「上次派发时刻」——**单号最小间隔的唯一权威来源**。
+   *
+   * ⚠️ 必须落库，不能只放内存：`recentlyPicked` 是内存 Map，
+   * Durable Object 被驱逐后即丢失，而驱逐在空闲几分钟后随时发生。
+   * 若守卫读的是内存值，则「重启后第一个请求」永远跳过间隔判定 ——
+   * 恰好是最需要限速的时刻（冷启动后客户端往往一次补发多条）。
+   *
+   * ⚠️ 只更新这一个字段，**不碰健康状态**：节奏是"选谁"的事，
+   * 不是"能不能用"的事（见 `AccountState.lastUsedAt` 的注释）。
+   */
+  private recordDispatch(uid: string, now: number): void {
+    const raw = readAccount(this.ctx.storage.sql, uid)
+    if (raw === undefined || raw === '') return
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(raw)
+    } catch {
+      return
+    }
+    const state = normalizeAccountState(parsed)
+    if (state === undefined) return
+    state.lastUsedAt = now
+    writeAccount(this.ctx.storage.sql, state.uid, state.realm, JSON.stringify(state), now)
   }
 
   /**
