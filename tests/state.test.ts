@@ -414,27 +414,35 @@ test('🔴 误判可人工解冻：clear 端点必须支持按 uid 解除单个�
   assert.match(pool, /state\.fails = 0/, '解除限制时应同时清失败计数')
 })
 
-test('🔴 限速模块必须有开启途径（否则写好也永远关着）', async () => {
-  // ## 真实缺陷
-  // `src/gateway/throttle.ts` 实现了按 uid 限速 + 抖动，防封的「节奏」层。
-  // 但 `safety.ts` 的 envFallback 里 `rateLimitQps` **硬编码 0**，
-  // 且无环境变量、面板无端点 ⇒ 模块写好了却永远关着。
+test('🔴 限速配置的**优先级**（面板值静默覆盖环境变量，实测踩过）', async () => {
+  // ## 排查实录（值得记住的失败链）
+  // 现象：容器里注入 `RATE_LIMIT_QPS=0.5`，但连打 4 次耗时都是 ~1s，没有任何延迟。
+  // 我先后误判为：①构建产物没含新代码 ②DO 实例缓存未失效 ③`this.env` 在 DO
+  // 里不可见。**全都不是。**
+  // 真实原因：数据库 `system_kv` 里**早就存了** `systemSafetyConfig`
+  // （`rateLimitQps: 0`），而 `num(raw?.rateLimitQps, ...)` 返回 0 且 0 是合法值
+  // ⇒ 永远走不到环境变量回落。
   //
-  // 这同一文件里其它配置（MAX_CONTEXT_MESSAGES / BURN_RATE_*）**都有**
-  // 环境变量回落，注释明写「不能把人配好的东西悄悄改回默认」。限速是个例外，
-  // 属于漏做，不是有意设计。
+  // 结论：**面板存值 > 环境变量 > 代码默认**。排查"限速不生效"必须先看
+  // `GET /admin/config/safety`，而不是查代码或环境变量。
   const { readFileSync } = await import('node:fs')
-  const src = readFileSync('src/gateway/safety.ts', 'utf8')
+  const doSrc = readFileSync('src/pool/AccountPoolDO.ts', 'utf8')
 
-  assert.match(src, /RATE_LIMIT_QPS/, '必须能用环境变量开启限速')
-  assert.match(src, /RATE_JITTER_MS/, '抖动也必须可配（固定间隔本身是机器特征）')
-  // 默认必须仍是关闭：限速会改变现有吞吐，不能升级后自动生效
-  assert.match(src, /raw\.trim\(\) === ''\) return 0/, '未设置时必须回落 0（关闭）')
-  // 非法值也必须回落关闭，而不是 NaN（NaN 会让每次请求都算出一个无效等待）
-  assert.match(src, /Number\.isFinite\(n\) && n > 0 \? n : 0/, '非法值必须回落关闭')
-  // 不能硬编码 0 了事（这正是缺陷本身）
-  assert.ok(
-    !/^\s+rateLimitQps: 0,$/m.test(src),
-    'rateLimitQps 不能硬编码 0 —— 那等于这个模块永远不生效',
+  // 面板值优先：必须是 `num(raw?...) ?? 回落` 的顺序，不能反过来
+  assert.match(
+    doSrc,
+    /rateLimitQps: num\(raw\?\.rateLimitQps, 0, 50\) \?\? resolveRateLimitQps\(this\.env\)/,
+    '面板值必须优先于环境变量（顺序反了会让面板失去作用）',
   )
+  assert.match(
+    doSrc,
+    /rateJitterMs: num\(raw\?\.rateJitterMs, 0, 10_000\) \?\? resolveRateJitterMs\(this\.env\)/,
+    '抖动同理',
+  )
+
+  const safetySrc = readFileSync('src/gateway/safety.ts', 'utf8')
+  assert.match(safetySrc, /export function resolveRateLimitQps/, '解析函数必须可被 DO 复用')
+  assert.match(safetySrc, /export function resolveRateJitterMs/, '同上')
+  // 默认必须是 0（关闭）：限速改变吞吐，不能升级后自动生效
+  assert.match(safetySrc, /return Number\.isFinite\(n\) && n > 0 \? n : 0/, '非法值回落关闭')
 })

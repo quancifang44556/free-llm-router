@@ -59,7 +59,7 @@ export function resetSafetyConfigCache(): void {
  * ⚠️ 本项目跑在 **Node 单容器**（非 Workers），所以 `throttle.ts` 里
  * 「多 isolate 各一份状态」的已知限制在这里**不成立** —— 限速是精确的。
  */
-function resolveRateLimitQps(env: Env): number {
+export function resolveRateLimitQps(env: Env): number {
   const raw = (env as { RATE_LIMIT_QPS?: string }).RATE_LIMIT_QPS
   if (raw === undefined || raw.trim() === '') return 0
   const n = Number(raw)
@@ -73,7 +73,7 @@ function resolveRateLimitQps(env: Env): number {
  * 固定间隔本身也是一种"机器特征"：每 1000ms 一次，比随机间隔更像脚本。
  * 抖动让节奏接近人类。只有 `RATE_LIMIT_QPS > 0` 时才有意义。
  */
-function resolveRateJitterMs(env: Env): number {
+export function resolveRateJitterMs(env: Env): number {
   const raw = (env as { RATE_JITTER_MS?: string }).RATE_JITTER_MS
   if (raw === undefined || raw.trim() === '') return 0
   const n = Number(raw)

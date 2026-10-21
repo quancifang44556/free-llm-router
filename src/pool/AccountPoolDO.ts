@@ -26,6 +26,9 @@
 import { DurableObject } from 'cloudflare:workers'
 import type { Env } from '../env.js'
 import { resolveBurnRate, resolveMaxContextMessages } from '../env.js'
+// ⚠️ 限速参数解析放在 `gateway/safety.ts`（与 `envFallback` 同处），
+// 由 DO 在"面板没存值"时回落到此 —— 这是限速唯一的开启途径。
+import { resolveRateJitterMs, resolveRateLimitQps } from '../gateway/safety.js'
 import { appendBalanceSample, detectBurnRate } from './burn-rate.js'
 import {
   type AccountState,
@@ -867,9 +870,26 @@ export class AccountPoolDO extends DurableObject<Env> {
       maxContextMessages: num(raw?.maxContextMessages, 0, 100_000) ?? envMax,
       burnRateWindowMs: num(raw?.burnRateWindowMs, 0, 86_400_000) ?? envBurn.windowMs,
       burnRateThresholdPct: num(raw?.burnRateThresholdPct, 0, 100) ?? envBurn.thresholdPct,
-      // 限速与抖动是**新增**能力，环境变量里没有对应项 ⇒ 默认关闭。
-      rateLimitQps: num(raw?.rateLimitQps, 0, 50) ?? 0,
-      rateJitterMs: num(raw?.rateJitterMs, 0, 10_000) ?? 0,
+      // 限速与抖动：面板未存值时**回落环境变量**（`RATE_LIMIT_QPS` / `RATE_JITTER_MS`）。
+      //
+      // ## 优先级（实测踩过坑，务必按这个顺序理解）
+      //   1. 面板存过的值（`systemSafetyConfig`）—— **最高优先，环境变量改不动它**
+      //   2. 没存过才用环境变量
+      //   3. 都没有才是 0（关闭）
+      //
+      // ⚠️ **这是最容易误判的一层**：我在排查「配了 `RATE_LIMIT_QPS=0.5` 却不生效」时，
+      // 先怀疑了构建产物、DO 生命周期、`this.env` 可见性，全都不是。真实原因是
+      // 数据库里**早就存了** `systemSafetyConfig`（含 `rateLimitQps: 0`），
+      // `num(raw?.rateLimitQps, ...)` 返回 0 且 0 是合法值，于是**永远不会**走到回落。
+      //
+      // 教训：限速不生效时**先查面板配置（`GET /admin/config/safety`）**，
+      // 而不是查环境变量或代码路径 —— 面板值会静默覆盖环境变量。
+      //
+      // ⚠️ 这里原先写死 `?? 0`，注释理由是「环境变量里没有对应项」。那在当时是事实，
+      // 但后果是：一旦 `systemSafetyConfig` 不存在（新部署），限速就**只能是关的**。
+      // 与同函数的 maxContextMessages / burnRate* 保持同一口径，限速不该是例外。
+      rateLimitQps: num(raw?.rateLimitQps, 0, 50) ?? resolveRateLimitQps(this.env),
+      rateJitterMs: num(raw?.rateJitterMs, 0, 10_000) ?? resolveRateJitterMs(this.env),
     }
     this.cachedSafetyConfig = config
     return config
