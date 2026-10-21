@@ -374,18 +374,26 @@ test('⚠️ 模型目录的候选筛选必须与 chat 的健康判据一致', (
   const src = readFileSync('src/index.ts', 'utf8')
   const i = src.indexOf("if (path === '/admin/providers/models'")
   const block = src.slice(i, i + 6000)
-  assert.ok(/a\.disabled === true/.test(block), '应跳过 disabled 账号')
-  // ⚠️ 判据必须是**四个字段全都查**：
-  // 2026-10-21 审查（M5）发现这里只查了三个，漏了 `restrictedUntil`（上游封号）
-  // 与 `degradeUntil`（连续业务失败降权）—— 这两种号会被排到前面去白打上游，
-  // 表现仍是「模型列表报登录态过期，而池里明明有好号」。
-  // 也就是说：上一段注释说的「选号策略不一致」，只修了「取第一个」，没修「坏号的定义」。
-  for (const field of ['until', 'breakerUntil', 'restrictedUntil', 'degradeUntil']) {
-    assert.ok(
-      new RegExp(`a\\.${field} > nowMs`).test(block) || new RegExp(`a\\.${field} > Date\\.now\\(\\)`).test(block),
-      `应跳过 ${field} 未到期的账号（与 pick() 的健康判据保持一致）`,
-    )
-  }
+  /**
+   * 🔴 **不得手抄判据，必须复用 `healthy()`**（2026-10-21 审查补，重复实现专项）。
+   *
+   * 这个位置已经付过一次学费：M5 时发现它只查了 3 个字段、漏了
+   * `restrictedUntil`（上游封号）与 `degradeUntil`（连续业务失败降权），
+   * 坏号被排到前面白打上游，表现是「模型列表报登录态过期，而池里明明有好号」。
+   *
+   * 后来把 5 个字段补齐了 —— 但那仍然是**手抄**：`healthy()` 下次加第 6 个维度时，
+   * 这里会静默漏判，且**没有任何测试会红**。
+   *
+   * 所以断言改成「必须调用 `healthy(`」＋「不得再出现手抄的字段比较」。
+   */
+  assert.ok(
+    /healthy\(a, Date\.now\(\)\)/.test(block),
+    '候选筛选必须复用 `healthy(a, Date.now())`，不要手抄一份判据',
+  )
+  assert.ok(
+    !/a\.(until|breakerUntil|restrictedUntil|degradeUntil)\s*>/.test(block),
+    '这里不该再出现手抄的字段比较 —— 判据只能有一份（state.ts 的 healthy）',
+  )
 })
 
 test('🔴 供应商关闭必须真的关掉（服务端状态 + 双向拦截）', () => {

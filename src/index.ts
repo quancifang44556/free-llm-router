@@ -20,7 +20,7 @@
 
 import { TaskRunnerDO, type RunContext, type TaskStep } from './taskrunner/TaskRunnerDO.js'
 import { classify } from './upstream/client.js'
-import { diagnoseAccount } from './pool/state.js'
+import { diagnoseAccount, healthy } from './pool/state.js'
 import { AccountPoolDO } from './pool/AccountPoolDO.js'
 import { planByName, type PlanName } from './taskrunner/plans.js'
 import { cstDay } from './upstream/travel.js'
@@ -1180,13 +1180,26 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
     console.error(
       `[unhandled] ${request.method} ${url?.pathname ?? '(bad url)'} → ${message}\n${stack}`,
     )
-    // 回给客户端**可读原因**（而不是 `error code: 1101`）。
+    /**
+     * 🔴 **不回显内部异常原文**（2026-10-21 审查补，安全面专项）。
+     *
+     * 原来直接把 `error.message` 拼进响应。任何持 key 者（含配额最紧的子密钥）
+     * 都能稳定把内部文案读回来 —— 实测 `POST body: null` 就回
+     * `服务内部错误：Cannot read properties of null (reading 'model')`；
+     * 而这通道对 `SQLITE_*`、文件路径、表名同样直通。
+     *
+     * 改为：对外固定文案 + 一个 `traceId`（与日志里的同一串），
+     * 用户报障时给这个 id，我们按它去日志里找完整堆栈。
+     */
+    const traceId = crypto.randomUUID().slice(0, 8)
+    console.error(`[unhandled] traceId=${traceId}（对外不再回显内部原因）`)
     return new Response(
       JSON.stringify({
         error: {
-          message: `服务内部错误：${message}`,
+          message: `服务内部错误，请稍后重试（如反复出现请把 traceId 反馈给我们：${traceId}）`,
           type: 'internal_error',
           code: 'internal_error',
+          traceId,
         },
       }),
       { status: 500, headers: { 'content-type': 'application/json; charset=utf-8' } },
@@ -3311,9 +3324,10 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
          * 这正是本段注释上一段在描述的那个缺陷（「选号策略不一致」）的**另一半**：
          * 换了「逐个尝试」解决了「第一个是坏号」，但坏号的**定义**仍然不同。
          */
-        const nowMs = Date.now()
-        if (a.until > nowMs || a.breakerUntil > nowMs) continue
-        if (a.restrictedUntil > nowMs || a.degradeUntil > nowMs) continue
+        // ⚠️ 直接复用 `healthy()`，不再手抄一份判据（2026-10-21 审查补，重复实现专项）。
+        // 手抄的代价已经付过一次（漏了 `restrictedUntil`/`degradeUntil`）；
+        // 下次 `healthy()` 加第 6 个维度时，这里会自动跟上，不用靠人记得。
+        if (!healthy(a, Date.now())) continue
         candidates.push({ pool: candidatePool, uid: a.uid })
       }
     }
@@ -4290,9 +4304,24 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
         'no_available_account',
       )
     }
+    /**
+     * 🔴 **子密钥的模型白名单必须作用于目录本身**（2026-10-21 审查补，安全面专项）。
+     *
+     * 原来这个分支**从未引用 `subkeyRecord`**（`grep subkeyRecord` 只在两个 POST
+     * 分支里出现），于是受限子密钥 `GET /v1/models` 能拿到部署方的**全量**目录
+     *（含未授权模型、`?realm=global` 的另一分片）—— 而同一个 key 打 chat 却被 403。
+     *
+     * 后果不是「能白用模型」（POST 侧确实拦），而是**信息暴露**：
+     * 受限方据此精挑被禁模型去试探，也暴露了内部模型规划。
+     */
+    const allowlist = subkeyRecord?.limits.models ?? []
+    const visible = allowlist.length === 0
+      ? data
+      : data.filter((m) => modelAllowed(String(m.id ?? ''), allowlist))
+
     return json({
       object: 'list',
-      data,
+      data: visible,
       ...(errors.length === 0 ? {} : { errors }),
       disabledCount: disabledTotal,
     })
@@ -4364,8 +4393,22 @@ async function subkeyModelDenied(
   const probe = request.clone()
   const body = (await readJsonCapped(probe).catch(() => undefined)) as { model?: unknown } | undefined
   const model = typeof body?.model === 'string' ? body.model : ''
-  // 取不到模型名就不拦（由下游按自己的规则报错），避免把合法请求误杀。
-  if (model === '') return undefined
+  /**
+   * 🔴 **拿不到模型名就直接 400**（2026-10-21 审查补，安全面专项）。
+   *
+   * 原来是「不拦，交给下游报错」—— 那是 **fail-open**：`{"model":123}` 这种
+   * 非字符串会让白名单校验整条跳过（实测拿到的是「没有可用账号」而不是 403）。
+   * 当前下游恰好也按 `typeof === 'string'` 取值，所以还不可利用；
+   * 但只要任何一层将来对空模型名做默认回填，这条立刻变成真实绕过。
+   *
+   * 与 `/v1/responses` 对齐：`model 必填`。
+   */
+  if (model === '') {
+    return json(
+      { error: { message: 'model 必填，且必须是字符串', type: 'invalid_request_error' } },
+      400,
+    )
+  }
   if (modelAllowed(model, rules)) return undefined
   return json(
     {

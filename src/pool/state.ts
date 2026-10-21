@@ -398,10 +398,19 @@ export function healthyForModel(state: AccountState, now: number, model: string)
  * 供 `/healthz` 探活与选号共用，保证两者口径一致（Go 侧 issue #31 的教训）。
  */
 export function modelExempt(state: AccountState, now: number): boolean {
-  if (state.disabled) return false
-  if (isActive(state.until, now)) return false
-  if (isActive(state.degradeUntil, now)) return false
-  if (isActive(state.breakerUntil, now)) return false
+  /**
+   * 🔴 **账号级判据必须直接用 `healthy()`，不要手抄**
+   *（2026-10-21 审查补，重复实现专项）。
+   *
+   * 原来这里逐个抄了 4 个维度，**漏了 `restrictedUntil`**（上游明确封号，11140）——
+   * 而 `healthy()` 有 5 个。于是「被封号 + 同时有模型限流」的账号会走进
+   * `modelExempt` 的 `true` 分支，池摘要把它算成「模型限流」，
+   * 而 `/admin/accounts/diagnose` 说是「上游标记账号受限，还剩 1 小时 58 分」。
+   *
+   * 用户按「换个模型」去处理，实际要等 2 小时或点解冻。
+   * 手抄一份判据 = 等着下次加维度时再漏一次。
+   */
+  if (!healthy(state, now)) return false
   for (const mc of Object.values(state.modelCooldowns)) {
     if (!mc.auditOnly && mc.until > 0) return true
   }
