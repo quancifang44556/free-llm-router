@@ -4662,6 +4662,19 @@ async function scheduled(event: ScheduledController, env: Env): Promise<void> {
     console.error('[cron] 余额刷新整体失败：', error instanceof Error ? error.message : String(error))
   }
 
+  // 🔴 **会话表清理**（2026-10-21 审查补，M6 指出两个 pruner 零调用者）。
+  // `sessions` / `login_sessions` 都是「登录时插一行、过期也不删」——
+  // 没有这一步，表只增不减，长期运行后查询变慢、库文件膨胀。
+  // 放在每个整点（与续期/余额同频）：一次全表 DELETE，开销可忽略。
+  try {
+    const pruned =
+      await env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn')).pruneStaleSessions(now)
+      + await env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('global')).pruneStaleSessions(now)
+    if (pruned > 0) console.log(`[cron] 清理过期会话 ${pruned} 条`)
+  } catch (error) {
+    console.error('[cron] 会话清理失败：', error instanceof Error ? error.message : String(error))
+  }
+
   const hour = hourUtc8(now)
   const job = SCHEDULE_UTC8[hour]
   const plan = job?.plan

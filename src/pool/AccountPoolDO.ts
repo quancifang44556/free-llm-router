@@ -994,7 +994,21 @@ export class AccountPoolDO extends DurableObject<Env> {
     deleteSession(this.ctx.storage.sql, key)
   }
 
-  /** 清理过期会话。 */
+  /**
+   * 清理过期会话（`sessions` + `login_sessions`），返回总清理条数。
+   *
+   * 🔴 **这个方法此前零调用者**（2026-10-21 审查补，M6 指出）：
+   * 两个 pruner 都实现好了，却没有任何地方调用 ⇒ **`sessions` 表只增不减**，
+   * 浏览器每次登录都插一行，永不过期删除。长期运行后查询变慢、库文件膨胀。
+   *
+   * 现在由 `scheduled()` 每小时调一次（见 `src/index.ts` 的注释）。
+   * 它顺带也有 `pruneLoginSessions` 的用途 —— 登录会话同样是只增不减。
+   */
+  async pruneStaleSessions(now: number): Promise<number> {
+    return pruneSessions(this.ctx.storage.sql, now) + pruneLoginSessions(this.ctx.storage.sql, now)
+  }
+
+  /** 清理过期会话（保留旧名，兼容既有调用）。 */
   async pruneSessions(now: number): Promise<number> {
     return pruneSessions(this.ctx.storage.sql, now)
   }
