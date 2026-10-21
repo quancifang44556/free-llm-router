@@ -18,6 +18,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
 import { classify, isWafBlocked, parseEnvelope, shouldPunish, shouldRotate, CHANNEL_BLOCKED_CODE } from '../src/upstream/client.ts'
+import { refineModelScoped } from '../src/gateway/server.js'
 
 /** 真实抓到的 401 HTML（APISIX / openresty）。 */
 const HTML_401 =
@@ -314,4 +315,25 @@ test('⚠️ `error.code`（单层）也要认，但不能把「只有 message�
   // 只有 message、没有码 ⇒ 不算信封（否则 isWafBlocked 会放过真 WAF 页）
   assert.equal(parseEnvelope('{"error":{"message":"something went wrong"}}'), undefined,
     '只有 message 的响应不得被当成业务信封')
+})
+
+test('🔴 qoder 排队耗尽（10605 + 503）不得判成 server/breaker', () => {
+  // 2026-10-21 审查（M3）发现：`qoder.ts` 把排队耗尽的 httpStatus 从 403 改写成 503，
+  // 目的是躲开「403 无信封 ⇒ 误判 WAF ⇒ 罚号」。但 503 会落进 classify 的 5xx 分支
+  // ⇒ `server` ⇒ `dimension: 'breaker'` ⇒ **3 次熔断一个完全健康的号 30 分钟起**。
+  // 等于「修掉一个 60 秒误罚，造出一个 30 分钟误罚」。
+  //
+  // 修法：报文里带业务码 `{"code":10605}`，并把 10605 登记为 rate_limited
+  //（且纳入 refineModelScoped 的模型级判据）。
+  const msg = 'Qoder 服务繁忙：排队等待已超过 60 秒（已尝试 4 次，实际等待 45 秒）。'
+    + '上游业务码：{"code":10605}。请稍后重试 —— 这是上游排队，不是账号或配置问题。'
+
+  const r = classify(503, msg)
+  assert.equal(r.kind, 'rate_limited', '排队必须判 rate_limited，不能是 server')
+  assert.equal(r.code, 10605, '业务码必须解析出来')
+  assert.notEqual(r.kind, 'server', '⚠️ 判成 server 会喂熔断，把健康号罚掉 30 分钟')
+
+  // 且必须是**模型级**（排队挤的是某个模型，不是账号坏了）
+  const scoped = refineModelScoped(r.kind, msg)
+  assert.equal(scoped.dimension, 'model', '10605 应归模型级冷却')
 })

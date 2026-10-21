@@ -1524,9 +1524,22 @@ async function chat(
           provider: product.id,
           httpStatus: 503,
           retryable: true,
+          // ⚠️ **报文里必须带业务码 `{"code":10605}`**（2026-10-21 审查补，M3 指出）。
+          //
+          // 网关的 `classify()` 只能从**文本**里解析业务码。原来这段纯中文文案
+          // 里没有任何码 ⇒ 503 落进 5xx 分支 ⇒ `server` ⇒ **breaker**
+          // ⇒ 3 次熔断健康号 30 分钟（比原先的「WAF 误判罚 60 秒」更重）。
+          //
+          // 现在带上 `{"code":10605}` 后：`classify` 走 5xx 分支里的
+          // 「已知业务码优先」路径 ⇒ `rate_limited`（且 10605 已被
+          // `refineModelScoped` 纳入模型级）⇒ 只冷却该模型，不再熔断账号。
+          //
+          // 把码直接写进对用户可见的文案里是**有意的**：它让「上游到底说了什么」
+          // 可被直接看到，省得排查时再猜。
           message:
             `Qoder 服务繁忙：排队等待已超过 ${Math.round(QUEUE_TOTAL_BUDGET_MS / 1000)} 秒`
             + `（已尝试 ${attempt + 1} 次，实际等待 ${Math.round(spent / 1000)} 秒）。`
+            + `上游业务码：{"code":${QODER_QUEUE_CODE}}。`
             + '请稍后重试 —— 这是上游排队，不是账号或配置问题。',
         })
       }
