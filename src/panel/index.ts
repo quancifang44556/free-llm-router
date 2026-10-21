@@ -70,16 +70,61 @@ export function securityHeaders(): Record<string, string> {
 /**
  * 面板静态资源（路径 → 内容、类型、缓存策略）。
  *
- * - `/panel/`（与 `/panel/index.html`）→ 单页入口，`no-store`：每次都拿最新入口，才能引用到新哈希的资源；
- * - `/panel/assets/*` → 文件名带内容哈希，`immutable` 永久缓存（升级后文件名会变，不会读到旧缓存）。
+ * - `/panel/`（与 `/panel/index.html`）→ 单页入口，`no-store`：每次都拿最新入口；
+ * - `/panel/assets/*` → `no-cache`（**允许缓存，但每次必须回源校验**）。
+ *
+ * ## 🔴 为什么不能 `immutable`（2026-10-21 实测踩到）
+ *
+ * 原注释的理由是「文件名带内容哈希，升级后文件名会变」——**但那是假的**：
+ * 面板产物是**预构建后提交进仓库**的，文件名是硬编码的
+ *（`index-Dg0M0nJm.js` / `style-xxx.css.txt` …），内容变了名字**不变**。
+ *
+ * 于是 `cache-control: immutable` + `max-age=31536000` 让浏览器**一年内
+ * 永不重新请求**该资源 ⇒ 用户升级后界面**一直显示旧版本号**
+ *（实测：服务端已返回 `0.9.5`，用户看到的仍是 `0.9.2`）。
+ *
+ * 改名方案（给文件名加真哈希）要改构建脚本，成本高；
+ * 而 `no-cache` 的成本只是一次 304 往返（有 ETag），对本人多设备完全可接受。
+ * ⇒ 取 `no-cache`：正确性优先于那点带宽。
  */
-export function panelAsset(path: string): { body: string; contentType: string; cacheControl: string } | undefined {
+/** 内容哈希缓存（路径 → ETag）。产物是静态的，算一次即可，不必每次请求都算。 */
+const etagCache = new Map<string, string>()
+
+/**
+ * 计算资源内容的 ETag。
+ *
+ * ⚠️ 用 64 位 FNV-1a 拼两段（快、同步、无依赖）。**不需要密码学强度** ——
+ * ETag 只用于「内容变没变」的协商，不是安全边界。
+ */
+function etagOf(body: string): string {
+  const existing = etagCache.get(body)
+  if (existing !== undefined) return existing
+  let h1 = 0x811c9dc5
+  let h2 = 0x01000193
+  for (let i = 0; i < body.length; i += 1) {
+    const c = body.charCodeAt(i)
+    h1 = Math.imul(h1 ^ c, 0x01000193) >>> 0
+    h2 = Math.imul(h2 ^ (c + i), 0x85ebca6b) >>> 0
+  }
+  const tag = `"${h1.toString(16)}${h2.toString(16)}"`
+  // 防无限增长：产物数量有限，超过 64 条整体清空即可
+  if (etagCache.size > 64) etagCache.clear()
+  etagCache.set(body, tag)
+  return tag
+}
+
+export function panelAsset(
+  path: string,
+): { body: string; contentType: string; cacheControl: string; etag: string } | undefined {
   const key = path === '/panel/index.html' ? '/panel/' : path
   const asset = Object.hasOwn(WEB_ASSETS, key) ? WEB_ASSETS[key] : undefined
   if (asset === undefined) return undefined
   return {
     body: asset.body,
     contentType: asset.type,
-    cacheControl: asset.immutable ? 'public, max-age=31536000, immutable' : 'no-store',
+    // ⚠️ 不用 `immutable`：文件名不随内容变，会让浏览器永久缓存旧产物
+    //（见上方注释的实测记录）。`no-cache` 允许缓存但强制回源校验。
+    cacheControl: asset.immutable ? 'no-cache' : 'no-store',
+    etag: etagOf(asset.body),
   }
 }

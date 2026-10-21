@@ -654,3 +654,32 @@ test('🔴 qoder 外层信封（body 套业务码）不得被判成 WAF', async 
   // ④ 常规信封不受影响
   assert.equal(classify(403, '{"code":6004,"msg":"rate"}').kind, 'rate_limited', '普通信封行为不变')
 })
+
+test('🔴 面板资源不得 immutable 缓存（会让用户永远看到旧版本）', async () => {
+  // ## 真实故障（2026-10-21）
+  // 用户报「真的部署了吗，我看这里版本号还是 0.9.2」。
+  // 实测：服务端 `/panel/assets/index-*.js` 已返回 `0.9.5`，
+  // 但响应头是 `cache-control: public, max-age=31536000, immutable`
+  // ⇒ 浏览器**一年内永不重新请求** ⇒ 界面永远显示旧版本。
+  //
+  // 根因：原注释写「文件名带内容哈希，升级后文件名会变」——
+  // **但那是假的**：面板产物是预构建后提交进仓库的，文件名是硬编码的
+  // （`index-Dg0M0nJm.js`），内容变了名字不变。
+  const { readFileSync } = await import('node:fs')
+  const panel = readFileSync('src/panel/index.ts', 'utf8')
+  const idx = readFileSync('src/index.ts', 'utf8')
+
+  // ① 不得再用 immutable —— 只查**真实的 cache-control 字符串字面量**，
+  //    不查注释（本项目注释习惯逐字引用旧值，直接 grep 会误伤）。
+  assert.ok(
+    !/'public, max-age=31536000, immutable'/.test(panel),
+    '面板资源不得使用 immutable 缓存 —— 文件名不随内容变，会永久缓存旧产物',
+  )
+  // ② 必须用 no-cache（允许缓存但强制回源校验）
+  assert.match(panel, /cacheControl: asset\.immutable \? 'no-cache'/, '必须改为 no-cache')
+  // ③ 必须有 ETag，否则 no-cache 等于每次全量重下
+  assert.match(panel, /etag: etagOf\(asset\.body\)/, '必须为面板资源计算 ETag')
+  // ④ 必须支持条件请求回 304
+  assert.match(idx, /if-none-match/, '必须处理 If-None-Match')
+  assert.match(idx, /status: 304/, '内容未变时必须回 304')
+})

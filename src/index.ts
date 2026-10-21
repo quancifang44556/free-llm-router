@@ -1205,10 +1205,19 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
   // 刻意不用 cookie（cookie 会自动附带，需要额外 CSRF 防护；Authorization 头不会）。
   const asset = panelAsset(path)
   if (asset !== undefined) {
-    return new Response(asset.body, {
-      status: 200,
-      headers: { ...securityHeaders(), 'content-type': asset.contentType, 'cache-control': asset.cacheControl },
-    })
+    const headers = {
+      ...securityHeaders(),
+      'content-type': asset.contentType,
+      'cache-control': asset.cacheControl,
+      etag: asset.etag,
+    }
+    // ⚠️ 支持条件请求：内容没变就回 304（省流量），变了才回全量。
+    // 这正是 `no-cache` 能成立的前提 —— 没有 ETag 的 `no-cache` 等于每次全量重下。
+    const inm = request.headers.get('if-none-match')
+    if (inm !== null && inm === asset.etag) {
+      return new Response(null, { status: 304, headers })
+    }
+    return new Response(asset.body, { status: 200, headers })
   }
   // 旧版独立登录页已并入单页面板（未登录时面板自己显示登录表单）——旧书签直接跳过去。
   if (path === '/login' || path === '/login/') {

@@ -138,14 +138,18 @@ test('🔴 主 bundle 动态加载的分包也都必须嵌进 manifest（否则�
   for (const c of chunks) assert.ok(panelAsset(`/panel/assets/${c}`), `分包 assets/${c} 未嵌入`)
 })
 
-test('⚠️ 带哈希的 assets 永久缓存，其余不缓存', () => {
+test('⚠️ 面板 assets 用 no-cache + ETag（不能用 immutable，否则永久缓存旧产物）', () => {
+  // ## 为什么改掉「永久缓存」（2026-10-21 实测）
+  // 原断言的前提是「文件名带内容哈希，升级后名字会变」——**但那是假的**：
+  // 面板产物是预构建后提交进仓库的，文件名硬编码（`index-Dg0M0nJm.js`），
+  // 内容变了名字不变。于是 `immutable` + 一年缓存让浏览器**永不重新请求**
+  // ⇒ 用户升级后界面一直显示旧版本号（实测：服务端 0.9.5、界面 0.9.2）。
   for (const [p, a] of Object.entries(WEB_ASSETS)) {
     const r = panelAsset(p)
     assert.ok(r)
     if (p.startsWith('/panel/assets/')) {
-      assert.ok(a.immutable, `${p} 应标记 immutable`)
-      assert.match(p, /-[\w-]{6,}\.(js|css)$/, `${p} 文件名应带内容哈希（否则不能永久缓存）`)
-      assert.equal(r.cacheControl, 'public, max-age=31536000, immutable')
+      assert.equal(r.cacheControl, 'no-cache', `${p} 必须 no-cache（回源校验），不能 immutable`)
+      assert.match(r.etag, /^"[0-9a-f]+"$/, `${p} 必须有 ETag，否则 no-cache 等于每次全量重下`)
     } else {
       assert.equal(r.cacheControl, 'no-store', `${p} 不带哈希，不能缓存`)
     }

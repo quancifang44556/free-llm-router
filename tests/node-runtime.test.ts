@@ -193,7 +193,11 @@ test('startServer：HTTP 服务端启动、健康检查与面板可访问性', a
     const cssRes = await fetch(`${baseUrl}${cssPath}`)
     assert.equal(cssRes.status, 200)
     assert.ok(cssRes.headers.get('content-type')?.includes('text/css'))
-    assert.match(cssRes.headers.get('cache-control') ?? '', /immutable/)
+    // ⚠️ 2026-10-21 改：面板产物文件名**不随内容变**（预构建后提交进仓库），
+    // 所以 `immutable` 会让浏览器永久缓存旧产物 ⇒ 用户升级后界面显示旧版本
+    //（实测：服务端 0.9.5、界面 0.9.2）。改为 `no-cache` + ETag 回源校验。
+    assert.match(cssRes.headers.get('cache-control') ?? '', /no-cache/)
+    assert.ok(cssRes.headers.get('etag'), '静态资源必须带 ETag（否则 no-cache 等于每次全量重下）')
     // 3b. 旧登录页地址跳到面板；/panel/ 下不存在的文件 404（不是 401）
     const loginRes = await fetch(`${baseUrl}/login`, { redirect: 'manual' })
     assert.equal(loginRes.status, 302)
