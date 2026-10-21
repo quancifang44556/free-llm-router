@@ -4438,6 +4438,40 @@ const REFRESH_LEAD_MS = 3_600_000
  * 上游没给过期时间的情形。**不拿它去续期**（无从判断该不该续），
  * 留待请求路径的 401 兜底。
  */
+/**
+ * 把后台任务（续期 / 余额刷新）的失败写进**面板日志**，而不是只进 console
+ * （2026-10-21 审查补，M6 指出）。
+ *
+ * ## 缺陷
+ * 这两处的失败原来只有 `console.error` —— 面板「日志」页**一条都看不到**。
+ * 用户的体验是：某账号的登录态悄悄失效、余额悄悄变成 0，
+ * 而面板上一切正常，只能靠 `docker logs` 才发现。
+ *
+ * ## 为什么只记失败
+ * 日志是 200 条的环形缓冲。每到整点、每个账号记一条成功，
+ * 一小时就能把整个环刷掉 —— 真正要看的失败反而被挤没了。
+ */
+function logBackgroundFailure(
+  pool: DurableObjectStub<AccountPoolDO>,
+  input: { uid: string; provider: string; action: string; message: string },
+): void {
+  void pool
+    .appendLog({
+      id: Math.random().toString(36).slice(2, 10),
+      time: Date.now(),
+      type: 'error',
+      model: input.action,
+      provider: input.provider,
+      uid: input.uid,
+      status: 500,
+      durationMs: 0,
+      tokens: { input: 0, output: 0, total: 0 },
+      stream: false,
+      error: input.message,
+    })
+    .catch(() => undefined)
+}
+
 async function refreshExpiringCredentials(env: Env, now: number): Promise<void> {
   for (const realm of ['cn', 'global']) {
     const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
@@ -4474,10 +4508,15 @@ async function refreshExpiringCredentials(env: Env, now: number): Promise<void> 
       } catch (error) {
         // ⚠️ 如实记原因。**不惩罚账号** —— 续期失败可能是网络抖动，
         // 而请求路径的 401 兜底仍会兜住真正失效的凭据。
-        console.error(
-          `[cron] ${providerId} ${account.uid} 主动续期失败：`,
-          error instanceof Error ? error.message : String(error),
-        )
+        const message = error instanceof Error ? error.message : String(error)
+        console.error(`[cron] ${providerId} ${account.uid} 主动续期失败：`, message)
+        // 🔴 同时写进面板日志（否则用户只能去 `docker logs` 里找）。
+        logBackgroundFailure(pool, {
+          uid: account.uid,
+          provider: providerId,
+          action: 'cron:refresh',
+          message: `主动续期失败：${message}`,
+        })
       }
     }
   }
@@ -4552,10 +4591,15 @@ async function refreshAccountBalances(env: Env, now: number): Promise<void> {
       } catch (error) {
         // ⚠️ 如实记录，且**不写 0** —— 查不到 ≠ 没钱了。
         failed += 1
-        console.warn(
-          `[cron] ${providerId} ${account.uid} 余额刷新失败（保持原值）：`,
-          error instanceof Error ? error.message : String(error),
-        )
+        const message = error instanceof Error ? error.message : String(error)
+        console.warn(`[cron] ${providerId} ${account.uid} 余额刷新失败（保持原值）：`, message)
+        // 🔴 同时写进面板日志（与续期失败同处理）。
+        logBackgroundFailure(pool, {
+          uid: account.uid,
+          provider: providerId,
+          action: 'cron:balance',
+          message: `余额刷新失败（保持原值）：${message}`,
+        })
       }
     }
   }
