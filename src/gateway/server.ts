@@ -2086,6 +2086,51 @@ export async function handleProviderChat(input: {
   /** 单账号池时 soft 也延迟（理由见 buddy 路径的同名函数）。 */
   const deferSoft = (): boolean => poolSize === 1
 
+  /**
+   * 🔴 **两道全局防封闸门必须在**这里也接线**（2026-10-21 审查补，M1 指出高危）**。
+   *
+   * ## 缺陷
+   * `wafGateActive` 的查询与 `noteWaf` 的投喂**只存在于 buddy 分支**（`987` / `1252`），
+   * provider 分支**既不查询也不投喂**。后果是双向的：
+   * 1. **不查询** ⇒ 出口 IP 已被 WAF 拦住时，buddy 会停手，provider 路径却继续
+   *    轮转送号，把一次客户端请求放大成 N 次撞同一堵墙（正是防封最忌的）；
+   * 2. **不投喂** ⇒ provider 路径上真实的 403 不计入 IP 级窗口，
+   *    导致闸门**永远攒不够证据**、形同虚设。
+   *
+   * ⇒ 带前缀模型（`qodercn/dfmodel`、`workbuddy/*` 等）的请求此前**完全不受防封保护**。
+   * 这是本项目「只在一处生效」模式的又一次复现，故此处**逐字对齐** buddy 的判据，
+   * 连错误码与文案都保持一致，避免两条路径的语义再漂。
+   *
+   * ## 为什么放在循环外
+   * 闸门激活期内应当**一个上游请求都不发**（见 buddy 分支的注释：
+   * 轮转只会加重风控）。放进循环内就失去意义了。
+   */
+  if (await pool.wafGateActive(Date.now()).catch(() => false)) {
+    return {
+      response: jsonError(
+        503,
+        '出口 IP 疑似被上游 WAF 拦截（短时间内多个账号接连 403），已暂停轮转以避免加重风控。稍后自动恢复。',
+        'waf_ip_blocked',
+      ),
+    }
+  }
+  // ⚠️ 先判方法存在再调用：波次暂停是保护措施，保护措施本身不能成为新的故障点
+  //（测试替身缺该方法 / 老 DO 未升级时应放行请求，而不是崩掉整条路径）。
+  const waveProbe = (pool as { restrictionGateActive?: (now: number) => Promise<boolean> })
+  const wavePaused =
+    typeof waveProbe.restrictionGateActive === 'function'
+      ? await waveProbe.restrictionGateActive(Date.now()).catch(() => false)
+      : false
+  if (wavePaused) {
+    return {
+      response: jsonError(
+        429,
+        '多个账号近期被上游风控限制（11140 账号存在异常行为），已暂停该区域派发以避免更多账号被牵连。稍后自动恢复；如确认是误判可在面板解冻。',
+        'restriction_wave',
+      ),
+    }
+  }
+
   for (let attempt = 0; attempt <= maxRotate; attempt += 1) {
     const now = Date.now()
     // ⚠️ 供应商过滤交给 `pick()` 做（`provider` 字段），
@@ -2296,6 +2341,39 @@ export async function handleProviderChat(input: {
             `[waf-403] model=${model} http=${peStatus} kind=${c.kind} len=${message.length} ` +
               `body=${message.slice(0, 500)}`,
           )
+        }
+
+        /**
+         * 🔴 **WAF / 11140 的「双记账」也必须在这里做**
+         *（2026-10-21 审查补，M1 指出高危）。
+         *
+         * ## 缺陷
+         * buddy 分支在 `!upstream.ok` 里做了双记账（`1260` 附近的 `noteWaf` /
+         * `noteRestriction`），而 provider 分支**只打日志、不记账**。
+         *
+         * ⇒ 效果是**闸门永远攒不够证据**：
+         * 顶部的 `wafGateActive` / `restrictionGateActive` 靠「短窗内多个不同号命中」
+         * 才激活，而 provider 路径（8 家 provider 抛 `ProviderError` 都走这里）
+         * 的真实 403 一条都没投喂 ⇒ 闸门对带前缀模型**形同虚设**。
+         *
+         * ## 为什么还要 `break`
+         * IP 被拦时继续轮转，就是把一次客户端请求放大成 N 次撞同一堵墙
+         *（buddy 分支的注释记过 Go 侧实测：3 个账号 1 秒内全部 403）。
+         * 故与 buddy 分支同样**立即停手**，返回可读原因。
+         */
+        if (c.kind === 'request_illegal') {
+          await pool.noteRestriction(picked.uid, Date.now()).catch(() => false)
+        }
+        if (c.kind === 'waf_blocked') {
+          const ipBlocked = await pool.noteWaf(picked.uid, Date.now()).catch(() => false)
+          if (ipBlocked) {
+            lastError = {
+              status: 503,
+              message: '出口 IP 疑似被 WAF 拦截（短窗内多个账号接连 403）',
+              kind: 'waf_ip_blocked',
+            }
+            break
+          }
         }
 
         const pm = mapErrorToPunishment(c.kind)

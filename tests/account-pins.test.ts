@@ -490,3 +490,65 @@ test('网关（供应商路径 cline）：只用指定账号不可用 ⇒ 不调
     rt.cleanup()
   }
 })
+
+test('🔴 provider 路径必须受 WAF / 11140 全局闸门保护（此前完全不设防）', async () => {
+  // 2026-10-21 审查（M1）发现的高危：两道全局闸门
+  //（IP 级 WAF 与 11140 波次）**只在 buddy 分支接线**（server.ts:987/1252），
+  // provider 分支既不查询也不投喂 ⇒ 带前缀模型（qodercn/*, workbuddy/* …）
+  // 完全不受防封保护。
+  //
+  // 本文钉住：闸门激活时，`handleProviderChat` 必须**一个上游请求都不发**就返回可读错误。
+  const rt = freshRuntime('waf-gate-provider')
+  try {
+    const provider = findProvider('cline')
+    assert.ok(provider !== undefined)
+    const originalChat = provider.chat
+    const originalWarn = console.warn
+    const originalLog = console.log
+    let upstreamCalls = 0
+    console.log = () => {}
+    console.warn = () => {}
+    provider.chat = (async () => {
+      upstreamCalls += 1
+      // 必须回 SSE 流：上游一律以流式形态响应，非流的聚合由网关自己做。
+      return new Response(okStream('cline ok'), { status: 200, headers: { 'content-type': 'text/event-stream' } })
+    }) as never
+    try {
+      const pool = rt.env.ACCOUNT_POOL.get(rt.env.ACCOUNT_POOL.idFromName('cn'))
+      for (const uid of ['w1', 'w2']) {
+        await addAccount(pool, uid, { provider: 'cline' })
+        await pool.putCredential(uid, { uid, nickname: uid, accessToken: `tok-${uid}`, refreshToken: '', expiresAt: Date.now() + 3600_000 }, Date.now())
+      }
+
+      const run = () => handleProviderChat({
+        providerId: 'cline', model: 'm', wantsStream: false,
+        rawBody: { model: 'm', messages: [{ role: 'user', content: 'hi' }] },
+        request: new Request('https://example.test/v1/chat/completions', { method: 'POST', headers: {} }),
+        env: rt.env, realm: 'cn', tried: [], sessionKey: '', failoverDepth: 1,
+      })
+
+      // 先确认没激活时是通的（否则下面的 503 可能是别的原因）
+      const before = await run()
+      assert.equal(before.response.status, 200, '闸门未激活时应正常转发')
+      await before.response.text()
+      upstreamCalls = 0
+
+      // 让 2 个不同账号各命中一次 403 ⇒ 达到 WAF_IP_THRESHOLD=2 ⇒ 闸门激活
+      const now = Date.now()
+      await pool.noteWaf('w1', now)
+      const activated = await pool.noteWaf('w2', now)
+      assert.equal(activated, true, '两个不同账号命中后闸门应激活')
+
+      const blocked = await run()
+      assert.equal(blocked.response.status, 503, '闸门激活后 provider 路径必须拦下')
+      assert.match(await blocked.response.text(), /WAF/)
+      assert.equal(upstreamCalls, 0, '⚠️ 闸门激活时不得再向上游发任何请求（否则等于撞同一堵墙）')
+    } finally {
+      provider.chat = originalChat
+      console.warn = originalWarn
+      console.log = originalLog
+    }
+  } finally {
+    rt.cleanup()
+  }
+})
