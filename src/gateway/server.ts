@@ -1119,6 +1119,18 @@ export async function handleChatCompletions(
     if (!upstream.ok) {
       const text = await upstream.text().catch(() => '')
       const { kind, msg } = classify(upstream.status, text)
+      /**
+       * 上游原文诊断开关（`QODER_DEBUG_UPSTREAM=1`）。
+       *
+       * ⚠️ 保留而不是用完就删：这次排查「11140 到底是不是真封号」全靠它 ——
+       * 只有拿到 `http=403 code=11140 displayMsg:"account has been restricted"`
+       * 的**原始字节**，才能区分「真·账号限制」与「WAF 403 / 模型下线」这两种
+       * 完全不同的处置。之前正是因为看不到原文，把模型下线误判成封号。
+       * 默认关闭（正文可能含用户内容），排障时打开。
+       */
+      if ((globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env?.QODER_DEBUG_UPSTREAM === '1') {
+        console.warn(`[upstream] http=${upstream.status} kind=${kind} body=${text.slice(0, 300)}`)
+      }
       const mapped = mapErrorToPunishment(kind)
       const { dimension, resetAt } = refineModelScoped(kind, text)
 

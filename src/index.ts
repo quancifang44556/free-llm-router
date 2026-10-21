@@ -3400,14 +3400,31 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
   }
 
   if (path === '/admin/restriction/clear' && request.method === 'POST') {
-    const body = (await request.json().catch(() => ({}))) as { realm?: string }
+    const body = (await request.json().catch(() => ({}))) as { realm?: string; uid?: string }
     const realm = body.realm ?? 'cn'
     const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
+    // 带 uid ⇒ 解除**该账号**的 restrictedUntil（确认误判时用）；
+    // 不带 ⇒ 只清波次暂停。两层语义不同，不能混成一个动作。
+    if (typeof body.uid === 'string' && body.uid !== '') {
+      const outcome = await pool.clearAccountRestriction(body.uid)
+      if (!outcome.found) {
+        return json({ error: { message: `账号不存在：${body.uid}`, type: 'not_found' } }, 404)
+      }
+      return json({
+        ok: true,
+        realm,
+        uid: body.uid,
+        cleared: outcome.cleared,
+        note: outcome.cleared
+          ? '已解除该账号的上游限制标记与失败计数（仅用于确认误判时）'
+          : '该账号本来就没有上游限制标记（失败计数已清零）',
+      })
+    }
     await pool.clearRestrictionGate()
     return json({
       ok: true,
       realm,
-      note: '已解除账号级限制波次暂停（若账号确实被上游标记，它们各自的 restrictedUntil 仍然生效）',
+      note: '已解除账号级限制波次暂停（若账号确实被上游标记，它们各自的 restrictedUntil 仍然生效；传 uid 可解除单个账号）',
     })
   }
 

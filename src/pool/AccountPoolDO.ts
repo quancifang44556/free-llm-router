@@ -1853,6 +1853,28 @@ export class AccountPoolDO extends DurableObject<Env> {
     await this.ctx.storage.put('restrictionGate', { until: 0, hits: {} })
   }
 
+  /**
+   * 人工解除**单个账号**的 `restrictedUntil`（波次暂停之外的另一个层次）。
+   *
+   * ⚠️ 为什么需要这个：`clearRestrictionGate` 只清「波次暂停」，不动账号自身状态。
+   * 于是出现「误判后无法解冻」——线上真实发生过：模型下线返回的错误被归到
+   * 账号级限制，三个号被各锁 2 小时，面板提供的新端点也清不掉，只能等自然过期。
+   *
+   * 用途限定在**确认误判**时：上游限制有 2 小时自然过期，
+   * 不要拿它当"绕过限制"的常规手段（见 RESTRICTED_HOLD_MS 的注释）。
+   */
+  async clearAccountRestriction(uid: string): Promise<{ found: boolean; cleared: boolean }> {
+    const raw = readAccount(this.ctx.storage.sql, uid)
+    if (raw === undefined || raw === '') return { found: false, cleared: false }
+    const state = normalizeAccountState(JSON.parse(raw))
+    if (state === undefined) return { found: false, cleared: false }
+    const wasRestricted = state.restrictedUntil !== 0
+    state.restrictedUntil = 0
+    state.fails = 0
+    writeAccount(this.ctx.storage.sql, state.uid, state.realm, JSON.stringify(state), Date.now())
+    return { found: true, cleared: wasRestricted }
+  }
+
   private async loadRestrictionGate(): Promise<{ until: number; hits: Record<string, number> }> {
     const raw = await this.ctx.storage.get<{ until?: unknown; hits?: unknown }>('restrictionGate')
     const until = typeof raw?.until === 'number' ? raw.until : 0

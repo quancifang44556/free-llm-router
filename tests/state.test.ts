@@ -387,3 +387,29 @@ test('🔴 cosy 版本可被环境变量覆盖（签名载荷里的版本，不�
     else process.env.QODER_COSY_VERSION = prev
   }
 })
+
+test('🔴 误判可人工解冻：clear 端点必须支持按 uid 解除单个账号限制', async () => {
+  // ## 线上真实踩到
+  //
+  // 模型下线 / WAF 403 被误判成「账号级限制」后，三个号各被锁 2 小时。
+  // 而 `/admin/restriction/clear` 只清「波次暂停」，**不动账号自身状态** ——
+  // 于是确认误判后也解不开，只能干等自然过期。面板上没有第二个出口。
+  //
+  // 双层语义必须分开（不能混成一个动作）：
+  //   - 不带 uid：清波次暂停（整池层面的止血）
+  //   - 带 uid  ：清该账号的 restrictedUntil + fails（确认误判后的解冻）
+  const { readFileSync } = await import('node:fs')
+
+  const idx = readFileSync('src/index.ts', 'utf8')
+  assert.match(idx, /body\.uid/, 'clear 端点必须接受 uid')
+  assert.match(idx, /clearAccountRestriction/, 'clear 端点必须能清单个账号的限制')
+
+  const pool = readFileSync('src/pool/AccountPoolDO.ts', 'utf8')
+  assert.match(pool, /async clearAccountRestriction\(uid: string\)/,
+    'AccountPoolDO 必须有 clearAccountRestriction')
+  // 必须真的把 restrictedUntil 归零并落盘，不能只返回成功
+  assert.match(pool, /state\.restrictedUntil = 0[\s\S]{0,240}writeAccount\(/,
+    'clearAccountRestriction 必须置 0 并写回存储')
+  // fails 也要清：只清 restricted 而留着 fails，下次 5xx 立刻又熔断
+  assert.match(pool, /state\.fails = 0/, '解除限制时应同时清失败计数')
+})
