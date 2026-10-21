@@ -1146,51 +1146,8 @@ const QUEUE_MAX_ATTEMPTS = 3
  * ⇒ 取 **45 秒**：足够覆盖「一次正常排队」（实测常见 20–25s），
  * 又远低于平台会掐断的量级。超出预算时**如实报「排队太挤」**，
  * 让客户端稍后重试 —— 那比挂到被平台掐断（无可读原因）好得多。
- *
- * ## ⚠️ 45 秒可能偏短（2026-10-21 复核，未改默认值）
- *
- * shuishuipingan/qoder2api-hub 的 `docs/risk-control-and-queueing.md` §7.1
- * 逆向官方客户端得到一个事实：排队**不是"失败后重试"，是独立的轮询协议**
- * （`GET /api/v2/service/ask/queue/status?...`），官方客户端：
- *
- *   - 收到 10605 后**不结束请求**，进入轮询循环；
- *   - 每轮 `sleep(retryAfterSeconds)` 再查状态；
- *   - `serviceAvailable === false` ⇒ **继续轮询，不放弃**；
- *   - 连续 3 次轮询失败才判致命；
- *   - **总等待上限默认 60 分钟**（`QODER_MODEL_QUEUE_MAX_WAIT_MS`）。
- *
- * 也就是说官方对排队是「分钟级耐心等待」，我们 45 秒就放弃 ——
- * 高峰时段会把「官方客户端能等到」的请求报成「服务繁忙」。
- *
- * 但**不能直接照抄 60 分钟**：本服务可能跑在 Workers 上（单请求有时限），
- * 一个 HTTP 请求挂几十分钟既会被平台掐断、用户也早已放弃。
- * 因此保留 45s 为默认，改用 `QODER_QUEUE_BUDGET_MS` 让部署方按实际
- * 运行环境（Node 长驻 vs Workers）自行调整 —— 这是环境相关量，不该硬编码。
  */
 const QUEUE_TOTAL_BUDGET_MS = 45_000
-
-/**
- * 实际使用的排队预算：`QODER_QUEUE_BUDGET_MS` 优先，非法值回落默认。
- *
- * ⚠️ **默认值刻意留在 `<= 90s`**（见 `QUEUE_TOTAL_BUDGET_MS` 的推导）：
- * 本服务可能跑在 Workers 上，一个 HTTP 请求挂几十分钟会被平台直接掐断，
- * 那比"如实报排队太挤"更糟（客户端拿到的是无原因的 1101）。
- *
- * 但 Node 长驻部署没有这个限制，而官方客户端实测能等 60 分钟
- * （`docs/risk-control-and-queueing.md` §7.1 逆向结论：排队是独立轮询协议，
- * `serviceAvailable=false` 也继续等）。所以把决定权交给部署方：
- * **Node 部署可调高（如 600000），Workers 部署保持默认**。
- *
- * 非法值（空串/非数字/负数）静默回落默认 —— 排队预算不该因为
- * 一个环境变量拼错就变成 NaN，那会让所有排队请求"立刻超预算"。
- */
-function queueTotalBudget(): number {
-  const env = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env
-  const raw = (env?.QODER_QUEUE_BUDGET_MS ?? '').trim()
-  if (raw === '') return QUEUE_TOTAL_BUDGET_MS
-  const n = Number(raw)
-  return Number.isFinite(n) && n > 0 ? n : QUEUE_TOTAL_BUDGET_MS
-}
 
 function sleep(ms: number, signal: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -1517,7 +1474,7 @@ async function chat(
     if (queue !== undefined) {
       // ⚠️ **先判总预算，再判次数** —— 两个上限都要守，任一超了就如实上报。
       const spent = Date.now() - queueStartedAt
-      const overBudget = spent >= queueTotalBudget()
+      const overBudget = spent >= QUEUE_TOTAL_BUDGET_MS
       if (overBudget || attempt >= QUEUE_MAX_ATTEMPTS) {
         // ⚠️ 如实说明「是排队太挤」，而不是把它伪装成失败 ——
         // 用户据此知道「稍后重试有用」，而不是「我的账号/配置有问题」。
@@ -1527,7 +1484,7 @@ async function chat(
           httpStatus: status,
           retryable: true,
           message:
-            `Qoder 服务繁忙：排队等待已超过 ${Math.round(queueTotalBudget() / 1000)} 秒`
+            `Qoder 服务繁忙：排队等待已超过 ${Math.round(QUEUE_TOTAL_BUDGET_MS / 1000)} 秒`
             + `（已尝试 ${attempt + 1} 次，实际等待 ${Math.round(spent / 1000)} 秒）。`
             + '请稍后重试 —— 这是上游排队，不是账号或配置问题。',
         })

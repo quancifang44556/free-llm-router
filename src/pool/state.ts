@@ -108,50 +108,6 @@ export interface TokenUsage {
  */
 export const RESTRICTED_HOLD_MS = 2 * 60 * 60 * 1000
 
-/**
- * 同一账号两次派发之间的**最小间隔**（毫秒）。
- *
- * ## 为什么需要（借鉴 shuishuipingan/qoder2api-hub 的 traffic guard）
- *
- * 网关是长驻进程，客户端可以瞬间发几十个请求。若不限速，账号会以
- * 「机器节奏」向上游施压 —— 这是判风控时最容易被识别的特征，而且
- * 与请求内容无关，改任何请求头都掩盖不掉。
- *
- * 该项目的实测默认值是 **400ms + 0~120ms 抖动**（`QD_TEAM_MIN_GAP_MS`），
- * 注释写的是「近似人类节奏」。⚠️ 作者并未给出推导过程，属经验值；
- * 这里沿用同一量级，并可通过 `MIN_DISPATCH_GAP_MS` 调整。
- *
- * ⚠️ **只影响"选谁"，不影响"能不能用"**：等不到间隔的账号只是被排到
- * 候选列表后面（降权），不是被冷却。池子只有一两个号时会退化为"照发"，
- * 否则一个号的小池会永久卡死（见 `pick` 的兜底）。
- */
-export const MIN_DISPATCH_GAP_MS = 400
-
-/** 叠加在最小间隔上的抖动上限（避免固定节奏本身成为特征）。 */
-const DISPATCH_JITTER_MS = 120
-
-/**
- * 判断账号距上次派发是否已过最小间隔。
- *
- * `now - lastUsedAt >= gap + jitter(该账号确定)`：抖动按 uid 派生，
- * 保证同一账号每次都得到**相同**的抖动值 —— 否则每次间隔不同，
- * 反而像一个"忽快忽慢"的异常客户端。
- */
-export function dispatchGapOk(state: AccountState, now: number): boolean {
-  if (state.lastUsedAt === 0) return true
-  const jitter = uidJitter(state.uid)
-  return now - state.lastUsedAt >= MIN_DISPATCH_GAP_MS + jitter
-}
-
-/** 由 uid 派生的稳定抖动（0..DISPATCH_JITTER_MS）。 */
-function uidJitter(uid: string): number {
-  let h = 0
-  for (let i = 0; i < uid.length; i += 1) {
-    h = (h * 31 + uid.charCodeAt(i)) >>> 0
-  }
-  return h % (DISPATCH_JITTER_MS + 1)
-}
-
 export interface AccountState {
   /** 上游 uid（账号主键）。 */
   uid: string
@@ -173,18 +129,6 @@ export interface AccountState {
   disabled: boolean
   /** 禁用原因。 */
   reason: string
-
-  // ── 派发节奏域 ──
-  /**
-   * 上次派发（真正向上游发请求）的时刻（epoch ms，0 = 从未）。
-   *
-   * 用于**单号最小间隔**（见 `MIN_DISPATCH_GAP_MS`）：同一账号连续两次请求
-   * 之间必须留出间隔，否则就是在用「机器节奏」打上游。
-   *
-   * ⚠️ 这是**节奏**字段，不是**健康**字段：它只影响"选谁"，不影响"能不能用"，
-   * 所以不参与 `ready()` 判定，也不该被 `noteSuccess` 清零。
-   */
-  lastUsedAt: number
 
   // ── 冷却域 ──
   /** 账号级冷却截止（epoch ms，0 = 无）。 */
@@ -289,7 +233,6 @@ export function createAccountState(input: {
     modelConfirm: {},
     breakerUntil: 0,
     restrictedUntil: 0,
-    lastUsedAt: 0,
     retryCount: 0,
     fails: 0,
     degradeUntil: 0,
@@ -381,7 +324,6 @@ export function normalizeAccountState(raw: unknown): AccountState | undefined {
     // 线上实测后果：`Math.max(undefined, x)` = NaN → 写库后读回 0，
     // 表现为「11140 罚了却看不出罚」，排查极难。
     restrictedUntil: num('restrictedUntil', base.restrictedUntil),
-    lastUsedAt: num('lastUsedAt', base.lastUsedAt),
     retryCount: num('retryCount', base.retryCount),
     fails: num('fails', base.fails),
     degradeUntil: num('degradeUntil', base.degradeUntil),
