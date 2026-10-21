@@ -371,17 +371,21 @@ export const CONTEXT_TRIM_NOTE_PREFIX = '（系统提示·上下文压缩）'
  *   在 OpenAI 兼容上游里也是合法位置。
  *
  * ⚠️ **不得**把被省略的消息内容摘进这条提示：那等于把隐私写进日志/上下文，
- * 也失去「压缩」的意义。这里只说条数。
+ * 也失去「压缩」的意义。
+ *
+ * ⚠️ **文案必须与当轮条数无关**（这条踩过）：
+ * 早先写的是「更早的 619 条消息…最近 101 条」，而这两个数字**每一轮都在变**
+ *（窗口随对话滑动）。于是 [首条 system + 摘要] 这一段前缀**每轮都不同** ⇒
+ * 上游 prefix cache 在摘要处就断掉，整段历史每轮全价重算。
+ * 现在只描述「发生过截断」这个事实，数字只进日志（日志不进上下文、不影响缓存）。
+ * 换来的收益：首条 system + 摘要 成为稳定前缀，可被缓存命中。
  */
-function buildTrimNote(dropped: number, kept: number): Msg {
+function buildTrimNote(): Msg {
   return {
     role: 'system',
     content:
-      `${CONTEXT_TRIM_NOTE_PREFIX} 更早的 ${dropped} 条消息因超出单请求消息数上限已被省略，`
-      + (kept > 0
-        ? `下面紧接的是最近 ${kept} 条消息的原文。`
-        : '保留窗口内没有能安全保留的消息（留下会拆散工具调用与结果）。')
-      + '省略的只是历史长度，不影响当前任务的上下文；'
+      `${CONTEXT_TRIM_NOTE_PREFIX} 更早的消息因超出单请求消息数上限已被省略，`
+      + '下面紧接的是保留的最近原文。省略的只是历史长度，不影响当前任务的上下文；'
       + '若确实需要其中某个细节，请向用户确认后重新索取。',
   }
 }
@@ -462,7 +466,7 @@ export function trimMessagesByLimit(messages: unknown[], limit: number): TrimMes
   const out: unknown[] = []
   if (keepHead) out.push(head)
   const kept = messages.length - start
-  out.push(buildTrimNote(dropped, kept))
+  out.push(buildTrimNote())
   for (let i = start; i < messages.length; i += 1) out.push(messages[i])
 
   // 兜底：同一套「id 交集」判据（与出站前的配对修复**共用**一个实现，不重写一遍）。

@@ -94,8 +94,14 @@ test('超限 ⇒ 保留首条 system + 最近 N 条，中间插一条摘要提�
   assert.deepEqual(result.messages[0], msgs[0], '首条 system 必须原样保留')
   const note = result.messages[1] as M
   assert.equal(note.role, 'system', '摘要用 system：用 user 会形成连续两条 user，Gemini 系判非法')
-  assert.match(String(note.content), /更早的 40 条消息[^。]*省略/)
+  assert.match(String(note.content), /更早的消息[^。]*省略/)
   assert.ok(String(note.content).startsWith(CONTEXT_TRIM_NOTE_PREFIX))
+  // 🔴 摘要文案**必须与当轮条数无关**：嵌了数字就会让 [首条 system + 摘要] 这个
+  // 前缀每轮都变，上游 prefix cache 在摘要处断掉、整段历史每轮全价重算。
+  assert.ok(
+    !/[0-9]/.test(String(note.content)),
+    '摘要文案不得出现任何数字（条数会逐轮变化，破坏 prefix cache）',
+  )
 
   // 最近的 10 条必须逐条相同、且顺序不变
   assert.deepEqual(result.messages.slice(2), msgs.slice(-10))

@@ -3442,3 +3442,113 @@ Cannot read properties of undefined (reading 'UPSTREAM_CHAT_BASE')
 「永久积分」与「有时效的赠送积分」的**来源**，而上游的 `get-user-resource`
 只给 `CapacityRemain` / `CycleCapacityRemain`，**没有来源标记** ——
 故这属于**上游数据不足以支撑**的语义，不是实现偷懒。
+
+---
+
+### 9.23 上下文治理 / 会话链 / 消耗熔断 / Qoder 思考档位（2026-10-21，四项同批）
+
+依据两份材料，不是拍脑袋：
+
+1. **workbuddy2api 的封禁事件复盘**
+   （`doc/incident-postmortem-and-hardening-checklist.md`，公开可查）——
+   三次封号前最后一次成功请求分别是 **2552 / 428→434 / 987~993 条消息**，
+   结论之一是「P2 上下文治理：单请求消息数硬上限 + 摘要压缩」与
+   「P2 额度监控：消耗速率异常自动熔断」。
+2. **dsh-our-free-model 的 Qoder 适配实现**（`qoder-product.ts` / `qoder-adapter.ts`）
+   —— 它在 Qoder 渠道上把思考档位做通了，而本项目此前完全没解析。
+
+#### 9.23.1 消息数硬上限（`MAX_CONTEXT_MESSAGES`）
+
+**默认 300，不是复盘建议的 100**，理由写在 `src/env.ts` 常量注释里，摘要：
+
+- 300 仍**低于三次封禁样本中的最小值 434**，还在同一量级防线内；
+- 取 100 的实测后果：`719 条 → 101 条`，一次丢掉 619 条历史。对 agent 场景是
+  实打实的质量损失，而复盘把根因写成**多因素叠加**（无设备指纹 / 会话链缺失 /
+  429 热重试 / 高频），本项目其余几项均已具备，不必单独拉到最紧。
+
+**接线点只有一个**：`handleChatCompletions` 里、`rawBody` 解析与 `deriveSessionKey`
+之后，**早于**聚合分支与两处 `handleProviderChat`。理由：这里是聚合路由、具名
+provider、buddy、`/v1/responses`（经 `responses.ts:888` 内部转调）的**共同入口**。
+分两处写正是本项目「同一个 bug 只修一半」的旧伤。
+
+放在 `deriveSessionKey` **之后**是刻意的：粘性 key 必须由完整历史算出，
+否则裁掉几条就每轮换 key、命中不了上游 prompt cache。
+
+**配对安全**（否则上游 400 `11148`）：保留窗口的左边界向后推进到第一条非 `tool`
+消息；若整段窗口都是 `tool` 结果，则向前回溯到发起这批调用的 `assistant`；
+最后再复用 `cleanupOrphanToolCalls` 同一套 id 交集判据兜底。
+
+**摘要文案必须与当轮条数无关**（这条踩过）：早先文案是「更早的 619 条消息…
+最近 101 条」，两个数字**每轮都在变**，于是 `[首条 system + 摘要]` 这段前缀每轮
+都不同 ⇒ prefix cache 在摘要处断掉、整段历史每轮全价重算。现在只描述「发生过
+截断」这个事实，**数字只进日志**（日志不进上下文）。测试里有一条断言：
+摘要文案**不得出现任何数字**。
+
+#### 9.23.2 会话链路（b3 + `x-conversation-*`）
+
+补 `x-b3-traceid`（32 hex，同会话稳定）/ `x-b3-spanid`（16 hex，每请求新生成）/
+`x-b3-sampled: 1`，以及会话级 message-id / request-id。
+
+- **`X-Conversation-ID` 保持带连字符的 UUIDv4，不是 32 hex**：这是本项目
+  `tests/intl-headers.test.ts` 钉死的官方桌面端实测形态，改成 32 hex 与实测相反。
+- **会话标识只认客户端显式 `user` / `conversation_id`**（沿用
+  `deriveSessionKey`），**绝不从消息内容推断** —— 宁可「不粘」也不能「错误地粘」，
+  错粘会把独立请求压到一处，被上游判成并发踢流。
+- 只接入**国际服**两处组装点（`intlReferenceChatHeaders`、`cliChatHeaders` 的
+  workbuddy 分支），**国内 buddy 分支一字未动**（有测试断言零污染）。
+- **刻意不做 `x-device-token`**：复盘明确「一设备一账号一 token，严禁多账号共用，
+  否则风控连坐」，与本项目多账号池架构直接冲突，风险大于收益。
+
+#### 9.23.3 消耗速率熔断
+
+采样（`AccountState.samples`，上限 6 条，随 state 持久化）+ 纯函数判定，
+命中**复用现有 `applyFailure({kind:'soft'})`**，不新造惩罚态；已在硬冷却时
+不把 `coolKind` 降级成 `soft`。
+
+**默认窗口是 1 小时，不是复盘写的 5 分钟**（这条踩过）：采样的唯一生产调用点是
+`AccountPoolDO.updateBalance`，而它只由**整点 cron** 与面板手动刷新触发 ——
+正常运行时**每小时才一个采样点**。窗口设 5 分钟 ⇒ 窗口内最多命中 1 个采样 ⇒
+比较基准恒等于当前值 ⇒ **检测永远休眠，既不误报也完全不生效**。
+复盘那套 5 分钟/20% 是配合高频轮询 `/v1/credits` 设计的，我们没有那个节奏。
+
+要更细粒度**必须先给网关请求路径加采样点**，只缩窗口会让检测重新失效。
+
+`revive()` 一并清空 `samples`：不清的话，触发熔断前的高消耗采样仍在窗口内，
+下一次 `updateBalance` 会拿它当基准**立刻再锁一次**，用户会看到「点了解冻，
+一分钟后又被锁」且找不到原因。
+
+#### 9.23.4 Qoder 思考档位
+
+**根因**：`parseQoderModelCatalog` 只读了 `is_reasoning`（有没有思考能力），
+**完全没读 `thinking_config.enabled.efforts`**（有哪些档位），于是 11 个 Qoder
+模型在 `/v1/models` 里全部没有 `reasoning_efforts`，客户端也就没有档位选择器。
+
+三个必须记住的口径（照参考实现的实测结论）：
+
+1. **取 `efforts` 的键名不取值**：目录形如
+   `efforts: { xhigh:{}, low:{}, medium:{is_default:true} }`，键即档位 id，
+   按目录原始顺序保存。
+2. **`is_default` 是「默认选中」不是「多选」**：IDE 里是下拉单选。
+3. **「关闭思考」不塞进 `efforts`**：它由独立的 `supportsDisable` 表达，
+   客户端自己会追加 `none`；手动塞会语义重复。
+
+档位必须在客户端白名单内（`none/low/medium/high/xhigh/max`），**不在的会被
+静默丢弃** —— 已加 `EFFORT_WHITELIST` 过滤。默认档位必须落在 `efforts` 内，
+否则客户端会发一个不存在的档位、上游回 `11150`。
+
+**链路要透传到底**：`QoderFallbackModel.efforts → ProviderModel.reasoningEfforts
+→ /v1/models.reasoning_efforts`。早期漏了 `toProviderModels` 这一环，
+档位解析出来了但下游一律看不到（与「倍率漏传导致面板显示 —」同款教训）。
+
+实测（`qodercn/` 8 个模型）：`dmodel [high,max] 默认=max · 可关闭`、
+`dfmodel [high,max,low] 默认=max · 可关闭`。
+
+#### 9.23.5 验证与遗留
+
+- `npm run typecheck` 0 错；`npm test` 764/764（基线 723 + 41 新增）。
+- 线上实测：`719 条 → 101 条 limit=100`（改 300 后 `785 条 → 302 条 limit=300`）；
+  `/v1/models` 54 个模型、其中 8 个 Qoder 模型带档位；真实对话返回
+  `reasoning_content` 非空。
+
+**遗留**：消耗熔断目前只有整点粒度，两次 cron 之间的突发抓不到 —— 需要网关
+请求路径采样点才谈得上分钟级。属于**已知限制**，不是 bug。
