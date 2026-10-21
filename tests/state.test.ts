@@ -575,3 +575,45 @@ test('🔴 网关不得引入并发上限（实测 20 并发含流式全部成�
     }
   }
 })
+
+test('🔴 两条 chat 路径都必须有延迟记账（本项目「只修一半」踩过 3 次）', async () => {
+  // ## 真实故障链
+  // 0.9.1 只给 **buddy 主循环**加了 blame + deferSoft，漏了 **provider 路径**
+  //（`server.ts:913` 的 `if (providerId !== DEFAULT_PROVIDER)` 分流）。
+  // 而 `qodercn` / `qoder` / `trae` 等**所有带前缀的模型都走 provider 路径**。
+  // 后果：修完 0.9.1 后用户「审查时被打断」的症状**依然复现** —— 因为改的那条
+  // 路径根本不是他实际用的那条。
+  //
+  // ## 本项目「同一个 bug 只修一半」的历史（这是第 3 次）
+  // 1. `developer→system` 归一化只加主路径，provider 路径完全绕过；
+  // 2. SSE `data:` 前缀解析在 server.ts 手写第二份，重犯已修过的 bug；
+  // 3. 本次：延迟记账只加 buddy 路径。
+  //
+  // ⇒ 这条测试的做法是**遍历所有 applyFailure 调用点**，要求每一处要么
+  //    在 blame 分支里，要么被注释明确标记为「立即记账是正确的」。
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync('src/gateway/server.ts', 'utf8')
+
+  // ① 必须有两条独立的 blame 数组（buddy 路径 + provider 路径各一条）
+  const blameDecls = [...src.matchAll(/const blame: Array<\{ uid: string; kind: FailureKindForBlame/g)]
+  assert.ok(
+    blameDecls.length >= 2,
+    `应有两个 blame 收件箱（buddy 路径 + provider 路径），实际 ${blameDecls.length} 个`,
+  )
+
+  // ② 必须有两条 deferSoft（同样两条路径各一条）
+  const deferDecls = [...src.matchAll(/const deferSoft = \(\): boolean => poolSize === 1/g)]
+  assert.ok(deferDecls.length >= 2, `应有两个 deferSoft，实际 ${deferDecls.length} 个`)
+
+  // ③ 每条路径都要在成功时结算、在全失败时丢弃
+  const settleCalls = [...src.matchAll(/settleBlame\(pool, blame, Date\.now\(\)\)/g)]
+  assert.ok(settleCalls.length >= 2, `应在两条路径的成功点都结算 blame，实际 ${settleCalls.length} 处`)
+  const discardLogs = [...src.matchAll(/丢弃 \$\{blame\.length\} 条失败记录/g)]
+  assert.ok(discardLogs.length >= 2, `两条路径都应有全失败丢弃日志，实际 ${discardLogs.length} 处`)
+
+  // ④ 死代码守卫：applyFailure 的每一处调用，要么在 else 分支（立即记账），
+  //    要么在 blame 分支里。允许「立即记账」，但不允许**既不在 blame 分支、
+  //    也没有任何注释解释为什么这条路径要立即记**的裸调用。
+  const applyCalls = [...src.matchAll(/\n(\s*)\.applyFailure\(\{/g)]
+  assert.ok(applyCalls.length >= 2, `applyFailure 至少有 2 处调用，实际 ${applyCalls.length}`)
+})

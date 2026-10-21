@@ -1284,17 +1284,25 @@ export async function handleChatCompletions(
 
       if (mapped.punish) {
         const cause = modelCauseFor(kind)
-        await pool
-          .applyFailure({
-            uid: candidate.uid,
-            kind: kind === 'rate_limited' ? dimension : mapped.dimension === 'model' ? 'model' : mapped.dimension,
-            now: Date.now(),
-            ...(model !== '' ? { model } : {}),
-            ...(resetAt !== undefined ? { resetAt } : {}),
-            ...(msg !== '' ? { reason: `${kind}: ${msg}`.slice(0, 200) } : {}),
-            ...(cause !== undefined ? { modelCause: cause } : {}),
-          })
-          .catch(logPoolError('applyFailure'))
+        const punishKind =
+          kind === 'rate_limited' ? dimension : mapped.dimension === 'model' ? 'model' : mapped.dimension
+        // ⚠️ 与 buddy 路径同一套纪律：累加型维度 + 单账号池的 soft 都延迟记账，
+        // 只有「换号后成功」才落账；全失败则丢弃（见上方 blame 的说明）。
+        if (punishKind === 'breaker' || punishKind === 'degrade' || (punishKind === 'soft' && deferSoft())) {
+          blame.push({ uid: candidate.uid, kind: punishKind, reason: `${kind}: ${msg}`.slice(0, 200) })
+        } else {
+          await pool
+            .applyFailure({
+              uid: candidate.uid,
+              kind: punishKind,
+              now: Date.now(),
+              ...(model !== '' ? { model } : {}),
+              ...(resetAt !== undefined ? { resetAt } : {}),
+              ...(msg !== '' ? { reason: `${kind}: ${msg}`.slice(0, 200) } : {}),
+              ...(cause !== undefined ? { modelCause: cause } : {}),
+            })
+            .catch(logPoolError('applyFailure'))
+        }
       }
 
       clearSessionBinding(pool, sessionKey, ctx)
@@ -1968,6 +1976,32 @@ export async function handleProviderChat(input: {
   let pinBlocked = false
   const maxRotate = await maxRotateFor(env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn')))
 
+  /**
+   * ⚠️ **provider 路径也要延迟记账**（2026-10-21 修，我自己上一次只修了一半）。
+   *
+   * 0.9.1 给 buddy 主循环加了 `blame` + `deferSoft`，但**漏了这条路径** ——
+   * 而 `qodercn` / `qoder` / `trae` 等**所有带前缀的模型都走这里**
+   *（`server.ts:913` 的 `if (providerId !== DEFAULT_PROVIDER)` 分流）。
+   *
+   * 后果与 buddy 路径完全相同：池里只有 1 个号时，一次瞬时抖动就让该号进 60 秒
+   * 软冷却，期间全部请求回 503「1 个账号都在冷却中」—— 用户报「审查时被打断」
+   * 的症状在修完 0.9.1 后**依然复现**，就是因为这条路径没修。
+   *
+   * ⚠️ 这是本项目第三次「同一个 bug 只修一半」
+   *（前两次：`developer→system` 归一化、SSE `data:` 前缀解析）。
+   * ⇒ 以后修任何记账/归一化逻辑，**必须 grep 出所有 `applyFailure` 调用点**再动手。
+   */
+  const blame: Array<{ uid: string; kind: FailureKindForBlame; reason: string }> = []
+  let poolSize = 0
+  try {
+    const all = await env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm)).listAccounts(realm, Date.now())
+    poolSize = all.filter((a) => (a.provider ?? '') === providerId && a.disabled !== true).length
+  } catch {
+    poolSize = 0
+  }
+  /** 单账号池时 soft 也延迟（理由见 buddy 路径的同名函数）。 */
+  const deferSoft = (): boolean => poolSize === 1
+
   for (let attempt = 0; attempt <= maxRotate; attempt += 1) {
     const now = Date.now()
     // ⚠️ 供应商过滤交给 `pick()` 做（`provider` 字段），
@@ -2066,6 +2100,10 @@ export async function handleProviderChat(input: {
                 onFirstChunk: () => {
                   const t = pool.noteSuccess(picked.uid, Date.now(), undefined, model).catch(logPoolError('noteSuccess'))
                   if (ctx !== undefined) ctx.waitUntil(t)
+                  // ✅ **结算 blame**：这个号成功了 ⇒ 之前那些失败确实是那几个号的问题。
+                  const settle = settleBlame(pool, blame, Date.now())
+                  if (ctx !== undefined) ctx.waitUntil(settle)
+                  else void settle
                   // ⚠️ 首帧到达即绑定会话 —— 此后同一会话优先落这个账号，
                   // 从第二轮起命中上游 prompt cache（更快、更省）。
                   if (sessionKey !== '' && ctx !== undefined) {
@@ -2596,6 +2634,16 @@ export async function handleProviderChat(input: {
     }
   }
 
+  // ⚠️ **丢弃 blame**（与 buddy 路径同一纪律）：所有候选都以同样方式失败，
+  // 没有「换号后成功」这个证据，就不能断定是那几个号坏了。
+  // 不丢弃的话这些记录会留在数组里既不算也不清 —— 虽然随函数返回被回收，
+  // 但**日志缺失**会让排障时误以为「没有失败过」。
+  if (blame.length > 0) {
+    console.warn(
+      `[blame] provider 路径全池同样失败，丢弃 ${blame.length} 条失败记录（不记熔断）: ` +
+        blame.map((b) => `${b.uid.slice(0, 8)}/${b.kind}`).join(','),
+    )
+  }
   return {
     response: jsonError(
       lastError?.status ?? 503,

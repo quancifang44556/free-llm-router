@@ -5,4 +5,4 @@
  * 不直接 import package.json：Workers 构建不开 resolveJsonModule，
  * 且没必要把整个 package.json 打进 Worker。
  */
-export const APP_VERSION = '0.9.1'
+export const APP_VERSION = '0.9.2'
