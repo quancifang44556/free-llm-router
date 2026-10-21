@@ -385,8 +385,44 @@ export const CHANNEL_BLOCKED_HINT =
   '（上游渠道校验拦截：与账号无关，多由客户端系统提示里的固定身份句或特征串触发；' +
   '网关已内置常见客户端的清洗，若仍复现请提供触发的系统提示首句）'
 
+/**
+ * 流内（首帧之后）错误的惩罚维度。
+ *
+ * 🔴 **必须与首帧/HTTP 分支同口径**（2026-10-21 审查补，重复实现专项）。
+ *
+ * ## 缺陷
+ * 原实现只有一句话：`CHANNEL_BLOCK_RE.test(message) ? 'soft' : 'breaker'`。
+ * 于是**同一个错误码**，行为取决于它从哪条路径到达：
+ * - 首帧到达（`classify` + `mapErrorToPunishment` + `refineModelScoped`）
+ *   ⇒ 6004/110 只锁**该模型**；
+ * - 首帧之后到达 ⇒ 一律 `breaker`（**账号级**，3 次 30 分钟起，按 `2^n` 到 6 小时）。
+ *
+ * 对单账号供应商（qoder），`breaker` 等于「整个供应商 30 分钟不可用」，
+ * 而正解只是「换一个模型」。
+ *
+ * ## 修法
+ * 用与另外两条路径同一个 `classify()`：限流/模型级/请求形状问题都只记 `soft`
+ *（模型维度冷却），只有真正「说不清、疑似账号本身坏了」才落 `breaker`。
+ * 解析不出错误码时仍兜底 `breaker` —— 失败方向保持保守。
+ */
 export function punishmentForStreamError(message: string): 'soft' | 'breaker' {
-  return CHANNEL_BLOCK_RE.test(message) ? 'soft' : 'breaker'
+  if (CHANNEL_BLOCK_RE.test(message)) return 'soft'
+  const kind = classify(200, message).kind
+  switch (kind) {
+    // 限流（6004/14017）、无此模型（11102）、档位拒绝（11158）：
+    // 都是**模型维度**的问题，换号/换模型能解，不该把整号熔断。
+    case 'rate_limited':
+    case 'model_unavailable':
+    case 'model_denied':
+      return 'soft'
+    // 请求本身的形状问题：换号也不会好，更不该罚号
+    case 'bad_request':
+    case 'context_exceeded':
+    case 'image_invalid':
+      return 'soft'
+    default:
+      return 'breaker'
+  }
 }
 
 /**

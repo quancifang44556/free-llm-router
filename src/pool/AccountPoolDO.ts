@@ -916,22 +916,63 @@ export class AccountPoolDO extends DurableObject<Env> {
     return config
   }
 
-  /** 更新防封配置（部分字段；未提供的保持原值）。 */
+  /**
+   * 更新防封配置（**只写调用方真正提供的字段**）。
+   *
+   * 🔴 **不能一次写全六个字段**（2026-10-21 审查补，配置健壮性专项）。
+   *
+   * ## 缺陷
+   * 原实现把六个字段**全部**算好再整体写入 —— 其中没提供的用 `cur` 顶替，
+   * 而 `cur` 是「已存值 ?? 环境变量」的合并结果。于是：
+   * 用户只要在面板点一下「会话链」开关，就把当时的**环境变量值**（常常还是 `0`）
+   * 固化进 `systemSafetyConfig`；此后 `num(stored)` 恒命中，`?? resolve*()` 永不执行
+   * ⇒ **环境变量被一个 UI 点击永久冻结，且零提示**。
+   *
+   * 实测（真 DO + 真 SQLite）：
+   * ```
+   * 面板保存 {"sessionTrace":true} 写成 rateLimitQps=0
+   * 之后把 env 改成 "0.5" 并重读：rateLimitQps=0   ⚠️ 被压住
+   * ```
+   * 用户视角就是「我设了 0.5，面板显示 0」。
+   *
+   * ## 修法
+   * 只把**本次显式提供的合法字段**落到存储；没提到的字段**不写**
+   * ⇒ 它们继续走环境变量回落，改动 env 立刻生效。
+   */
   async setSafetyConfig(input: Partial<SafetyConfig>): Promise<SafetyConfig> {
-    const cur = await this.getSafetyConfig()
-    const num = (v: unknown, min: number, max: number, fallback: number): number =>
-      typeof v === 'number' && Number.isFinite(v) && v >= min && v <= max ? v : fallback
-    const next: SafetyConfig = {
-      sessionTrace: typeof input.sessionTrace === 'boolean' ? input.sessionTrace : cur.sessionTrace,
-      maxContextMessages: num(input.maxContextMessages, 0, 100_000, cur.maxContextMessages),
-      burnRateWindowMs: num(input.burnRateWindowMs, 0, 86_400_000, cur.burnRateWindowMs),
-      burnRateThresholdPct: num(input.burnRateThresholdPct, 0, 100, cur.burnRateThresholdPct),
-      rateLimitQps: num(input.rateLimitQps, 0, 50, cur.rateLimitQps),
-      rateJitterMs: num(input.rateJitterMs, 0, 10_000, cur.rateJitterMs),
+    const stored = (await this.ctx.storage.get<Partial<SafetyConfig>>('systemSafetyConfig')) ?? {}
+    const next: Partial<SafetyConfig> = { ...stored }
+    const num = (v: unknown, min: number, max: number): number | undefined =>
+      typeof v === 'number' && Number.isFinite(v) && v >= min && v <= max ? v : undefined
+    const rejected: string[] = []
+
+    if (input.sessionTrace !== undefined) {
+      if (typeof input.sessionTrace === 'boolean') next.sessionTrace = input.sessionTrace
+      else rejected.push('sessionTrace')
     }
+    for (const [key, min, max] of [
+      ['maxContextMessages', 0, 100_000],
+      ['burnRateWindowMs', 0, 86_400_000],
+      ['burnRateThresholdPct', 0, 100],
+      ['rateLimitQps', 0, 50],
+      ['rateJitterMs', 0, 10_000],
+    ] as const) {
+      const raw = input[key]
+      if (raw === undefined) continue
+      const v = num(raw, min, max)
+      if (v === undefined) rejected.push(key)
+      else next[key] = v
+    }
+
+    if (rejected.length > 0) {
+      // ⚠️ 越界值**不静默**：以前是「保持原值 + 回 ok:true」，脚本会误判成功。
+      console.warn(`[safety] 以下字段越界或非数，已忽略：${rejected.join(', ')}`)
+    }
+
     await this.ctx.storage.put('systemSafetyConfig', next)
-    this.cachedSafetyConfig = next
-    return next
+    // ⚠️ 必须清缓存：合并结果（stored ?? env）变了，不复算的话本实例继续用旧值。
+    this.cachedSafetyConfig = undefined
+    return await this.getSafetyConfig()
   }
 
   /** 账号池计数摘要（供 `/healthz` 与面板）。 */

@@ -13,6 +13,7 @@ import path from 'node:path'
 
 import { readTextCapped } from '../src/gateway/body.js'
 import { startServer } from '../src/server/index.js'
+import { punishmentForStreamError } from '../src/gateway/server.js'
 
 const KEY = 'gate-cap-key'
 
@@ -116,5 +117,24 @@ test('🔴 停用列表里的陈旧 `auto` 不得把默认入口 buddy/auto 打�
     if (saved === undefined) delete process.env.API_KEY
     else process.env.API_KEY = saved
     for (const f of [tmp, `${tmp}-wal`, `${tmp}-shm`]) fs.rmSync(f, { force: true })
+  }
+})
+
+test('🔴 流内「模型级」错误只能记 soft，不能把整号熔断', () => {
+  // 6004 = 模型级限流；110 = 模型不可用。同一个码在首帧路径只锁模型，
+  // 在首帧之后却落 breaker（账号级，3 次 30 分钟起）—— 这就是「整个供应商不可用」的成因。
+  const cases: Array<[string, 'soft' | 'breaker', string]> = [
+    ['{"code":6004,"msg":"usage exceeds frequency limit, please switch to the other models"}', 'soft', '6004 模型级限流'],
+    ['{"code":110,"msg":"model not found"}', 'soft', '110 模型不可用'],
+    ['{"code":11128,"msg":"unapproved channel"}', 'soft', '渠道指纹被拒（不罚号）'],
+    // 说不清的才兜底 breaker —— 失败方向保持保守
+    ['{"msg":"something weird happened"}', 'breaker', '无法归类的错误'],
+  ]
+  for (const [msg, expected, label] of cases) {
+    assert.equal(
+      punishmentForStreamError(msg),
+      expected,
+      `⚠️ ${label} 被判成 ${punishmentForStreamError(msg)}（期望 ${expected}）`,
+    )
   }
 })
