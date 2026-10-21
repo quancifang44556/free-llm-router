@@ -19,6 +19,8 @@
  */
 
 import { TaskRunnerDO, type RunContext, type TaskStep } from './taskrunner/TaskRunnerDO.js'
+import { classify } from './upstream/client.js'
+import { diagnoseAccount } from './pool/state.js'
 import { AccountPoolDO } from './pool/AccountPoolDO.js'
 import { planByName, type PlanName } from './taskrunner/plans.js'
 import { cstDay } from './upstream/travel.js'
@@ -3551,6 +3553,141 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
   }
 
   // ── 账号列表 ──
+  /**
+   * 账号当前状态诊断（五维度冷却总览）。
+   *
+   * ## 为什么需要它（用户明确要求）
+   * 用户的原话是「能不能加一个显示冷却时间的功能，因为我看会返回当前模型达到冷却，
+   * 冷却到什么时候」。而 `/admin/accounts` 虽然已经回传了 `until` / `breakerUntil` /
+   * `restrictedUntil` / `modelCooldowns`，但那是**原始时间戳**，用户得自己减、
+   * 自己认字段 —— 且五个维度彼此正交，看单个字段无法回答「现在到底能不能用」。
+   *
+   * 本端点把它们汇总成一句人话 + 结构化明细，判据全部复用 `isActive()` / `healthy()`
+   *（不另写一套，避免本项目反复踩的「双判据」坑）。
+   */
+  if (path === '/admin/accounts/diagnose' && request.method === 'GET') {
+    const realm = url.searchParams.get('realm') ?? 'cn'
+    const stub = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
+    const now = Date.now()
+    const accounts = await stub.listAccounts(realm, now)
+    return json({
+      realm,
+      now,
+      accounts: accounts.map((a) => diagnoseAccount(a, now)),
+    })
+  }
+
+  /**
+   * 主动探测：**真的打一次上游**，回答「这个号现在到底能不能用」。
+   *
+   * ## 与 `/admin/accounts/diagnose` 的分工
+   * - `diagnose` 只看**库里已有的记录**（冷却/熔断/限制）⇒ 廉价、无副作用；
+   * - `probe` 真的发一次最小请求 ⇒ 能发现「库里没记录但其实已经不可用」
+   *   （如凭据悄悄失效、上游对该号静默降级）。
+   *
+   * ## 关键取舍：**不临时清除冷却**
+   * 曾考虑探测前清冷却、探测后恢复，但：
+   *   ① 恢复需要重放 `applyFailure`，会**干扰真实的指数退避计数**（把 streak 打乱）；
+   *   ② 探测中途失败（超时/客户端断开）会让账号**永久停在"无冷却"状态**，
+   *      相当于把保护关掉了 —— 代价远大于收益。
+   * ⇒ 采用**只读探测**：不改池状态，若账号正冷却则在 `note` 里如实说明
+   *   「本次探测反映上游真实状态，但网关仍不会派单」。
+   *
+   * ## 分类复用现有判据
+   * `verdict` 由 `classify()` + `mapErrorToPunishment()` 推出，不另写一套。
+   */
+  if (path === '/admin/accounts/probe' && request.method === 'POST') {
+    const body = (await request.json().catch(() => ({}))) as {
+      uid?: unknown
+      model?: unknown
+      realm?: unknown
+    }
+    const realm = typeof body.realm === 'string' && body.realm !== '' ? body.realm : 'cn'
+    const onlyUid = typeof body.uid === 'string' && body.uid !== '' ? body.uid : undefined
+    const wantedModel = typeof body.model === 'string' && body.model !== '' ? body.model : undefined
+
+    const stub = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
+    const now = Date.now()
+    const all = await stub.listAccounts(realm, now)
+    const targets = onlyUid === undefined ? all : all.filter((a) => a.uid === onlyUid)
+    if (onlyUid !== undefined && targets.length === 0) {
+      return jsonError(400, `账号不存在：${onlyUid}`, 'invalid_request')
+    }
+
+    /** 每个账号一条结果的累加器。 */
+    const results: Array<Record<string, unknown>> = []
+    for (const acct of targets) {
+      const providerId = acct.provider ?? DEFAULT_PROVIDER
+      const model = wantedModel ?? `${providerId}/auto`
+      const stateBefore = diagnoseAccount(acct, Date.now())
+      const startedAt = Date.now()
+
+      // ⚠️ 串行探测：单账号池下并发打上游只会加重风控（本项目的核心教训之一）。
+      // 用内部 Request 走真实网关链路，等价于一次真实调用但拿到结构化结果。
+      const probeReq = new Request('https://internal/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: `Bearer ${env.API_KEY ?? ''}` },
+        body: JSON.stringify({
+          model,
+          messages: [{ role: 'user', content: '1' }],
+          max_tokens: 1,
+          stream: false,
+        }),
+      })
+
+      let ok = false
+      let detail = ''
+      let verdict = 'healthy'
+      try {
+        const gatewayResult = await handleChatCompletions(probeReq, env, realm, ctx)
+        if (gatewayResult.response.ok) {
+          ok = true
+        } else {
+          const errJson = (await gatewayResult.response.json().catch(() => ({}))) as {
+            error?: { message?: string }
+          }
+          detail = errJson.error?.message ?? `HTTP ${gatewayResult.response.status}`
+          // 复用错误分类：把「谁的错」翻成用户能行动的三类
+          const { kind } = classify(gatewayResult.response.status, detail)
+          if (kind === 'auth_error' || kind === 'request_illegal') verdict = 'account_problem'
+          else if (kind === 'model_unavailable' || kind === 'model_denied') verdict = 'model_problem'
+          else verdict = 'upstream_problem'
+        }
+      } catch (error) {
+        detail = error instanceof Error ? error.message : String(error)
+        verdict = /timeout|abort|timed out/i.test(detail) ? 'timeout' : 'upstream_problem'
+      }
+
+      results.push({
+        uid: acct.uid,
+        provider: providerId,
+        nickname: acct.nickname ?? '',
+        model,
+        ok,
+        latencyMs: Date.now() - startedAt,
+        verdict,
+        detail: detail.slice(0, 300),
+        stateBefore: { summary: stateBefore.summary, healthy: stateBefore.healthy, blockedBy: stateBefore.blockedBy },
+        note:
+          stateBefore.healthy
+            ? ''
+            : `账号当前处于「${stateBefore.summary}」，本次探测反映上游真实状态，但网关仍不会派单`,
+      })
+    }
+
+    const tally = { total: results.length, healthy: 0, account_problem: 0, model_problem: 0, upstream_problem: 0, timeout: 0 }
+    for (const r of results) {
+      const v = String(r['verdict'] ?? '')
+      if (v === 'healthy') tally.healthy += 1
+      else if (v === 'account_problem') tally.account_problem += 1
+      else if (v === 'model_problem') tally.model_problem += 1
+      else if (v === 'timeout') tally.timeout += 1
+      else tally.upstream_problem += 1
+    }
+
+    return json({ realm, probedAt: Date.now(), results, summary: tally })
+  }
+
   if (path === '/admin/accounts' && request.method === 'GET') {
     const realm = url.searchParams.get('realm') ?? 'cn'
     const stub = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))

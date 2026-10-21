@@ -425,3 +425,198 @@ export function pruneExpired(state: AccountState, now: number, costTtlMs: number
 
   return changed
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 账号状态诊断（供 `/admin/accounts/diagnose` 与面板使用）
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** 单个维度的诊断结果。 */
+export interface DimensionView {
+  active: boolean
+  /** 到期时刻（epoch ms）。`0` = 无。 */
+  until: number
+  /** 还剩多少毫秒（已 clamp 到 >= 0）。前端不该自己减，避免时钟漂移两处不一致。 */
+  remainingMs: number
+  /** 可读原因。 */
+  reason: string
+}
+
+/** 模型级冷却的诊断条目（比 DimensionView 多模型名与计数）。 */
+export interface ModelDimensionView extends DimensionView {
+  model: string
+  hits: number
+  /**
+   * 审计条目（`auditOnly`）不参与选号判定。
+   *
+   * ⚠️ 必须暴露：否则用户看到「这个模型冷却中」却发现请求能通，会以为面板在骗人。
+   */
+  auditOnly: boolean
+  /** 上游给出的原始重置时刻；`0` = 无。 */
+  resetAt: number
+}
+
+/** 一个账号的完整诊断。 */
+export interface AccountDiagnosis {
+  uid: string
+  provider: string
+  nickname: string
+  disabled: boolean
+  /** 是否可派单。**与 `blockedBy` 同源**（都用 `healthy()` 的判据），不会自相矛盾。 */
+  healthy: boolean
+  /**
+   * 命中了哪些维度（可多个）。
+   *
+   * 取值：`disabled` / `account_cooldown` / `model_cooldown` / `breaker` /
+   * `degrade` / `restricted`
+   */
+  blockedBy: string[]
+  /**
+   * 一句人话总结。
+   *
+   * ⚠️ 多维度同时命中时取「**最远的那个**」作为主因 —— 因为用户真正关心的是
+   * 「什么时候能恢复」，而恢复时刻由最远的那个维度决定。
+   */
+  summary: string
+  dimensions: {
+    accountCooldown: DimensionView & { kind: string }
+    modelCooldowns: ModelDimensionView[]
+    breaker: DimensionView
+    degrade: DimensionView
+    restricted: DimensionView
+  }
+  counters: {
+    fails: number
+    softStreak: number
+    consecutiveFails: number
+    successCount: number
+    errTotal: number
+    lastSuccess: number
+    lastErr: number
+  }
+  /** `AccountState.reason` 原文（上游/我们的最后一条原因）。 */
+  reason: string
+}
+
+/** 把毫秒转成人话（`42 秒` / `12 分钟` / `1 小时 58 分`）。 */
+export function humanizeMs(ms: number): string {
+  if (ms <= 0) return '0 秒'
+  const totalSec = Math.ceil(ms / 1000)
+  if (totalSec < 60) return `${totalSec} 秒`
+  const totalMin = Math.ceil(totalSec / 60)
+  if (totalMin < 60) return `${totalMin} 分钟`
+  const h = Math.floor(totalMin / 60)
+  const m = totalMin % 60
+  return m === 0 ? `${h} 小时` : `${h} 小时 ${m} 分`
+}
+
+/** 构造单个维度视图。 */
+function dimensionOf(until: number, now: number, reason: string): DimensionView {
+  const active = isActive(until, now)
+  return {
+    active,
+    until: active ? until : 0,
+    remainingMs: active ? Math.max(0, until - now) : 0,
+    reason: active ? reason : '',
+  }
+}
+
+/**
+ * 生成一个账号的完整诊断。
+ *
+ * ⚠️ **所有判据都复用 `isActive()`**，不另写一套 —— 本项目反复踩过
+ * 「同一概念两处判据不一致」的坑（`healthy()` 说能用、`blockedBy` 说有冷却）。
+ */
+export function diagnoseAccount(state: AccountState, now: number): AccountDiagnosis {
+  const blockedBy: string[] = []
+
+  const accountCooldownRaw = dimensionOf(state.until, now, state.reason)
+  const breaker = dimensionOf(state.breakerUntil, now, '连续失败熔断')
+  const degrade = dimensionOf(state.degradeUntil, now, '连续业务失败降权')
+  const restricted = dimensionOf(state.restrictedUntil, now, '上游标记账号受限（11140）')
+
+  const modelCooldowns: ModelDimensionView[] = Object.entries(state.modelCooldowns)
+    .map(([model, mc]) => {
+      const view = dimensionOf(mc.until, now, mc.reason)
+      return {
+        ...view,
+        model,
+        hits: mc.hits ?? 0,
+        auditOnly: mc.auditOnly === true,
+        resetAt: mc.resetAt ?? 0,
+      }
+    })
+    // 只列「正在冷却」或「审计条目」；已过期的由 pruneExpired 清理，不必展示噪音
+    .filter((m) => m.active || m.auditOnly)
+    .sort((a, b) => b.remainingMs - a.remainingMs)
+
+  if (state.disabled) blockedBy.push('disabled')
+  if (accountCooldownRaw.active) blockedBy.push('account_cooldown')
+  if (modelCooldowns.some((m) => m.active && !m.auditOnly)) blockedBy.push('model_cooldown')
+  if (breaker.active) blockedBy.push('breaker')
+  if (degrade.active) blockedBy.push('degrade')
+  if (restricted.active) blockedBy.push('restricted')
+
+  /**
+   * `healthy` 直接复用 `healthy()`。
+   *
+   * ⚠️ 注意 `healthy()` **不看 `modelCooldowns`**（那是 `healthyForModel()` 的事）——
+   * 因为模型级冷却不阻止账号被选去服务**别的**模型。
+   * 故 `blockedBy` 里可能有 `model_cooldown` 而 `healthy === true`，
+   * 这**不是矛盾**，而是正确语义：账号可用，但那几个模型暂时不行。
+   */
+  const isHealthy = healthy(state, now)
+
+  // 主因：取剩余时间最远的那个维度（恢复时刻由它决定）
+  const candidates: Array<{ label: string; ms: number }> = []
+  if (state.disabled) candidates.push({ label: '账号已停用', ms: Number.MAX_SAFE_INTEGER })
+  if (accountCooldownRaw.active) {
+    const kindText = state.coolKind === 'hard' ? '余额耗尽' : '限流'
+    candidates.push({ label: `账号冷却中（${kindText}），还剩 ${humanizeMs(accountCooldownRaw.remainingMs)}`, ms: accountCooldownRaw.remainingMs })
+  }
+  if (breaker.active) candidates.push({ label: `连续失败熔断中，还剩 ${humanizeMs(breaker.remainingMs)}`, ms: breaker.remainingMs })
+  if (degrade.active) candidates.push({ label: `降权中，还剩 ${humanizeMs(degrade.remainingMs)}`, ms: degrade.remainingMs })
+  if (restricted.active) candidates.push({ label: `上游标记账号受限，还剩 ${humanizeMs(restricted.remainingMs)}`, ms: restricted.remainingMs })
+
+  const activeModels = modelCooldowns.filter((m) => m.active && !m.auditOnly)
+  if (activeModels.length > 0) {
+    const furthest = activeModels[0]!
+    const names = activeModels.map((m) => m.model).join('、')
+    candidates.push({
+      label: `模型 ${names} 冷却中，还剩 ${humanizeMs(furthest.remainingMs)}（账号本身可用）`,
+      ms: furthest.remainingMs,
+    })
+  }
+
+  let summary = '可用'
+  if (candidates.length > 0) {
+    candidates.sort((a, b) => b.ms - a.ms)
+    summary = candidates[0]!.label
+  }
+
+  return {
+    uid: state.uid,
+    provider: state.provider ?? '',
+    nickname: state.nickname ?? '',
+    disabled: state.disabled,
+    healthy: isHealthy,
+    blockedBy,
+    summary,
+    dimensions: {
+      accountCooldown: { ...accountCooldownRaw, kind: state.coolKind },
+      modelCooldowns,
+      breaker,
+      degrade,
+      restricted,
+    },
+    counters: {
+      fails: state.fails,
+      softStreak: state.softStreak,
+      consecutiveFails: state.consecutiveFails,
+      successCount: state.successCount,
+      errTotal: state.errTotal,
+      lastSuccess: state.lastSuccess,
+      lastErr: state.lastErr,
+    },
+    reason: state.reason,
+  }
+}
