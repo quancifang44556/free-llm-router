@@ -125,28 +125,30 @@ const CODE_KIND: Record<number, ErrorKind> = {
   14003: 'rate_limited',
   14018: 'credit_exhausted',
   /**
-   * 🔴 **qoder 的额度用尽码 `110`**（2026-10-21 实测，用户报「API 密钥无效」的真凶）。
+   * **qoder 业务码 `110`（`Billing daily count exceeded`）** —— 2026-10-21 实测定性。
    *
-   * ## 故障链
-   * qoder 额度用尽时返回 **HTTP 403 + `{"code":"110","message":"Billing ..."}`**。
-   * `qoder.ts:1541` 抛 `ProviderError` 时沿用 `httpStatus: status`（=403），
-   * message 是中文「Qoder 当日额度已用尽（403）：…」。
+   * ## 它**不是**额度耗尽（这点我一开始搞错了）
+   * 用户是专业版会员，明确说「不可能用尽」。实测 `/admin/accounts/balance`
+   * 直连上游拿到 **`credits: 4565`（充足）**。上游原文的关键词是
+   * **`count`（次数）**，不是 credits（额度）⇒ 这是**日调用次数**上限。
    *
-   * 网关侧 `classify(403, …)` 的流程：
-   *   ① `isWafBlocked(403, 中文)` → false（CJK 加固生效 ✅）
-   *   ② `parseEnvelope` **成功**解析出 `code:110`
-   *   ③ 但本表**没有 110** ⇒ 查不到 kind
-   *   ④ 落到「403 且非 WAF」的兜底 ⇒ **`auth_error`**
+   * ## 一次代价高昂的错误映射（必须记住）
+   * 我最初把它映射成 `credit_exhausted`，而它的处置是 `dimension: 'hard'`
+   * ⇒ **硬冷却到次日 04:00** ⇒ 账号被锁 **619 分钟（10.3 小时）**，
+   * 而账号完全健康、额度充足。**把语义未明的码映射到最重的处置，代价远大于收益。**
    *
-   * ⇒ 客户端看到 `auth_error` 就提示「**API 密钥无效**」——
-   * 而真相是**当日额度用尽**，处置完全不同（等次日重置 vs 换密钥）。
-   * 这是本项目「错误文案误导」的第 N 次复发。
+   * ## 为什么现在映射成 `rate_limited`
+   * - 语义对：日次数上限就是一种限流；
+   * - **代价小**：`rate_limited` → `dimension: 'soft'`（60 秒，非 10 小时）；
+   * - **单账号池下不产生持久冷却**：`deferSoft()` 在 `poolSize === 1` 时把 soft
+   *   压进 `blame` 延迟记账，全失败则**丢弃**（不记账）⇒ 账号不会被锁；
+   * - 文案诚实：错误里显示 `rate_limited:` 而非 `auth_error:`，
+   *   客户端不会再误报「API 密钥无效」。
    *
-   * ⚠️ `110` 只在 `qoder.ts` 内部被 `QODER_BILLING_CODE` 处理过，
-   * 从未进过全局码表 —— 而网关的 `classify()` 用的是这张全局表。
-   * 「provider 自己认识、网关不认识」是这类误判的结构性来源。
+   * ⚠️ 若将来确认 110 是**账号级**日上限（而非模型级），应改成 `dimension: 'model'`
+   * 并携带 `resetAt`（次日 00:00），让它只冷却该模型而不是账号。
    */
-  110: 'credit_exhausted',
+  110: 'rate_limited',
   14017: 'rate_limited',
   11158: 'model_denied',
   11140: 'request_illegal',

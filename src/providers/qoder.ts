@@ -1537,15 +1537,35 @@ async function chat(
       continue
     }
 
-    // ── 额度用尽（业务码 110）→ **不可重试**，如实上报 ──
+    // ── 业务码 110（`Billing daily count exceeded`）→ 如实上报 ──
+    //
+    // ## 🔴 这里原先把 110 写成「当日额度已用尽」，**是错的**（2026-10-21 实测纠正）
+    //
+    // 用户是专业版会员，明确表示「不可能用尽」。实测 `/admin/accounts/balance`
+    // 直连上游拿到的 **`credits: 4565`（充足）**，而坐实了 110 的真实语义：
+    // 上游原文是 `Billing daily count exceeded` —— 关键词是 **count（次数）**，
+    // 不是 credits（额度）。**这不是余额耗尽。**
+    //
+    // ## 更严重的一次错误连锁（必须记住）
+    // 我一度把 `110` 加进全局 `CODE_KIND` → `credit_exhausted`，
+    // 而 `credit_exhausted` 的处置是 `dimension: 'hard'` ⇒ **硬冷却到次日 04:00**。
+    // 于是「一个语义未明的码」直接让账号被锁 **619 分钟（10.3 小时）**，
+    // 而账号其实完全健康。**把不确定的码映射到最重的处置，代价远大于收益。**
+    // ⇒ 已回滚：110 不再进全局码表（保持 `punish: false`，不冷却账号）。
+    //
+    // ## 现在的处置
+    // `retryable: false`：日次数上限按自然日重置，短重试无意义。
+    // 文案**如实引用上游原文**，不再替上游下「额度用尽」的结论 ——
+    // 用户看到 `Billing daily count exceeded` 才能自己去判断/申诉。
     if (looksLikeQoderBillingError(text)) {
       throw new ProviderError({
         provider: product.id,
         httpStatus: status,
-        // ⚠️ `retryable: false`：额度按自然日结算，重试与换号都无意义；
-        // 标记应为「UTC+8 当日 24:00 解禁」（由账号池负责，不在本层）。
         retryable: false,
-        message: `Qoder 当日额度已用尽（${status}）：${text.slice(0, 300)}`,
+        message:
+          `Qoder 返回业务码 110（${status}）：${text.slice(0, 300)}`
+          + '\n⚠️ 这不是「余额耗尽」（实测该账号 credits 仍有数千），'
+          + '上游原文是「Billing daily count exceeded」，更像是**日调用次数**上限。',
       })
     }
 

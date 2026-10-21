@@ -463,7 +463,21 @@ export function refineModelScoped(
   if (isChannelBlockedText) return { dimension: 'soft', code, resetAt }
   // 6004 / 14003 = 模型级限流（切模型即可用，不该罚整个账号）
   // 11134 = 模型供应方暂不可用（同属「换个模型就行」）
-  if (code === 6004 || code === 14003 || code === 11134) return { dimension: 'model', code, resetAt }
+  /**
+   * ⚠️ **`110` 也必须在这里**（2026-10-21 实测）。
+   *
+   * qoder 的 `110`（`Billing daily count exceeded`）是**模型级**日次数上限 ——
+   * 实测证据：同一账号下 `dfmodel` 返回 110，而
+   * `qmodel` / `dmodel` / `auto` / `gmodel` / `mmodel` **全部 200 可用**，
+   * 且 `/admin/accounts/balance` 显示 `credits: 4565`（充足）。
+   *
+   * ⇒ 若只映射成 `rate_limited` 而不在这里归到 `model`，它会落进 `dimension: 'soft'`
+   * 即**账号级**冷却 —— 短暂锁住整个账号，连带影响那些本来能用的模型。
+   * 归到 `model` 后只冷却 `dfmodel`，其余模型不受影响（`healthyForModel` 按模型判）。
+   */
+  if (code === 6004 || code === 14003 || code === 11134 || code === 110) {
+    return { dimension: 'model', code, resetAt }
+  }
   // ⚠️ 文案兜底（第二道腿）：上游换码值时仍能判对。只认「模型」语义的措辞，
   // **不得**匹配泛泛的 "too many requests"（那是真·账号级限流）。
   //
@@ -484,8 +498,27 @@ export function refineModelScoped(
 
 /** 从响应体里读业务码（`{"code":6004,...}`）。 */
 export function parseBusinessCode(bodyText: string): number | undefined {
-  const m = /"code"\s*:\s*(\d+)/.exec(bodyText)
-  return m === null ? undefined : Number.parseInt(m[1] ?? '', 10)
+  /**
+   * 🔴 **必须同时认「带引号的字符串码」**（2026-10-21 实测缺陷）。
+   *
+   * 旧正则 `/"code"\s*:\s*(\d+)/` **只认未加引号的数字**（`{"code":6004}`），
+   * 而 qoder 实际返回的是 **`{"code":"110"}`**（值是字符串）。
+   * ⇒ 解析返回 `undefined` ⇒ `refineModelScoped` 的模型级判据（6004/14003/11134/110）
+   * 全部失效 ⇒ 落回 `dimension: 'soft'`（**账号级**冷却）
+   * ⇒ 一个「只有某模型不可用」的错误把整个账号锁住了。
+   *
+   * 两个分支**必须成对**：
+   * - 有引号时必须要求**闭合引号**，否则 `"11‑128"` 会被截成 `11`（错值）；
+   * - 无引号时按裸数字解析（`{"code":6004}`）。
+   *
+   * ⚠️ `11‑128` 里的连字符是 **U+2011**（非 ASCII），`\d+` 不会跨越它，
+   * 且闭合引号分支要求数字后紧跟 `"`，故 `"11‑128"` 正确地解析不出数字
+   * —— 那类码由 `isChannelBlockedText` 单独处理。
+   */
+  const quoted = /"code"\s*:\s*"(\d+)"/.exec(bodyText)
+  if (quoted !== null) return Number.parseInt(quoted[1] ?? '', 10)
+  const bare = /"code"\s*:\s*(\d+)/.exec(bodyText)
+  return bare === null ? undefined : Number.parseInt(bare[1] ?? '', 10)
 }
 
 /**

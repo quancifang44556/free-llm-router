@@ -211,27 +211,79 @@ test('⚠️ 关键回归：parseEnvelope 与 classify 必须能识别带 data: 
   assert.equal(shouldRotate(classify(200, sseMulti).kind), true, '限流帧必须触发换号重试')
 })
 
-test('🔴 qoder 额度用尽码 110 必须归为 credit_exhausted（不是 auth_error）', async () => {
-  // ## 真实故障（2026-10-21，用户报「我用不了 qd 渠道了，提示 api 秘钥无效」）
-  // qoder 额度用尽返回 **HTTP 403 + {"code":"110"}**，而 `110` 从未进过全局
-  // `CODE_KIND` 表（只在 `qoder.ts` 内部被 `QODER_BILLING_CODE` 处理过）。
-  // 于是网关 `classify(403, …)` 走到「403 且非 WAF」的兜底 ⇒ **`auth_error`**
-  // ⇒ 客户端提示「**API 密钥无效**」，而真相是**当日额度用尽**。
+test('🔴 业务码 110 = 日次数上限（不是额度耗尽，绝不能触发 10 小时硬冷却）', async () => {
+  // ## 事故复盘（2026-10-21，我自己造成的，代价 10 小时）
+  // 用户报「我用不了 qd 渠道了，提示 api 秘钥无效」。
+  // 我先把 110 当成 `credit_exhausted`（以为额度用尽），结果：
+  //   · `credit_exhausted` → `dimension: 'hard'` ⇒ **硬冷却到次日 04:00**
+  //   · 账号被锁 **619 分钟（10.3 小时）**，而实测 `credits: 4565`（充足）
+  //   · 用户明确说「我是专业版会员不限制的」—— 他是对的
   //
-  // 两者处置完全相反：前者要换密钥（白费功夫），后者等次日重置即可。
+  // 上游原文是 `Billing daily count exceeded`：关键词 **count（次数）**，不是 credits。
+  //
+  // ## 现在的定性
+  // 110 → `rate_limited`（语义=限流），处置 `dimension: 'soft'`（60 秒）。
+  // 且单账号池下 `deferSoft()` 会把它压进 `blame` 延迟记账、全失败则**丢弃**
+  // ⇒ 账号不会被锁住。文案也不再是 `auth_error`（避免客户端误报「密钥无效」）。
   const { classify } = await import('../src/upstream/client.ts')
 
-  // 网关侧拿到的文本形态：provider 包了一层中文前缀
-  const withPrefix = 'Qoder 当日额度已用尽（403）：{"code":"110","message":"Billing d..."}'
-  assert.equal(classify(403, withPrefix).kind, 'credit_exhausted', '带中文前缀也要认出 110')
+  const body = 'Qoder 返回业务码 110（403）：{"code":"110","message":"Billing daily count exceeded"}'
 
-  // 纯 JSON 形态
-  assert.equal(classify(403, '{"code":"110","message":"Billing"}').kind, 'credit_exhausted')
-  // 数字形态
-  assert.equal(classify(403, '{"code":110}').kind, 'credit_exhausted')
+  // ① 必须是限流语义，不是额度耗尽
+  assert.equal(classify(403, body).kind, 'rate_limited')
+  assert.equal(classify(403, '{"code":"110"}').kind, 'rate_limited')
 
-  // ⚠️ 反向守卫：不得把别的 403 也吞成 credit_exhausted
-  assert.equal(classify(403, 'Forbidden').kind, 'waf_blocked', '真 WAF 仍要判 waf_blocked')
-  assert.equal(classify(403, '{"code":11140,"msg":"request illegal"}').kind, 'request_illegal')
-  assert.equal(classify(403, '{"code":14018}').kind, 'credit_exhausted', '14018 也是额度用尽')
+  // ② 绝不能是 auth_error（那会让客户端提示「API 密钥无效」）
+  assert.notEqual(classify(403, body).kind, 'auth_error', '110 不是鉴权问题')
+
+  // ③ 绝不能是 credit_exhausted（那会触发硬冷却到次日 04:00，锁号 10 小时）
+  assert.notEqual(classify(403, body).kind, 'credit_exhausted', '110 不是额度耗尽')
+
+  // ④ 其它码不受影响
+  assert.equal(classify(403, '{"code":14018}').kind, 'credit_exhausted', '14018 才是真额度耗尽')
+  assert.equal(classify(403, 'Forbidden').kind, 'waf_blocked')
+  assert.equal(classify(403, '{"code":11140}').kind, 'request_illegal')
+})
+
+test('🔴 业务码 110 必须是**模型级**冷却（不能锁整个账号）', async () => {
+  // ## 实测依据（2026-10-21）
+  // 同一账号下：`dfmodel` 返回 110（Billing daily count exceeded），
+  // 而 `qmodel` / `dmodel` / `auto` / `gmodel` / `mmodel` **全部 200 可用**，
+  // `/admin/accounts/balance` 显示 `credits: 4565`（充足）。
+  //
+  // ⇒ 110 是**模型级**日次数上限。若归成 `dimension: 'soft'`（账号级），
+  // 会短暂锁住整个账号，连带影响那些本来能用的模型 —— 那是错的。
+  const { refineModelScoped } = await import('../src/gateway/server.ts')
+  const r = refineModelScoped('rate_limited', '{"code":"110","message":"Billing daily count exceeded"}')
+  assert.equal(r.dimension, 'model', '110 必须只冷却该模型，不能冷却整个账号')
+  assert.equal(r.code, 110)
+
+  // 反向守卫：6004 等仍是 model，而真正的账号级限流仍是 soft
+  assert.equal(refineModelScoped('rate_limited', '{"code":6004}').dimension, 'model')
+  assert.equal(refineModelScoped('rate_limited', '{"code":14003}').dimension, 'model')
+  assert.equal(
+    refineModelScoped('rate_limited', '{"code":9999,"msg":"too many requests"}').dimension,
+    'soft',
+    '未识别的码应保守地按账号级处理（不要误判成模型级）',
+  )
+})
+
+test('🔴 parseBusinessCode 必须同时认「裸数字」与「带引号字符串」两种码形态', async () => {
+  // 实测缺陷（2026-10-21）：旧正则只认 `{"code":6004}`，
+  // 而 qoder 返回 `{"code":"110"}`（字符串）⇒ 解析成 undefined
+  // ⇒ 模型级判据全部失效 ⇒ 错误地按**账号级**冷却，锁住整个账号。
+  const { parseBusinessCode } = await import('../src/gateway/server.ts')
+
+  // 两种形态都要认
+  assert.equal(parseBusinessCode('{"code":6004}'), 6004, '裸数字')
+  assert.equal(parseBusinessCode('{"code":"110"}'), 110, '带引号字符串')
+  assert.equal(parseBusinessCode('{"code":"6004","msg":"x"}'), 6004)
+
+  // ⚠️ 带引号时必须要求闭合引号，否则 "11‑128" 会被截成 11（错值）
+  assert.equal(parseBusinessCode('{"code":"11‑128"}'), undefined, '非纯数字字符串不得解析出数字')
+  assert.equal(parseBusinessCode('{"code":"11-128"}'), undefined)
+
+  // 无 code 时 undefined
+  assert.equal(parseBusinessCode('Forbidden'), undefined)
+  assert.equal(parseBusinessCode('{"msg":"no code"}'), undefined)
 })
