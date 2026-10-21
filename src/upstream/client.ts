@@ -124,6 +124,29 @@ const CODE_KIND: Record<number, ErrorKind> = {
   11102: 'model_unavailable',
   14003: 'rate_limited',
   14018: 'credit_exhausted',
+  /**
+   * 🔴 **qoder 的额度用尽码 `110`**（2026-10-21 实测，用户报「API 密钥无效」的真凶）。
+   *
+   * ## 故障链
+   * qoder 额度用尽时返回 **HTTP 403 + `{"code":"110","message":"Billing ..."}`**。
+   * `qoder.ts:1541` 抛 `ProviderError` 时沿用 `httpStatus: status`（=403），
+   * message 是中文「Qoder 当日额度已用尽（403）：…」。
+   *
+   * 网关侧 `classify(403, …)` 的流程：
+   *   ① `isWafBlocked(403, 中文)` → false（CJK 加固生效 ✅）
+   *   ② `parseEnvelope` **成功**解析出 `code:110`
+   *   ③ 但本表**没有 110** ⇒ 查不到 kind
+   *   ④ 落到「403 且非 WAF」的兜底 ⇒ **`auth_error`**
+   *
+   * ⇒ 客户端看到 `auth_error` 就提示「**API 密钥无效**」——
+   * 而真相是**当日额度用尽**，处置完全不同（等次日重置 vs 换密钥）。
+   * 这是本项目「错误文案误导」的第 N 次复发。
+   *
+   * ⚠️ `110` 只在 `qoder.ts` 内部被 `QODER_BILLING_CODE` 处理过，
+   * 从未进过全局码表 —— 而网关的 `classify()` 用的是这张全局表。
+   * 「provider 自己认识、网关不认识」是这类误判的结构性来源。
+   */
+  110: 'credit_exhausted',
   14017: 'rate_limited',
   11158: 'model_denied',
   11140: 'request_illegal',

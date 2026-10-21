@@ -210,3 +210,28 @@ test('⚠️ 关键回归：parseEnvelope 与 classify 必须能识别带 data: 
   assert.equal(classify(200, sseMulti).kind, 'rate_limited')
   assert.equal(shouldRotate(classify(200, sseMulti).kind), true, '限流帧必须触发换号重试')
 })
+
+test('🔴 qoder 额度用尽码 110 必须归为 credit_exhausted（不是 auth_error）', async () => {
+  // ## 真实故障（2026-10-21，用户报「我用不了 qd 渠道了，提示 api 秘钥无效」）
+  // qoder 额度用尽返回 **HTTP 403 + {"code":"110"}**，而 `110` 从未进过全局
+  // `CODE_KIND` 表（只在 `qoder.ts` 内部被 `QODER_BILLING_CODE` 处理过）。
+  // 于是网关 `classify(403, …)` 走到「403 且非 WAF」的兜底 ⇒ **`auth_error`**
+  // ⇒ 客户端提示「**API 密钥无效**」，而真相是**当日额度用尽**。
+  //
+  // 两者处置完全相反：前者要换密钥（白费功夫），后者等次日重置即可。
+  const { classify } = await import('../src/upstream/client.ts')
+
+  // 网关侧拿到的文本形态：provider 包了一层中文前缀
+  const withPrefix = 'Qoder 当日额度已用尽（403）：{"code":"110","message":"Billing d..."}'
+  assert.equal(classify(403, withPrefix).kind, 'credit_exhausted', '带中文前缀也要认出 110')
+
+  // 纯 JSON 形态
+  assert.equal(classify(403, '{"code":"110","message":"Billing"}').kind, 'credit_exhausted')
+  // 数字形态
+  assert.equal(classify(403, '{"code":110}').kind, 'credit_exhausted')
+
+  // ⚠️ 反向守卫：不得把别的 403 也吞成 credit_exhausted
+  assert.equal(classify(403, 'Forbidden').kind, 'waf_blocked', '真 WAF 仍要判 waf_blocked')
+  assert.equal(classify(403, '{"code":11140,"msg":"request illegal"}').kind, 'request_illegal')
+  assert.equal(classify(403, '{"code":14018}').kind, 'credit_exhausted', '14018 也是额度用尽')
+})
