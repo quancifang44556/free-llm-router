@@ -528,3 +528,46 @@ test('🔴 单账号池的 soft 冷却必须延迟（否则唯一路径被掐断
   assert.match(src, /catch \{\s*poolSize = 0\s*\}/, '探测失败必须回落 0（不启用延迟）')
   assert.match(src, /type FailureKindForBlame = 'breaker' \| 'degrade' \| 'soft'/, 'blame 类型必须容纳 soft')
 })
+
+test('🔴 网关不得引入并发上限（实测 20 并发含流式全部成功）', async () => {
+  // ## 实测依据（2026-10-21）
+  // 用户实测官方客户端单会话最多 20 并发子代理，判断「只是客户端限制」。
+  // 我们对本网关做了两轮压测（qodercn/dfmodel）：
+  //   · 20 并发非流式   → 20/20 成功，总耗时 1.73s
+  //   · 20 并发 + 流式  → 20/20 成功，总耗时 13.2s
+  // 两轮之后账号零损伤（errTotal 恒 9、until=0、fails=0）。
+  //
+  // ⇒ 瓶颈不在并发能力，在**失败记账策略**。给网关加并发信号量只会自我限制。
+  // 这条测试防止以后有人凭「防封」直觉加一个 MAX_CONCURRENT 之类的开关。
+  const { readFileSync, readdirSync } = await import('node:fs')
+
+  const files: string[] = []
+  const walk = (dir: string): void => {
+    for (const e of readdirSync(dir, { withFileTypes: true })) {
+      const full = `${dir}/${e.name}`
+      if (e.isDirectory()) walk(full)
+      else if (e.name.endsWith('.ts')) files.push(full)
+    }
+  }
+  walk('src')
+
+  // 只查「会挡住**本网关自己请求**」的并发闸门。
+  //
+  // ⚠️ 必须区分两类同名概念：
+  //   · 本地闸门（禁止）：我们主动限自己的并发，如 `MAX_CONCURRENT_REQUESTS`、信号量；
+  //   · **识别上游**的限制（允许）：如 `isZcodeConcurrencyLimited()` —— 那是
+  //     解析上游返回的"并发超限"错误码，作用是**正确应对上游**，不是自我限制。
+  //     第一版正则写得太宽，把后者误报成闸门。
+  const banned = [/MAX_CONCURRENT_REQUESTS/i, /MAX_INFLIGHT/i, /acquireSlot\s*\(/, /semaphore\.acquire/i]
+  for (const f of files) {
+    const src = readFileSync(f, 'utf8')
+    for (const re of banned) {
+      assert.doesNotMatch(
+        src,
+        re,
+        `${f} 出现了并发闸门 ${re} —— 实测网关支持 20 并发（含流式）无失败，` +
+          '不需要为"防封"加并发上限。若确有新证据，请先更新本测试与 throttle.ts 的实测记录。',
+      )
+    }
+  }
+})
