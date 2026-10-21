@@ -59,12 +59,38 @@ export function resetSafetyConfigCache(): void {
  * ⚠️ 本项目跑在 **Node 单容器**（非 Workers），所以 `throttle.ts` 里
  * 「多 isolate 各一份状态」的已知限制在这里**不成立** —— 限速是精确的。
  */
-export function resolveRateLimitQps(env: Env): number {
-  const raw = (env as { RATE_LIMIT_QPS?: string }).RATE_LIMIT_QPS
-  if (raw === undefined || raw.trim() === '') return 0
-  const n = Number(raw)
-  // 非法值回落 0（=关闭）。限速配置写错时宁可放行，也不要卡住全部请求。
+/** 是否已经为某个环境变量打过「值非法」的警告（避免每秒刷日志）。 */
+const warnedEnvValues = new Set<string>()
+
+/**
+ * 严格解析一个**正的十进制小数**（QPS 允许 `0.5`，所以要小数）。
+ *
+ * 🔴 **不能用 `Number()`**（2026-10-21 审查补，配置健壮性专项）：
+ * `Number()` 接受 `'0x10'`（→16）和 `'1e3'`（→1000）这些**没人会想写**的形式。
+ * 更要紧的是「写错 → `NaN` → 回落 0 → **限速被悄悄关掉**」——
+ * 与同文件的 `MAX_CONTEXT_MESSAGES`（写错回落 300，即**收紧**）方向相反。
+ * 本项目的纪律（`src/env.ts:1-13`）明确要求数值配置一律走统一解析器，
+ * 这两个变量此前是唯一的例外（还靠 `as` 断言绕过类型）。
+ */
+function parsePositiveDecimal(raw: string | undefined, name: string): number {
+  if (raw === undefined) return 0
+  const t = raw.trim()
+  if (t === '') return 0
+  if (!/^\d+(?:\.\d+)?$/.test(t)) {
+    // 值非法：**仍然回落 0（关闭限速）** —— 卡住全部请求比不限速更糟。
+    // 但必须留下可见痕迹，否则用户永远不知道「我配了但没生效」。
+    if (!warnedEnvValues.has(name)) {
+      warnedEnvValues.add(name)
+      console.warn(`⚠️ [安全] ${name}=${JSON.stringify(raw)} 不是有效数值，已按 0（关闭）处理`)
+    }
+    return 0
+  }
+  const n = Number(t)
   return Number.isFinite(n) && n > 0 ? n : 0
+}
+
+export function resolveRateLimitQps(env: Env): number {
+  return parsePositiveDecimal((env as { RATE_LIMIT_QPS?: string }).RATE_LIMIT_QPS, 'RATE_LIMIT_QPS')
 }
 
 /**
@@ -74,10 +100,7 @@ export function resolveRateLimitQps(env: Env): number {
  * 抖动让节奏接近人类。只有 `RATE_LIMIT_QPS > 0` 时才有意义。
  */
 export function resolveRateJitterMs(env: Env): number {
-  const raw = (env as { RATE_JITTER_MS?: string }).RATE_JITTER_MS
-  if (raw === undefined || raw.trim() === '') return 0
-  const n = Number(raw)
-  return Number.isFinite(n) && n > 0 ? n : 0
+  return parsePositiveDecimal((env as { RATE_JITTER_MS?: string }).RATE_JITTER_MS, 'RATE_JITTER_MS')
 }
 
 function envFallback(env: Env): SafetyConfig {

@@ -30,6 +30,7 @@ import { classify, type ErrorKind } from '../upstream/client.js'
 import { deriveDeviceId, referenceChatHeaders } from '../upstream/headers.js'
 import { deriveIntlConversationId, newTurnRequestId } from '../upstream/conversation.js'
 import { cleanupToolPairing, prepareChatBody, sanitizeChatBody, trimMessagesByLimit } from './payload.js'
+import { BodyTooLargeError, readJsonCapped } from './body.js'
 import { safetyConfigFor } from './safety.js'
 import { throttleUpstream } from './throttle.js'
 import { ERROR_CHECK_FRAMES, ERROR_HINT_PATTERN, aggregateSse, createFrameTranslator, detectErrorFrame, doneFrame, errorFrame, isEmptyAssistantTurn, mayHaveUsage, parseSseLine, sseHeaders, translateFrame } from './stream.js'
@@ -807,8 +808,14 @@ export async function handleChatCompletions(
   // ① 解析并准备请求体（一次性，不随换号重复）
   let rawBody: unknown
   try {
-    rawBody = await request.json()
-  } catch {
+    // 🔴 **必须有上限**（2026-10-21 审查补，安全面专项）：
+    // 原来直接 `request.json()`，一条 120 MiB 的请求会把 RSS 顶高 322 MB，
+    // 而且**读完之后**才因别的原因失败 —— 没有 413。
+    rawBody = await readJsonCapped(request)
+  } catch (error) {
+    if (error instanceof BodyTooLargeError) {
+      return { response: jsonError(413, error.message, 'payload_too_large') }
+    }
     return { response: jsonError(400, '请求体必须是合法 JSON', 'invalid_request_error') }
   }
 

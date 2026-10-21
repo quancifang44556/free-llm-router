@@ -41,6 +41,21 @@ export function envFlag(raw: string | undefined, fallback: boolean): boolean {
   const v = (raw ?? '').trim().toLowerCase()
   if (['false', '0', 'no', 'off'].includes(v)) return false
   if (['true', '1', 'yes', 'on'].includes(v)) return true
+  /**
+   * 🔴 **写错要出声**（2026-10-21 审查补，配置健壮性专项）。
+   *
+   * 原来是静默回落：`TRUST_PROXY=ture`（漏个字母）→ 当成没设 → `false`。
+   * 而 `TRUST_PROXY` 一错，反代下 `CF-Connecting-IP` 恒为反代 IP
+   * ⇒ 子密钥的「来源 IP 白名单」把**所有**请求拒掉，用户只看到「密钥无效」。
+   *
+   * 区分「没设」（`undefined` / 空串，正常）与「设了但不认识」（多半是拼错）。
+   */
+  if (v !== '' && !['undefined', 'null'].includes(v)) {
+    console.warn(
+      `⚠️ [配置] 布尔开关的值 ${JSON.stringify(raw)} 不是 true/false，已按默认 ${fallback} 处理` +
+        `（支持：true/1/yes/on、false/0/no/off）`,
+    )
+  }
   return fallback
 }
 
@@ -78,8 +93,34 @@ export function resolveClientIp(
   return normalize(remoteAddress ?? '')
 }
 
+/** 严格解析 `PORT`：只接受 1..65535 的纯十进制整数，非法即报错退出。 */
+function strictPort(raw: string | undefined): number {
+  const t = (raw ?? '').trim()
+  if (t === '') return 11451
+  if (!/^\d+$/.test(t)) {
+    throw new Error(
+      `PORT 配置非法：${JSON.stringify(raw)}。只接受 1-65535 的十进制整数（不接受 0x / 1e / 小数 / 多余字符）。`,
+    )
+  }
+  const n = Number(t)
+  if (!Number.isInteger(n) || n < 1 || n > 65535) {
+    throw new Error(`PORT 超出范围：${JSON.stringify(raw)}。只接受 1-65535。`)
+  }
+  return n
+}
+
 export function startServer(options: ServerOptions = {}) {
-  const port = options.port ?? Number.parseInt(process.env.PORT || '11451', 10)
+  /**
+   * 🔴 **端口不能走 `parseInt`**（2026-10-21 审查补，配置健壮性专项）。
+   *
+   * `Number.parseInt` 是宽松的：`PORT=0x1f` → `0`（**随机端口**，容器映射对不上，
+   * 表现为「服务没起来」）、`PORT=1e3` → `1`（真去绑 1 端口）、
+   * `PORT=abc` → `NaN` → 在 `listen()` 里抛 `ERR_SOCKET_BAD_PORT`，
+   * 报错里**一个字都没提 PORT**。这是唯一一个不在 `Env` 里、也没走统一解析的数值配置。
+   *
+   * 端口**没有安全的回落方向**（随便换一个都连不上），故非法时直接报错退出。
+   */
+  const port = options.port ?? strictPort(process.env.PORT)
   const host = options.host ?? process.env.HOST ?? '0.0.0.0'
   const autoCron = options.autoCron ?? envFlag(process.env.AUTO_TASK_CRON, true)
   const trustProxy = options.trustProxy ?? envFlag(process.env.TRUST_PROXY, false)

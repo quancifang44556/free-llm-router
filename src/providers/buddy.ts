@@ -30,7 +30,7 @@
  * - 模型 id 是裸的（无 `provider/` 前缀），与既有用户兼容。
  */
 
-import { type Env } from '../env.js'
+import { type Env, parseString } from '../env.js'
 import { cliChatHeaders, deriveDeviceId, referenceChatHeaders } from '../upstream/headers.js'
 import { extractModels, type OpenAiModel } from '../gateway/models.js'
 import { prepareChatBody, sanitizeChatBody } from '../gateway/payload.js'
@@ -255,9 +255,24 @@ export function buildBuddyProvider(config: VariantConfig, env?: Env): Provider {
   const bases =
     config.id === BUDDY_CN.id && env !== undefined
       ? {
-          chat: env.UPSTREAM_CHAT_BASE || config.chatBase,
-          billing: env.UPSTREAM_BILLING_BASE || config.billingBase,
-          web: env.UPSTREAM_WEB_BASE || config.webBase,
+          /**
+           * ⚠️ **必须走 `parseString`（trim 后空串回落），不能用 `||`**
+           *（2026-10-21 审查补，配置健壮性专项）。
+           *
+           * `||` 只挡「假值」，挡不住**纯空白**：`.env` 里写
+           * `UPSTREAM_CHAT_BASE= `（只有空格）时，`'  '` 是**真值**，
+           * base 就变成了 `'  '`，拼出的 URL 是 `'  /v3/config'`
+           * ⇒ `fetch` 抛 `Failed to parse URL`。
+           *
+           * 而另外 15 处（任务/签到/余额…）都走 `resolveUpstream` → `parseString`，
+           * 于是表现为「**网关 500、任务侧一切正常**」的半侧故障 —— 极难定位。
+           *
+           * 默认值仍用**本变体**的 `config.*Base`（不是 `DEFAULT_UPSTREAM`）：
+           * 两者内容相同，但这里要的是「这个变体的域名」。
+           */
+          chat: parseString(env.UPSTREAM_CHAT_BASE, config.chatBase),
+          billing: parseString(env.UPSTREAM_BILLING_BASE, config.billingBase),
+          web: parseString(env.UPSTREAM_WEB_BASE, config.webBase),
         }
       : { chat: config.chatBase, billing: config.billingBase, web: config.webBase }
 

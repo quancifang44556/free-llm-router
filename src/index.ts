@@ -88,6 +88,7 @@ import {
 } from './store/apikeys.js'
 import { authenticate, countUse } from './gateway/authz.js'
 import { utc8DayKey } from './store/usage.js'
+import { BodyTooLargeError, MAX_IMPORT_BYTES, MAX_REQUEST_BYTES, readJsonCapped } from './gateway/body.js'
 import { fetchBalance } from './upstream/checkin.js'
 import { claimCompensation, fetchCompensationStatus } from './upstream/compensation.js'
 import { listTasks } from './upstream/tasks.js'
@@ -1197,6 +1198,55 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
 async function handleInner(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   const url = new URL(request.url)
   const path = url.pathname
+
+  /**
+   * 🔴 **全局请求体预检**（2026-10-21 审查补，安全面专项）。
+   *
+   * 放在**路由之前**、也放在**鉴权之前**：攻击者不需要有效密钥就能用巨体打满内存
+   *（实测一条 120 MiB 让 RSS +322 MB），所以这道门不能等鉴权。
+   *
+   * ⚠️ 这只是**廉价预检**：`content-length` 可省略（chunked）或伪造。
+   * 真正的防线是 `readJsonCapped`——边读边计数、超限立刻 cancel。
+   * 两道一起才成立；只有这一道会被轻易绕过。
+   */
+  /**
+   * 🔴 **`realm` 必须白名单**（2026-10-21 审查补，安全面专项）。
+   *
+   * 原来 `?realm=` 直接喂给 `env.ACCOUNT_POOL.idFromName(realm)`，**完全不校验**。
+   * 而适配层的 `get()` 按名字**永久缓存**实例、并在 SQLite 里建行 ——
+   * 于是任何一把有效密钥（哪怕配额最紧的子密钥）循环 `?realm=rand` 就能：
+   *   每请求 +1 个常驻实例（16–30 KB，5 分钟才回收）+ SQLite 2 行（**只增不减**）
+   * ⇒ 填满数据卷 ⇒ 全站 500。实测 400 个不同 realm 全部通过鉴权并落库。
+   *
+   * 放在**鉴权之前**：连无效密钥也不该有机会创建实例。
+   * 只有两个合法分片（与 `scheduled()`/面板遍历的取值一致）。
+   */
+  const requestedRealm = url.searchParams.get('realm')
+  if (requestedRealm !== null && requestedRealm !== 'cn' && requestedRealm !== 'global') {
+    return json(
+      {
+        error: {
+          message: `realm 只能是 cn 或 global（收到 ${JSON.stringify(requestedRealm)}）`,
+          type: 'invalid_request_error',
+        },
+      },
+      400,
+    )
+  }
+
+  const declaredLength = Number(request.headers.get('content-length') ?? '')
+  if (Number.isFinite(declaredLength) && declaredLength > MAX_IMPORT_BYTES) {
+    return json(
+      {
+        error: {
+          message: `请求体过大：${Math.round(declaredLength / 1024 / 1024)} MiB 超过上限`
+            + `（普通接口 ${Math.round(MAX_REQUEST_BYTES / 1024 / 1024)} MiB、导入 ${Math.round(MAX_IMPORT_BYTES / 1024 / 1024)} MiB）`,
+          type: 'payload_too_large',
+        },
+      },
+      413,
+    )
+  }
 
   // ── 免鉴权：存活探针（不含任何敏感信息） ──
   if (path === '/healthz') {
@@ -3512,8 +3562,12 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
   if (path === '/admin/import' && request.method === 'POST') {
     let payload: unknown
     try {
-      payload = await request.json()
-    } catch {
+      // 导入放宽到 32 MiB（要一次塞多个 auths/*.json），但**仍然有上限**。
+      payload = await readJsonCapped(request, MAX_IMPORT_BYTES)
+    } catch (error) {
+      if (error instanceof BodyTooLargeError) {
+        return json({ error: { message: error.message, type: 'payload_too_large' } }, 413)
+      }
       return json({ error: { message: '请求体必须是合法 JSON', type: 'invalid_json' } }, 400)
     }
 
@@ -4305,8 +4359,10 @@ async function subkeyModelDenied(
   if (record === undefined) return undefined
   const rules = record.limits.models
   if (rules.length === 0) return undefined
+  // ⚠️ 同样要**有上限地读**：这里会 clone 一份 body，
+  // 若上游限制缺失，同一份 120 MiB 会在内存里驻留两份（安全面专项实测）。
   const probe = request.clone()
-  const body = (await probe.json().catch(() => undefined)) as { model?: unknown } | undefined
+  const body = (await readJsonCapped(probe).catch(() => undefined)) as { model?: unknown } | undefined
   const model = typeof body?.model === 'string' ? body.model : ''
   // 取不到模型名就不拦（由下游按自己的规则报错），避免把合法请求误杀。
   if (model === '') return undefined
