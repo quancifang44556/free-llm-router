@@ -883,6 +883,17 @@ export async function handleResponses(
       'content-type': 'application/json',
       ...(pinnedAccount !== null && pinnedAccount.trim() !== '' ? { 'x-flr-account': pinnedAccount.trim() } : {}),
     },
+    /**
+     * 🔴 **必须带 `signal`**（2026-10-21 审查发现，M1 指出）。
+     *
+     * 这里把 `/v1/responses` 的请求转成内部 `/v1/chat/completions` 的 Request。
+     * 漏掉 `signal` ⇒ 内层 `clientGone()` 恒 false ⇒ 用户在 Responses 入口
+     * 点「停止」会被记成**账号失败** ⇒ 健康号被熔断（3 次 30 分钟）。
+     *
+     * ⚠️ 与 `server.ts` 反向容灾那处是**同一个缺陷的两个入口** ——
+     * 修一处必须同时修另一处，否则又是「只修一半」。
+     */
+    signal: request.signal,
     body: JSON.stringify(chatBody),
   })
   const inner = await handleChatCompletions(chatRequest, env, realm, ctx)

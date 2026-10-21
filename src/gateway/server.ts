@@ -2289,7 +2289,38 @@ export async function handleProviderChat(input: {
            * 这是「延迟记账」的第 3 条路径（前两条：buddy 主循环、provider 的
            * `peekStreamForError` 分支）。三处必须一致，否则又是「只修一半」。
            */
-          const pPunishKind = pm.dimension
+          /**
+           * 🔴 **必须在这里也做 `refineModelScoped`**（2026-10-21 审查发现，M1 指出）。
+           *
+           * ## 缺陷
+           * 本分支原来只写 `const pPunishKind = pm.dimension` ——
+           * 而 `mapErrorToPunishment('rate_limited')` 恒为 `'soft'`（**账号级**）。
+           * `refineModelScoped` 的模型级细分（6004 / 14003 / 11134 / **110**）
+           * 在这里**根本没被调用**。
+           *
+           * ## 为什么这条路径最关键
+           * qoder 的 `110`（日次数上限）**恰恰只从这条路径产生**：
+           * `providers/qoder.ts` 把非 2xx 包成 `ProviderError` 抛出 ⇒ 落到本分支。
+           * ⇒ 我上一版把 `110` 加进 `refineModelScoped` 的模型级判据，
+           * 但**唯一真正产生 110 的路径不调用它** ⇒ 修复等于没生效。
+           * 后果：单账号 provider（`qodercn`）遇 110 时**整个账号被锁 60 秒起**，
+           * 而正确处置是「只冷却该模型，换个模型立刻可用」。
+           *
+           * ## 与另两条路径对齐
+           * - 分支A（`server.ts:1269`）：`kind === 'rate_limited' ? dimension : …`
+           * - 分支B 首帧预检（`server.ts:2534`）：`kind === 'rate_limited' ? refined.dimension : …`
+           * 本处照抄同一口径，并**补上 `resetAt`**（另两条都传了）：
+           * 上游在文案里给了重置墙钟时，冷却应对齐它而不是走我们自己猜的指数退避
+           *（猜早了继续撞限流，猜晚了白白少用几小时）。
+           */
+          const pRefined = refineModelScoped(c.kind, detail)
+          const pPunishKind =
+            c.kind === 'rate_limited'
+              ? pRefined.dimension
+              : pm.dimension === 'model'
+                ? 'model'
+                : pm.dimension
+          const pResetAt = pRefined.resetAt
           if (pPunishKind === 'breaker' || pPunishKind === 'degrade' || (pPunishKind === 'soft' && deferSoft())) {
             blame.push({ uid: picked.uid, kind: pPunishKind, reason: `${c.kind}: ${detail}`.slice(0, 200) })
           } else {
@@ -2300,6 +2331,7 @@ export async function handleProviderChat(input: {
                 now: Date.now(),
                 ...(model !== '' ? { model } : {}),
                 ...(pcause !== undefined ? { modelCause: pcause } : {}),
+                ...(pResetAt !== undefined ? { resetAt: pResetAt } : {}),
                 reason: `${c.kind}: ${detail.slice(0, 180)}`,
               })
               .catch(logPoolError('applyFailure'))
@@ -2721,6 +2753,18 @@ export async function handleProviderChat(input: {
         const fallbackRequest = new Request(request.url, {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
+          /**
+           * 🔴 **必须带 `signal`**（2026-10-21 审查发现，M1 指出）。
+           *
+           * 重建 Request 时漏掉 `signal` ⇒ 内层 `handleChatCompletions` 的
+           * `clientGone()`（`request.signal.aborted`）**恒为 false**
+           * ⇒ 用户点「停止」造成的 AbortError 会被当成**上游/账号失败**记账
+           * ⇒ 健康号被记 breaker，3 次即熔断 30 分钟。
+           *
+           * 这正是本项目反复踩的「客户端取消被记成账号失败」在**合成 Request 入口的回归**：
+           * 两条主路径已经用 `clientGone` 修好了，但这里重建 Request 把判据废掉了。
+           */
+          signal: request.signal,
           body: JSON.stringify(fallbackBody),
         })
         return await handleChatCompletions(fallbackRequest, env, 'cn', ctx, 1)
