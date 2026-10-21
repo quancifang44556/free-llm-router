@@ -3675,6 +3675,31 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
       return jsonError(400, `账号不存在：${onlyUid}`, 'invalid_request')
     }
 
+    /**
+     * 单账号探测的**超时上限**（2026-10-21 补，此前完全没有超时）。
+     *
+     * ## 为什么必须有
+     * 探测内部走 `handleChatCompletions` —— 那是**真实网关链路**，
+     * 会经历上游排队。qoder 的排队预算已按用户要求提到 **60 秒**，
+     * 而本端点**串行**探测 N 个账号 ⇒ 最坏 N × 60 秒。
+     * 实测 3 个账号时浏览器/curl 早就断开，服务端却还在等。
+     *
+     * ## 为什么 30 秒
+     * 探测的目的是「**快速判断这个号现在能不能用**」，不是跑完整对话。
+     * 30 秒足够正常上游响应（实测 healthy 约 1.4-1.8 秒），
+     * 又能把「排队/挂死」快速暴露成 `verdict: 'timeout'`。
+     * 这比让用户干等 3 分钟更有用。
+     *
+     * ## 传播链（已核实）
+     * `Request.signal` → `handleChatCompletions` 用 `request.signal`
+     * → 上游 `client.ts` 用 `AbortSignal.any([options.signal, timeoutSignal])`
+     * ⇒ 超时会**真正中断上游请求**，不是只让 await 返回。
+     *
+     * 超时抛出的 `AbortError` 由下方 catch 的
+     * `/timeout|abort|timed out/i` 判据归为 `verdict: 'timeout'`。
+     */
+    const PROBE_TIMEOUT_MS = 30_000
+
     /** 每个账号一条结果的累加器。 */
     const results: Array<Record<string, unknown>> = []
     for (const acct of targets) {
@@ -3688,10 +3713,18 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
       const probeReq = new Request('https://internal/v1/chat/completions', {
         method: 'POST',
         headers: { 'content-type': 'application/json', authorization: `Bearer ${env.API_KEY ?? ''}` },
+        // ⚠️ 超时：见上方 `PROBE_TIMEOUT_MS` 的说明。缺了它，串行探测最坏 N×60 秒。
+        signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
         body: JSON.stringify({
           model,
           messages: [{ role: 'user', content: '1' }],
-          max_tokens: 1,
+          /**
+           * ⚠️ **不能给 1**：`hy4-preview` 这类**纯推理模型**会把预算全用在
+           * `reasoning_content` 上，`content` 恒为空 ⇒ 网关「空响应」兜底触发
+           * ⇒ 探测误报 `upstream_problem`（而账号其实健康）。
+           * 32 足够：普通模型 1-2 个 token 答完，推理模型也能产出非空 reasoning。
+           */
+          max_tokens: 32,
           stream: false,
         }),
       })
