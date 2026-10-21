@@ -606,8 +606,30 @@ test('🔴 两条 chat 路径都必须有延迟记账（本项目「只修一半
   assert.ok(deferDecls.length >= 2, `应有两个 deferSoft，实际 ${deferDecls.length} 个`)
 
   // ③ 每条路径都要在成功时结算、在全失败时丢弃
-  const settleCalls = [...src.matchAll(/settleBlame\(pool, blame, Date\.now\(\)\)/g)]
-  assert.ok(settleCalls.length >= 2, `应在两条路径的成功点都结算 blame，实际 ${settleCalls.length} 处`)
+  //
+  // 🔴 原来这里是 `settleCalls.length >= 2` 的**全局计数**断言 ——
+  // 2026-10-21 审查（M1）证明它**掩盖了真实缺陷**：
+  // 分支B 的主成功路径与其中一条重试路径**都没有** `settleBlame`，
+  // 但计数仍被「分支A + 分支B 续期重试」两处满足 ⇒ 断言通过、缺陷潜伏。
+  // 后果：provider 路径塞进 `blame` 的 breaker/degrade 失败**永不落账**，
+  // 持续 5xx 的账号永远不进熔断，面板 `fails` 恒 0。
+  //
+  // ⇒ 改为**结构断言**：每一处 `noteSuccess`（= 一次成功）之后都必须紧跟
+  //   一次 `settleBlame`。这样「新增一条成功路径但忘了结算」会立刻被抓到，
+  //   而不是被别处的调用凑够数量掩盖。
+  const noteIdx = [...src.matchAll(/noteSuccess\(/g)].map((m) => m.index ?? -1)
+  const settleIdx = [...src.matchAll(/settleBlame\(pool, blame, Date\.now\(\)\)/g)].map((m) => m.index ?? -1)
+  // ⚠️ 窗口取 1200 字符（不是 400）：本仓库习惯在 `noteSuccess` 与 `settleBlame`
+  // 之间写大段说明注释，实测最长间距 754 字符。窗口太小会**误报**成缺失。
+  // 窗口的意义只是「同一处成功回调内」，不需要精确到字节。
+  const SETTLE_WINDOW = 1200
+  const orphans = noteIdx.filter((i) => !settleIdx.some((j) => j > i && j - i < SETTLE_WINDOW))
+  assert.equal(
+    orphans.length,
+    0,
+    `有 ${orphans.length} 处 noteSuccess 之后缺少 settleBlame（偏移：${orphans.join(', ')}）`
+      + ' —— 成功路径必须结算 blame，否则 breaker/degrade 永不落账',
+  )
   const discardLogs = [...src.matchAll(/丢弃 \$\{blame\.length\} 条失败记录/g)]
   assert.ok(discardLogs.length >= 2, `两条路径都应有全失败丢弃日志，实际 ${discardLogs.length} 处`)
 

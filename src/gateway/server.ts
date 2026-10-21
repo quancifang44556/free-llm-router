@@ -2388,6 +2388,14 @@ export async function handleProviderChat(input: {
                 onFirstChunk: () => {
                   const t = pool.noteSuccess(picked.uid, Date.now(), undefined, model).catch(logPoolError('noteSuccess'))
                   if (ctx !== undefined) ctx.waitUntil(t)
+                  // ✅ **结算 blame**（2026-10-21 审查补，M1 指出）：
+                  // 这个号成功了 ⇒ 之前那些失败确实是那几个号的问题，现在才记账。
+                  // 缺了它，本路径塞进 blame 的 breaker/degrade 失败**永不落账**
+                  //（成功时直接 return，连「丢弃」日志都不打）——
+                  // 表现是「持续 5xx 的账号永远不进熔断、面板 fails 恒 0」。
+                  const settle = settleBlame(pool, blame, Date.now())
+                  if (ctx !== undefined) ctx.waitUntil(settle)
+                  else void settle
                   // 会话粘性：首帧到达即绑定，后续轮次优先落同一账号
                   if (sessionKey !== '' && ctx !== undefined) {
                     ctx.waitUntil(pool.bindSession(sessionKey, picked.uid, Date.now()).catch(logPoolError('bindSession')))
@@ -2666,6 +2674,23 @@ export async function handleProviderChat(input: {
         onFirstChunk: () => {
           const t = pool.noteSuccess(picked.uid, Date.now(), undefined, model).catch(logPoolError('noteSuccess'))
           if (ctx !== undefined) ctx.waitUntil(t)
+          /**
+           * ✅ **结算 blame**（2026-10-21 审查补，M1 指出）。
+           *
+           * 这是**分支B 的主成功路径** —— 它原来只有 `noteSuccess`，没有 `settleBlame`。
+           * 而 `blame.push` 在 ProviderError 分支（`2325`）会塞入 breaker/degrade 失败。
+           *
+           * ⇒ 缺 `settleBlame` 的后果：这些失败**永不落账**，
+           *   而且因为成功时直接 return，连「全失败则丢弃」的那条日志都不会打。
+           *   表现：持续 5xx 的账号永远不进熔断，面板 `fails` 恒 0 —— **保护机制静默失效**。
+           *
+           * ⚠️ 之所以长期没被发现：`tests/state.test.ts` 用的是
+           * `settleCalls.length >= 2` 的**全局计数**断言，
+           * 而它恰好被「分支A + 分支B 续期重试」两处满足 ⇒ 主路径缺失被掩盖。
+           */
+          const settle = settleBlame(pool, blame, Date.now())
+          if (ctx !== undefined) ctx.waitUntil(settle)
+          else void settle
         },
         onError: (message) => {
           const t = pool
