@@ -995,9 +995,39 @@ export function parseQoderQueueError(value: unknown, depth = 0): { retryAfterMs?
 export function looksLikeQoderBillingError(value: unknown): boolean {
   if (typeof value === 'string') {
     const lower = value.toLowerCase()
-    return lower.includes('billing daily count exceeded')
+    if (
+      lower.includes('billing daily count exceeded')
       || lower.includes('daily count exceeded')
       || lower.includes('billing_error')
+    ) return true
+    /**
+     * 🔴 **字符串分支必须也能认出 JSON 里的 110**（2026-10-21 审查补，M3 指出）。
+     *
+     * ## 缺陷
+     * 上游的 `message` 常常是**被序列化过的 JSON 字符串**，且文案会被本地化
+     * （实测中文 `"今日调用次数已达上限"` 之类）。原来的字符串分支只匹配三个
+     * **英文**关键词 ⇒ 中文文案**一个都不命中** ⇒ 这个 110 专用分支**永远走不到**，
+     * 于是本该「如实上报、不重试」的 110 退化成通用 5xx/未知错误。
+     *
+     * 分类（`refineModelScoped` 认业务码）仍然对，但**文案降级**：
+     * 用户看到的是上游那句原始错误，而不是我们解析出的「这是日次数上限、不是余额耗尽」。
+     *
+     * ## 两层补救
+     * 1. 字符串本身是 JSON ⇒ 解析后递归（code 字段就能被对象分支认出来）；
+     * 2. 直接按文本找 `"code":110` —— 覆盖「JSON 里又套了一层字符串」的脏形态。
+     *
+     * ⚠️ 递归必须**可终止**：`JSON.parse` 的结果与原文相同（如纯数字）时不再递归。
+     */
+    const trimmed = value.trim()
+    if (trimmed.startsWith('{') || trimmed.startsWith('[') || trimmed.startsWith('"')) {
+      try {
+        const parsed: unknown = JSON.parse(trimmed)
+        if (parsed !== value) return looksLikeQoderBillingError(parsed)
+      } catch {
+        // 不是合法 JSON：走下面的文本兜底
+      }
+    }
+    return /"code"\s*:\s*"?110"?/.test(value)
   }
   if (typeof value !== 'object' || value === null) return false
   const record = value as Record<string, unknown>
