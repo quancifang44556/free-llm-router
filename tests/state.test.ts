@@ -446,3 +446,44 @@ test('🔴 限速配置的**优先级**（面板值静默覆盖环境变量，�
   // 默认必须是 0（关闭）：限速改变吞吐，不能升级后自动生效
   assert.match(safetySrc, /return Number\.isFinite\(n\) && n > 0 \? n : 0/, '非法值回落关闭')
 })
+
+test('🔴 版本号三处必须一致（注释声称有测试钉住，实际并不存在）', async () => {
+  // ## 为什么这条测试是补出来的
+  // `src/version.ts` 的注释写着：
+  //   「必须与 package.json 的 version 一致 —— tests/panel.test.ts 有断言钉住」
+  // 但**该断言并不存在**（`tests/panel.test.ts` 里没有任何 APP_VERSION 检查）。
+  // 于是版本号实际上**三处各写各的**，谁也没钉住谁：
+  //   1. package.json          version
+  //   2. src/version.ts        APP_VERSION
+  //   3. src/panel/web/.../*.js.txt  面板两份硬编码字符串（顶栏 + 侧栏）
+  //
+  // 真实后果：用户看到的界面版本号一直是 0.8.0，而代码已经改了很多轮 ——
+  // 因为面板是**预构建静态资源**，版本字符串被写死在产物里，升级时不跟着走。
+  // 用户直接问我「我看着还是 0.8.0 啊」，就是这个造成的。
+  const { readFileSync, readdirSync } = await import('node:fs')
+  const pkg = JSON.parse(readFileSync('package.json', 'utf8')) as { version: string }
+  const appVer = /APP_VERSION = '([^']+)'/.exec(readFileSync('src/version.ts', 'utf8'))?.[1]
+
+  assert.ok(pkg.version.length > 0, 'package.json 必须有 version')
+  assert.equal(appVer, pkg.version, 'src/version.ts 的 APP_VERSION 必须等于 package.json 的 version')
+
+  // 面板预构建资源里的版本号也必须同步，否则界面上显示旧版本
+  const dir = 'src/panel/web/assets'
+  const bundles = readdirSync(dir).filter((f) => f.endsWith('.js.txt'))
+  assert.ok(bundles.length > 0, '必须能找到面板产物')
+  let found = false
+  for (const b of bundles) {
+    const src = readFileSync(`${dir}/${b}`, 'utf8')
+    // 面板是 React 预构建产物，渲染成 `v`,`0.9.0` 两个相邻字符串字面量
+    // （不是 `v0.9.0` 一个串）。只认这个位置，避免误伤依赖里的版本号。
+    for (const m of src.matchAll(/`v`,`(\d+\.\d+\.\d+)`/g)) {
+      found = true
+      assert.equal(
+        m[1],
+        pkg.version,
+        `面板产物 ${b} 里的版本号 ${m[1]} 与 package.json 的 ${pkg.version} 不一致 —— 界面会显示旧版本`,
+      )
+    }
+  }
+  assert.ok(found, '面板产物里必须能找到渲染版本号（否则说明资源结构变了，这条测试已失效）')
+})
