@@ -1119,10 +1119,17 @@ export function unwrapQoderEnvelopeStream(
  * 请求挂住几分钟，而 Worker 最终会被平台掐断（实测报
  * `Network connection lost.` 且耗时 122s）。
  */
-const QUEUE_MAX_DELAY_MS = 10_000
+const QUEUE_MAX_DELAY_MS = 20_000
 
-/** 排队重试的次数上限。 */
-const QUEUE_MAX_ATTEMPTS = 3
+/**
+ * 排队重试的次数上限。
+ *
+ * ⚠️ 必须与 `QUEUE_MAX_DELAY_MS` / `QUEUE_TOTAL_BUDGET_MS` **联合看**：
+ * 三者共同决定「最多能等多久」。若次数太小（3 × 10s = 30s），
+ * 60 秒总预算就永远用不满 ⇒ 用户在排队挤时被过早放弃。
+ * 现取值：4 × 20s = 80s > 预算 60s ⇒ **由预算先触发**，语义正确。
+ */
+const QUEUE_MAX_ATTEMPTS = 4
 
 /**
  * 排队的**总墙钟预算**（毫秒）—— 所有重试与等待加起来不得超过它。
@@ -1147,7 +1154,21 @@ const QUEUE_MAX_ATTEMPTS = 3
  * 又远低于平台会掐断的量级。超出预算时**如实报「排队太挤」**，
  * 让客户端稍后重试 —— 那比挂到被平台掐断（无可读原因）好得多。
  */
-const QUEUE_TOTAL_BUDGET_MS = 45_000
+const QUEUE_TOTAL_BUDGET_MS = 60_000
+
+/**
+ * ## 为什么是 60 秒（用户 2026-10-21 明确要求）
+ *
+ * 原值 45 秒，理由是「实测常见排队 20–25s」。但用户的实际要求是
+ * **「等 60 秒，还不行才停」** —— 宁可多等 15 秒也别过早放弃，
+ * 因为排队挤的时候放弃意味着这次请求白费。
+ *
+ * ⚠️ **光改这个常量不够**（我第一版就差点只改这一处）：
+ * 次数上限 `QUEUE_MAX_ATTEMPTS=3` × 单次上限 `QUEUE_MAX_DELAY_MS=10s`
+ * = 最多只能等 ~30 秒 ⇒ **60 秒预算永远用不满**，形同虚设。
+ * 故三处必须一起改：预算 60s / 单次 20s / 次数 4 ⇒ 上限 80s > 预算 60s，
+ * 预算才是真正的约束（由它先触发）。
+ */
 
 function sleep(ms: number, signal: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -1479,9 +1500,29 @@ async function chat(
         // ⚠️ 如实说明「是排队太挤」，而不是把它伪装成失败 ——
         // 用户据此知道「稍后重试有用」，而不是「我的账号/配置有问题」。
         // ⚠️ `retryable: true`：排队是**容量**问题，换号或稍后重试确实有效。
+        /**
+         * 🔴 **`httpStatus` 必须改写成 503，不能沿用上游的 403**（2026-10-21 实测）。
+         *
+         * ## 真实故障链（从 `[waf-403]` 日志抓到原文）
+         *
+         * 上游排队码 `10605` 常随 **HTTP 403** 返回。这里抛出 `ProviderError` 时
+         * 沿用了 `httpStatus: status`（= 403），于是网关侧：
+         *   1. `classify(403, 这段中文文案)` —— 文案不是 JSON 信封；
+         *   2. `parseEnvelope` 返回 `undefined`；
+         *   3. `isWafBlocked(403, ...)` 命中 ⇒ **`waf_blocked`**；
+         *   4. 处置 = `punish: true, dimension: 'soft'` ⇒ **罚账号 + 冷却 60 秒**。
+         *
+         * 而真相是「上游排队挤」——账号完全健康。单账号池下这等于整条链路断 60 秒，
+         * 用户看到的就是「API 密钥无效 / 本轮运行失败」这类误导性报错。
+         *
+         * ## 为什么是 503
+         * 503 = 服务暂时不可用，语义上正是「上游容量/排队」。它不会被判成 WAF
+         *（WAF 判据写死 `403`），也不会落进 4xx 的参数错误分支。
+         * `retryable: true` 保持 —— 排队换号或稍后重试确实有效。
+         */
         throw new ProviderError({
           provider: product.id,
-          httpStatus: status,
+          httpStatus: 503,
           retryable: true,
           message:
             `Qoder 服务繁忙：排队等待已超过 ${Math.round(QUEUE_TOTAL_BUDGET_MS / 1000)} 秒`

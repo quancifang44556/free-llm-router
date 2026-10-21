@@ -825,6 +825,22 @@ test('🔴 qoder 排队必须有**总墙钟预算**（只有次数上限会让�
   assert.ok(budget <= 90_000, `总预算 ${budget}ms 太长，会被平台掐断（实测 122s 即失败）`)
   // ⚠️ 下限：要够覆盖一次正常排队（实测常见 20–25s），否则正常用户会被误报
   assert.ok(budget >= 30_000, `总预算 ${budget}ms 太短，正常排队（20–25s）会被误判为繁忙`)
+
+  /**
+   * ⚠️ **三常量必须逻辑自洽**（2026-10-21 补，我差点只改总预算）。
+   *
+   * `maxAttempts × maxDelay` 若小于 `budget`，预算就**永远用不满** ——
+   * 用户要求「等 60 秒」，但循环会在 ~30 秒时就因次数耗尽而放弃，
+   * 60 秒形同虚设。这类「改了 A 却没改 B」正是本项目反复出现的缺陷模式。
+   */
+  const maxAttempts = Number(/const QUEUE_MAX_ATTEMPTS = (\d+)/.exec(src)![1])
+  const maxDelay = Number(/const QUEUE_MAX_DELAY_MS = ([\d_]+)/.exec(src)![1]!.replaceAll('_', ''))
+  assert.ok(
+    maxAttempts * maxDelay >= budget,
+    `次数×单次上限（${maxAttempts}×${maxDelay}ms=${maxAttempts * maxDelay}ms）` +
+      `小于总预算（${budget}ms）⇒ 预算永远用不满，改预算等于没改。` +
+      '必须同时调大次数或单次上限。',
+  )
   // 循环里必须真的用上它
   const i = src.indexOf('async function chat(')
   // 取整个函数体（首帧窥探加进来后函数变长，固定 3000 字符会截不到排队分支）

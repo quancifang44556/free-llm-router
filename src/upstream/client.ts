@@ -299,7 +299,29 @@ export function parseEnvelope(text: string): Envelope | undefined {
  * 把它们当 WAF 会让「凭据过期」看起来像「IP 被封」，排查方向完全错。
  */
 export function isWafBlocked(httpStatus: number, bodyText: string): boolean {
-  return httpStatus === 403 && parseEnvelope(bodyText) === undefined
+  if (httpStatus !== 403) return false
+  if (parseEnvelope(bodyText) !== undefined) return false
+  /**
+   * 🔴 **2026-10-21 加固：我们自己的中文错误文案绝不能被判成 WAF。**
+   *
+   * ## 真实故障（`[waf-403]` 日志抓到的原文）
+   * ```
+   * body=Qoder 服务繁忙：排队等待已超过 45 秒（已尝试 4 次，实际等待 32 秒）。
+   *      请稍后重试 —— 这是上游排队，不是账号或配置问题。
+   * ```
+   * 这段话**是 `qoder.ts` 自己生成的**（`ProviderError` 的 message），
+   * 而该 ProviderError 沿用了上游 10605 排队响应带的 **HTTP 403**。
+   * 于是 `403 + 非信封` ⇒ `waf_blocked` ⇒ **罚健康账号 + 冷却 60 秒**。
+   *
+   * ⇒ 判据必须加一条：**含中日韩字符的文本不可能是 WAF 返回**。
+   * WAF（APISIX / EdgeOne）返回的是英文/HTML 拦截页，绝不会是中文业务文案。
+   * 我们所有 `ProviderError` 的 message 都是中文，加上这条即可整类排除。
+   *
+   * ⚠️ 为什么不是"按 ProviderError 判断"：`classify()` 只收 `(status, bodyText)`，
+   * 拿不到错误来源。语言判据是在这个签名约束下最可靠的区分手段。
+   */
+  if (/[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]/.test(bodyText)) return false
+  return true
 }
 
 /**
