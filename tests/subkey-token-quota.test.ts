@@ -59,3 +59,39 @@ test('🔴 网关必须在每一个「用量已知」的点调用 settleSubkeyUs
     `只找到 ${calls} 处 settleSubkeyUsage 调用（应有 4 处，对应 4 个用量记录点）`,
   )
 })
+
+test('🔴 lastUsedAt 不该每个请求都整表重写（用量计数仍要照常累加）', async () => {
+  const tmp = path.join(os.tmpdir(), `lastused-${Date.now()}.db`)
+  const rt = createNodeRuntime(tmp)
+  try {
+    const pool = rt.env.ACCOUNT_POOL.get(rt.env.ACCOUNT_POOL.idFromName('cn'))
+    const rec = await pool.addApiKey({ name: 'lu', hash: 'x'.repeat(64), prefix: 'sk-lastused' })
+
+    await pool.recordApiKeyUse({ id: rec.id, ip: '1.1.1.1', model: 'm', input: 0, output: 0 })
+    const first = (await pool.listApiKeys()).find((k) => k.id === rec.id)
+    const firstAt = first?.lastUsedAt ?? 0
+    assert.ok(firstAt > 0, '首次使用应写入 lastUsedAt')
+
+    // 紧接着再来两次：计数必须照常累加，但 lastUsedAt 不该被重写（60s 精度）。
+    // ⚠️ 必须**真的隔开几毫秒**：三次调用若落在同一毫秒内，`Date.now()` 完全相同，
+    // 那么「每次都重写」与「降频」在断言上无法区分 —— 我第一版就这么写的，
+    // 变异测试（把条件改成 `if (true)`）照样绿，等于没测住。
+    await new Promise((r) => setTimeout(r, 5))
+    await pool.recordApiKeyUse({ id: rec.id, ip: '1.1.1.1', model: 'm', input: 0, output: 0 })
+    await new Promise((r) => setTimeout(r, 5))
+    await pool.recordApiKeyUse({ id: rec.id, ip: '1.1.1.1', model: 'm', input: 0, output: 0 })
+
+    const usage = (await pool.getApiKeyUsage(rec.id)) as { requests?: number }
+    assert.equal(usage.requests, 3, '请求数必须照常累加（降频只影响 lastUsedAt 的写回）')
+
+    const after = (await pool.listApiKeys()).find((k) => k.id === rec.id)
+    assert.equal(
+      after?.lastUsedAt,
+      firstAt,
+      '⚠️ 60 秒内的重复使用仍在整表重写 —— 面板只显示相对时间，不值得每请求付这笔钱',
+    )
+  } finally {
+    rt.db.close()
+    for (const f of [tmp, `${tmp}-wal`, `${tmp}-shm`]) fs.rmSync(f, { force: true })
+  }
+})

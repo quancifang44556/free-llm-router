@@ -454,6 +454,14 @@ export interface SafetyConfig {
   rateJitterMs: number
 }
 
+/**
+ * `lastUsedAt` 的写回精度。
+ *
+ * 面板展示的是相对时间（「3 分钟前」），60 秒精度完全够用；
+ * 而每次写回都要把**全部子密钥记录**整体序列化 —— 不值得为每个请求付这笔钱。
+ */
+const LAST_USED_AT_RESOLUTION_MS = 60_000
+
 export class AccountPoolDO extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env)
@@ -2357,11 +2365,26 @@ export class AccountPoolDO extends DurableObject<Env> {
     usages[input.id] = usage
 
     await this.ctx.storage.put(API_KEY_USAGE_KEY, usages)
-    // 记录上的 `lastUsedAt` 也要更新（面板列表直接展示它，不必再读用量表）
+    /**
+     * 记录上的 `lastUsedAt` 也要更新（面板列表直接展示它，不必再读用量表）。
+     *
+     * 🔴 **但不必每个请求都重写整个 keys 数组**（2026-10-21 审查补，并发专项）。
+     *
+     * 原实现每次请求都 `saveApiKeys(records)` —— 即把**全部子密钥记录**序列化后
+     * 整体写回，只为把一个 `lastUsedAt` 时间戳推进几百毫秒。
+     * 加上上面那次 `put(API_KEY_USAGE_KEY)`，**每个请求两次整表写**。
+     *
+     * 面板上的「最后使用」精确到分钟就够用了（显示的是相对时间），
+     * 故 60 秒内的重复更新直接跳过：写入次数从「每请求 2 次」降到
+     * 「每分钟至多 1 次」，而界面观感无差别。
+     */
     const idx = records.findIndex((r) => r.id === input.id)
     if (idx >= 0) {
-      records[idx] = { ...records[idx]!, lastUsedAt: now }
-      await this.saveApiKeys(records)
+      const prev = records[idx]!.lastUsedAt ?? 0
+      if (now - prev >= LAST_USED_AT_RESOLUTION_MS) {
+        records[idx] = { ...records[idx]!, lastUsedAt: now }
+        await this.saveApiKeys(records)
+      }
     }
   }
 
