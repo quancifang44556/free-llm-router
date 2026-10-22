@@ -86,7 +86,8 @@ import {
   resetUsageWindow,
   toApiKeyView,
 } from './store/apikeys.js'
-import { authenticate, countUse } from './gateway/authz.js'
+import { authenticate, clientIpOf, countUse, registerSubkeyUsage } from './gateway/authz.js'
+import { authBlocked, noteAuthFailure, noteAuthSuccess } from './gateway/inbound-limit.js'
 import { utc8DayKey } from './store/usage.js'
 import { BodyTooLargeError, MAX_IMPORT_BYTES, MAX_REQUEST_BYTES, readJsonCapped } from './gateway/body.js'
 import { fetchBalance } from './upstream/checkin.js'
@@ -194,10 +195,14 @@ import { panelAsset, securityHeaders } from './panel/index.js'
 export { AccountPoolDO, TaskRunnerDO }
 
 /** JSON 响应助手，统一 no-store（避免缓存鉴权结果）。 */
-function json(value: unknown, status = 200): Response {
+function json(value: unknown, status = 200, extraHeaders: Record<string, string> = {}): Response {
   return new Response(JSON.stringify(value, null, 2), {
     status,
-    headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
+    headers: {
+      'content-type': 'application/json; charset=utf-8',
+      'cache-control': 'no-store',
+      ...extraHeaders,
+    },
   })
 }
 
@@ -1381,18 +1386,47 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
    * （那一刻才知道 `model`）才能判 ⇒ 块外的代码拿不到 `record` ⇒
    * 校验点**根本无处安放**，于是从来没有被校验过。
    */
+  /**
+   * 🔴 **鉴权失败限速**（2026-10-21 审查补，安全面专项）。
+   *
+   * 全仓原本没有入站限流：实测 **200 个乱猜 Bearer 并发打完只要 179 ms**
+   *（≈1100 rps，全部 401、无 429、无延时），而每个请求都要一次 SHA-256 + 一次
+   * DO/SQLite 查询。两条利用路径：在线爆破弱主密钥；无凭据打满 CPU。
+   *
+   * 判据是「**失败次数**」而非总流量 —— 正常客户端几乎不会鉴权失败，
+   * 所以误伤面最小；且鉴权成功会把该 IP 的计数清零（防爆破不能变成拒绝服务）。
+   */
+  const clientIp = clientIpOf(request)
+  const blocked = authBlocked(clientIp)
+  if (blocked.limited) {
+    return json(
+      {
+        error: {
+          message: `鉴权失败次数过多，请 ${Math.ceil(blocked.retryAfterMs / 1000)} 秒后重试`,
+          type: 'rate_limit_error',
+        },
+      },
+      429,
+      { 'retry-after': String(Math.ceil(blocked.retryAfterMs / 1000)) },
+    )
+  }
+
   let subkeyRecord: ApiKeyRecord | undefined
   if (!(await authorized(request, env))) {
     // 不是主密钥 ⇒ 只有在 `/v1/*` 上才尝试子密钥。
     if (!isV1Path) {
+      noteAuthFailure(clientIp)
       return json({ error: { message: 'Missing or invalid API key', type: 'authentication_error' } }, 401)
     }
     // ⚠️ 此时还不知道模型，先传空串跳过模型检查；真正的模型校验在
     // 拿到请求体之后（见下方 `/v1/chat/completions` 分支）。
     const sub = await authenticate(request, env, '')
     if (sub.kind === 'none') {
+      noteAuthFailure(clientIp)
       return json({ error: { message: 'Missing or invalid API key', type: 'authentication_error' } }, 401)
     }
+    // 鉴权成功 ⇒ 清掉该 IP 的失败计数（否则同事的合法请求会被一起锁住）
+    noteAuthSuccess(clientIp)
     if (sub.kind === 'subkey-denied') {
       // ⚠️ 429 用于配额（可重试），403 用于 IP/模型范围（换 Key 才行）——
       // 两者对调用方的运维含义完全不同，不能合并成一个状态码。
@@ -1405,6 +1439,17 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
       // `countUse` 内部的 `recordApiKeyUse` 只累加请求数，不校验模型。
       // 模型白名单改在拿到请求体后单独判（见下方 `subkeyRecord` 的用法）。
       subkeyRecord = sub.record
+    /**
+     * 🔴 登记本次请求的「子密钥归属」（2026-10-21 审查补，安全面专项）。
+     *
+     * `token` 配额此前是一条**从未接线**的死限制：`authenticate()` 只用
+     * `input=0/output=0` 记一次请求，而唯一能补真实用量的 `settleUsage()`
+     * **零调用者** ⇒ `maxTokens` 永远判不到（实测 `maxTokens=5` 连发 3 次全放行）。
+     *
+     * 挂到 `ctx` 上（WeakMap，随请求回收）：网关在 4 个「用量已知」的点调
+     * `settleSubkeyUsage(...)` 把真实 token 补回去。主密钥路径没有条目，零开销。
+     */
+    registerSubkeyUsage(ctx, sub.record, clientIpOf(request))
       ctx.waitUntil(countUse(env, sub.record, request, ''))
     }
   }

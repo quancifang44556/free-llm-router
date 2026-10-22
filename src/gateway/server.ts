@@ -26,6 +26,7 @@
 
 import type { UsageRecord } from '../store/usage.js'
 import { resolveUpstream, type Env } from '../env.js'
+import { settleSubkeyUsage } from './authz.js'
 import { classify, type ErrorKind } from '../upstream/client.js'
 import { deriveDeviceId, referenceChatHeaders } from '../upstream/headers.js'
 import { deriveIntlConversationId, newTurnRequestId } from '../upstream/conversation.js'
@@ -1662,6 +1663,8 @@ export async function handleChatCompletions(
             ok: true,
             ms: Date.now() - startedAt,
           }
+          // 🔴 子密钥的 token 配额（2026-10-21 审查补）：主密钥路径无条目、零开销
+          settleSubkeyUsage(ctx, env, record.input, record.output, record.model)
           const task = pool.recordUsage(record).catch((error: unknown) => {
             console.error(
               '[usage] 记录用量失败：',
@@ -2463,6 +2466,8 @@ export async function handleProviderChat(input: {
                   )
                 },
                 onFinish: (usage) => {
+                  // 🔴 子密钥 token 配额（2026-10-21 审查补）：主密钥路径无条目、零开销
+                  settleSubkeyUsage(ctx, env, usage?.input ?? 0, usage?.output ?? 0, `${providerId}/${model}`)
                   const t = pool
                     .recordUsage({
                       at: Date.now(), uid: picked.uid, model: `${providerId}/${model}`,
@@ -2755,6 +2760,8 @@ export async function handleProviderChat(input: {
                   )
                 },
                 onFinish: (usage) => {
+                  // 🔴 子密钥 token 配额（2026-10-21 审查补）：主密钥路径无条目、零开销
+                  settleSubkeyUsage(ctx, env, usage?.input ?? 0, usage?.output ?? 0, `${providerId}/${model}`)
                   const t = pool
                     .recordUsage({
                       at: Date.now(), uid: picked.uid, model: `${providerId}/${model}`,
@@ -3104,6 +3111,8 @@ export async function handleProviderChat(input: {
             ok: true,
             ms: Date.now() - startedAt,
           }
+          // 🔴 子密钥的 token 配额（2026-10-21 审查补）：主密钥路径无条目、零开销
+          settleSubkeyUsage(ctx, env, record.input, record.output, record.model)
           const t = pool.recordUsage(record).catch((error: unknown) => {
             console.error('[usage] 记录用量失败：', error instanceof Error ? error.message : String(error))
           })

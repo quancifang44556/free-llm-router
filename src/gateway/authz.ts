@@ -184,6 +184,51 @@ export function settleUsage(
 }
 
 /**
+ * 子密钥的「本次请求归属」——用 `WeakMap` 挂在 `ctx` 上。
+ *
+ * 🔴 **为什么必须这样传**（2026-10-21 审查补，安全面专项）。
+ *
+ * ## 缺陷：`token` 配额是一条**从未接线**的死限制
+ * `authenticate()` 在鉴权那一刻用 `input=0, output=0` 记一次请求（那时还不知道用量），
+ * 而 `settleUsage()` —— 唯一能把真实 token 补上去的函数 —— **零调用者**。
+ * 于是 `maxTokens` 永远判不到：实测 `maxTokens=5` 时连发 3 次全部放行，
+ * 面板「已用 0 / 100000」永远不动，管理员零告警。
+ *
+ * ## 为什么不把 `ApiKeyRecord` 一路透传下去
+ * `handleChatCompletions()` 是**位置参数**签名，且被三处（两个探针 + 主路径）调用，
+ * `handleProviderChat()` 是对象参数 —— 两种签名都要改，还会污染 provider 层。
+ * 真正需要它的只有「用量已知的那 4 个点」，而它们都能拿到同一个 `ctx`。
+ *
+ * ⇒ 鉴权成功后把归属挂到 `ctx`（按对象身份，天然随请求回收），
+ * 用量点就地 `settleSubkeyUsage(...)`。主密钥路径**零开销**（WeakMap 里没有条目）。
+ */
+const subkeyByCtx = new WeakMap<object, { record: ApiKeyRecord; ip: string }>()
+
+/** 鉴权成功且用的是子密钥时调用一次，登记本次请求的归属。 */
+export function registerSubkeyUsage(ctx: object | undefined, record: ApiKeyRecord, ip: string): void {
+  if (ctx === undefined) return
+  subkeyByCtx.set(ctx, { record, ip })
+}
+
+/**
+ * 用量已知时调用：把真实 token 补进子密钥配额。
+ *
+ * ⚠️ 不 `await`、不抛错：记账失败最多让配额失真，不该影响已经成功的响应。
+ */
+export function settleSubkeyUsage(
+  ctx: object | undefined,
+  env: Env,
+  input: number,
+  output: number,
+  model: string,
+): void {
+  if (ctx === undefined) return
+  const entry = subkeyByCtx.get(ctx)
+  if (entry === undefined) return
+  void settleUsage(env, entry.record, input, output, model, entry.ip)
+}
+
+/**
  * 子密钥上下文（传给网关记账用）。
  *
  * ## ⚠️ 为什么把 IP 一起带上，而不是让网关自己从 request 里读
