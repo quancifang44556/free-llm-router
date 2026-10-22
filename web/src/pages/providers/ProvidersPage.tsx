@@ -691,62 +691,6 @@ function AccountSafetyDialog({ account, onClose }: { account: Account | null; on
     )
   }
 
-  const Field = ({
-    k, title, desc, kind,
-  }: {
-    k: string
-    title: string
-    desc: string
-    kind: 'bool' | 'num'
-  }) => {
-    const on = hasOverride(k)
-    const label = global === undefined ? '' : (
-      kind === 'bool'
-        ? ((global as unknown as Record<string, boolean>)[k] ? '开' : '关')
-        : String((global as unknown as Record<string, number>)[k])
-    )
-    return (
-      <div className={cn('rounded-lg border px-3.5 py-3', !on && 'bg-muted/40')}>
-        <div className="flex items-start gap-3">
-          <div className="min-w-0 flex-1">
-            <div className="flex items-center gap-2 text-[13px] font-medium">
-              {title}
-              <Badge tone={on ? 'info' : 'neutral'}>
-                {on ? '本账号单独设置' : `跟随全局（${label}）`}
-              </Badge>
-            </div>
-            <div className="text-muted-foreground mt-0.5 text-xs leading-relaxed">{desc}</div>
-          </div>
-          {on && (
-            <button
-              type="button"
-              className="text-muted-foreground hover:text-foreground shrink-0 cursor-pointer text-[11.5px] underline decoration-dotted"
-              onClick={() => clearField(k)}
-            >
-              恢复跟随全局
-            </button>
-          )}
-        </div>
-        <div className="mt-2.5">
-          {kind === 'bool' ? (
-            <Switch
-              label={title}
-              checked={valueOf<boolean>(k, Boolean(global && (global as unknown as Record<string, boolean>)[k]))}
-              onCheckedChange={(v) => setField(k, v)}
-            />
-          ) : (
-            <Input
-              type="number"
-              className="tabular w-32"
-              value={String(valueOf<number>(k, Number(global && (global as unknown as Record<string, number>)[k]) ?? 0))}
-              onChange={(e) => setField(k, e.target.value === '' ? 0 : Number(e.target.value))}
-            />
-          )}
-        </div>
-      </div>
-    )
-  }
-
   return (
     <Dialog
       open={account !== null}
@@ -780,40 +724,151 @@ function AccountSafetyDialog({ account, onClose }: { account: Account | null; on
 
           {q.data && (
             <>
-              <Field
-                k="modelCooldownEnabled"
-                title="模型级冷却"
-                desc="关掉后：这个号的请求失败照样报错、照样换号，但不再把「这个账号 + 这个模型」锁起来。实测上游 429 / 排队多为瞬时，锁起来经常变成「明明还能用却选不到号」。"
-                kind="bool"
-              />
-              <Field
-                k="sessionTrace"
-                title="会话链（b3 三件套）"
-                desc="关掉 = 不再发 b3 追踪头。注意：只有国际版会发 b3，国内版本来就强制不发（发了会 11-128）。"
-                kind="bool"
-              />
-              <Field
-                k="rateLimitQps"
-                title="每账号 QPS 上限"
-                desc="0 = 不限速。限速的本意是让它「像真人操作有停顿」，只对需要伪装的上游有意义。"
-                kind="num"
-              />
-              <Field
-                k="rateJitterMs"
-                title="抖动上限（毫秒）"
-                desc="0 = 不抖动。把等距的请求打散，避免出现精确等距的机器特征。"
-                kind="num"
-              />
-              <Field
-                k="maxContextMessages"
-                title="上下文消息数上限"
-                desc="0 = 不裁剪。只对国际版生效；裁剪是**有损**的，会把早期消息与工具结果丢掉。"
-                kind="num"
-              />
+              <SafetyField
+          k="modelCooldownEnabled"
+          title="模型级冷却"
+          desc="关掉后：这个号的请求失败照样报错、照样换号，但不再把「这个账号 + 这个模型」锁起来。实测上游 429 / 排队多为瞬时，锁起来经常变成「明明还能用却选不到号」。"
+          kind="bool"
+          overridden={hasOverride('modelCooldownEnabled')}
+          current={valueOf('modelCooldownEnabled', false)}
+          globalValue={global === undefined ? undefined : (global as unknown as Record<string, unknown>)['modelCooldownEnabled']}
+          onValue={(v) => setField('modelCooldownEnabled', v)}
+          onReset={() => clearField('modelCooldownEnabled')}
+        />
+              <SafetyField
+          k="sessionTrace"
+          title="会话链（b3 三件套）"
+          desc="关掉 = 不再发 b3 追踪头。注意：只有国际版会发 b3，国内版本来就强制不发（发了会 11-128）。"
+          kind="bool"
+          overridden={hasOverride('sessionTrace')}
+          current={valueOf('sessionTrace', false)}
+          globalValue={global === undefined ? undefined : (global as unknown as Record<string, unknown>)['sessionTrace']}
+          onValue={(v) => setField('sessionTrace', v)}
+          onReset={() => clearField('sessionTrace')}
+        />
+              <SafetyField
+          k="rateLimitQps"
+          title="每账号 QPS 上限"
+          desc="0 = 不限速。限速的本意是让它「像真人操作有停顿」，只对需要伪装的上游有意义。"
+          kind="num"
+          overridden={hasOverride('rateLimitQps')}
+          current={valueOf('rateLimitQps', 0)}
+          globalValue={global === undefined ? undefined : (global as unknown as Record<string, unknown>)['rateLimitQps']}
+          onValue={(v) => setField('rateLimitQps', v)}
+          onReset={() => clearField('rateLimitQps')}
+        />
+              <SafetyField
+          k="rateJitterMs"
+          title="抖动上限（毫秒）"
+          desc="0 = 不抖动。把等距的请求打散，避免出现精确等距的机器特征。"
+          kind="num"
+          overridden={hasOverride('rateJitterMs')}
+          current={valueOf('rateJitterMs', 0)}
+          globalValue={global === undefined ? undefined : (global as unknown as Record<string, unknown>)['rateJitterMs']}
+          onValue={(v) => setField('rateJitterMs', v)}
+          onReset={() => clearField('rateJitterMs')}
+        />
+              <SafetyField
+          k="maxContextMessages"
+          title="上下文消息数上限"
+          desc="0 = 不裁剪。只对国际版生效；裁剪是**有损**的，会把早期消息与工具结果丢掉。"
+          kind="num"
+          overridden={hasOverride('maxContextMessages')}
+          current={valueOf('maxContextMessages', 0)}
+          globalValue={global === undefined ? undefined : (global as unknown as Record<string, unknown>)['maxContextMessages']}
+          onValue={(v) => setField('maxContextMessages', v)}
+          onReset={() => clearField('maxContextMessages')}
+        />
             </>
           )}
         </div>
       )}
     </Dialog>
+  )
+}
+
+/**
+ * 单个字段的编辑行（**必须是模块级组件**）。
+ *
+ * ## 🔴 为什么不能定义在 `AccountSafetyDialog` 体内（2026-10-22 修）
+ *
+ * React 用**函数引用**判断组件类型。在另一个组件体内定义组件，每次渲染都会
+ * 产生一个**新的函数对象** ⇒ React 认为类型变了 ⇒ **卸载整棵子树再重建**。
+ * 后果：数字输入框每敲一个字符就失焦、光标跳到末尾 —— 根本没法输入。
+ *
+ * 这是 React 的经典陷阱，而它的表现（"输入框不听话"）极容易被误当成浏览器问题。
+ *
+ * ## ⚠️ 数字字段的两个边界
+ *
+ * - `Number(undefined) ?? 0` 得到的是 **`NaN`**（`??` 只挡 null/undefined，
+ *   而 `Number(undefined)` 已经是 NaN）—— 直接用会显示 `NaN`。
+ *   故这里显式判 `globalValue === undefined` 再用 0 兜底。
+ * - 用户清空输入框时**不要**立刻写 0：那会让"想改成 0.5"的人被卡住
+ *   （输入过程中出现空串是正常的）。改为「空串不写值，失焦再补 0」。
+ */
+function SafetyField({
+  k: _k, title, desc, kind, overridden, current, globalValue, onValue, onReset,
+}: {
+  k: string
+  title: string
+  desc: string
+  kind: 'bool' | 'num'
+  /** 该字段是否已被本账号覆盖（决定显示"跟随全局"还是"单独设置"）。 */
+  overridden: boolean
+  /** 当前生效值（本地草稿 > 服务端覆盖 > 全局）。 */
+  current: unknown
+  /** 全局值（用于 Badge 提示）。`undefined` = 还没加载完。 */
+  globalValue: unknown
+  onValue: (v: unknown) => void
+  onReset: () => void
+}) {
+  const label = globalValue === undefined
+    ? '…'
+    : (kind === 'bool' ? (globalValue ? '开' : '关') : String(globalValue))
+
+  return (
+    <div className={cn('rounded-lg border px-3.5 py-3', !overridden && 'bg-muted/40')}>
+      <div className="flex items-start gap-3">
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-2 text-[13px] font-medium">
+            {title}
+            <Badge tone={overridden ? 'info' : 'neutral'}>
+              {overridden ? '本账号单独设置' : `跟随全局（${label}）`}
+            </Badge>
+          </div>
+          <div className="text-muted-foreground mt-0.5 text-xs leading-relaxed">{desc}</div>
+        </div>
+        {overridden && (
+          <button
+            type="button"
+            className="text-muted-foreground hover:text-foreground shrink-0 cursor-pointer text-[11.5px] underline decoration-dotted"
+            onClick={onReset}
+          >
+            恢复跟随全局
+          </button>
+        )}
+      </div>
+      <div className="mt-2.5">
+        {kind === 'bool' ? (
+          <Switch label={title} checked={current === true} onCheckedChange={(v) => onValue(v)} />
+        ) : (
+          <Input
+            type="number"
+            className="tabular w-32"
+            value={current === undefined || current === null || Number.isNaN(current) ? '' : String(current)}
+            onChange={(e) => {
+              // ⚠️ 空串**不写值**：否则用户想输入 "0.5" 时，第一个字符被抹成 0，
+              // 后面接不上（实测过这个体验缺陷）。失焦时再补 0。
+              if (e.target.value === '') return
+              const n = Number(e.target.value)
+              if (!Number.isNaN(n)) onValue(n)
+            }}
+            onBlur={(e) => {
+              if (e.target.value === '') onValue(0)
+            }}
+          />
+        )}
+      </div>
+    </div>
   )
 }

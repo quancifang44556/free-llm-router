@@ -683,6 +683,11 @@ export function cliChatHeaders(input: {
   if (input.variant === 'workbuddy') {
     Object.assign(
       headers,
+      // ⚠️ **这里刻意不传第三个参数**（会话链开关）：走 `cliChatHeaders` 的都是
+      // 「列模型目录 / 签到 / 余额探测」这类**非对话**请求，它们的调用方拿不到
+      // 具体账号的 `safetyOverride`（那些路径甚至可能没有账号上下文）。
+      // ⇒ 回落模块级全局值。这是**有意的边界**，不是漏传：
+      // 按账号的会话链开关只作用于**对话**请求（`referenceChatHeaders` 那条路）。
       sessionTraceHeaders({
         ...(input.conversationId === undefined ? {} : { conversationId: input.conversationId }),
         turnRequestId: input.conversationRequestId,
