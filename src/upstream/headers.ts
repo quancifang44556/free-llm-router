@@ -519,6 +519,18 @@ export function referenceChatHeaders(input: {
     // 国内版 `CodeBuddyIDE/1.106.1`，国际版 `WorkBuddy/… workbuddy-ai/…`。
     'User-Agent': CODEBUDDY_USER_AGENT,
   }
+  /**
+   * 🔴 **设备标识必须发**（2026-10-22，A7）。
+   *
+   * `intlDeviceHeaders` 的注释里早有实测结论：缺 `X-Machine-ID` 时
+   * 上游会回 `14003 Model busy`（首条 200、后续 429）。但国内版这条路径
+   * **一个都不发** —— 同一个结论只用在一条分支上。
+   *
+   * 现在由调用方统一传 `machineId` / `sessionId`（与 `/v3/config` 同源），
+   * 传了才发：不传时不臆造（避免「静默为所有账号伪造同一台设备」）。
+   */
+  if (input.machineId !== undefined && input.machineId !== '') headers['X-Machine-ID'] = input.machineId
+  if (input.sessionId !== undefined && input.sessionId !== '') headers['X-Session-ID'] = input.sessionId
   if (input.accessToken !== '') headers.Authorization = `Bearer ${input.accessToken}`
   return headers
 }

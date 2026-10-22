@@ -1316,7 +1316,28 @@ export async function handleChatCompletions(
       conversationIdOwner = candidate.uid
     }
 
-    // ② 构造出站请求
+    /**
+     * ② 构造出站请求
+     *
+     * 🔴 **设备标识必须真的发出去**（2026-10-22 审查，A7）。
+     *
+     * 原来这两行算了 `machineId` / `sessionId` 之后**再也没用过** ——
+     * 纯死变量：值算出来就扔，`referenceChatHeaders` 根本没收到它们。
+     *
+     * 后果是同一账号在两个端点上呈现成**两台不同设备**：
+     * - `listModels()`（`/v3/config`）走 `cliChatHeaders`，发的是
+     *   `deriveDeviceId()` 派生的 **36 位 hex**；
+     * - `chat`（`/v2/chat/completions`）走 `referenceChatHeaders`，
+     *   国内版**一个都不发**，国际版发的是 `deriveUuidLike()` 的 **UUID 形态**。
+     *
+     * 对上游风控来说这是「一个账号、两台机器、三种身份」——
+     * 而 `intlDeviceHeaders` 的注释早就写明「缺 `X-Machine-ID` 会回 14003 Model busy」，
+     * 等于我们自己把那条已验证的结论只用在一条路径上（又一次「只修一半」）。
+     *
+     * ⚠️ 形态统一为 **36 位 hex**（`/v3/config` 已在用、且是 `desktop.go:51-53` 的原口径）。
+     * `deriveUuidLike` 的 UUID 形态是「国际服抓包长这样」的推断，没有版本锚点；
+     * 而 36-hex 有明确的参考实现出处，故以它为准。
+     */
     const machineId = await deriveDeviceId(candidate.uid, 'machine')
     const sessionId = await deriveDeviceId(candidate.uid, 'session')
     const conversationRequestId = crypto.randomUUID().replaceAll('-', '')
@@ -1347,6 +1368,9 @@ export async function handleChatCompletions(
           // 两者都在重试循环**第 0 轮**算一次（见函数开头的说明）。
           conversationId,
           turnRequestId,
+          // ⚠️ 与 `/v3/config` 同源（同一账号 ⇒ 同一台设备），见上面的说明。
+          machineId,
+          sessionId,
         }),
         body: prepared,
         signal: request.signal,

@@ -540,8 +540,13 @@ test('🔴 面板状态徽章必须识别「降权中」（degradeUntil）', () 
   const files = readdirSync('src/panel/web/assets').filter((f) => /^index-.*\.js\.txt$/.test(f))
   assert.ok(files.length > 0, '应能找到面板主包')
   const src = readFileSync(path.join('src/panel/web/assets', files[0]!), 'utf8')
-  assert.ok(
-    /degradeUntil>t\?`degraded`/.test(src),
+  // ⚠️ **不要钉死压缩后的写法**（2026-10-22）：原断言是
+  // `/degradeUntil>t?`degraded`/`，而重建后的产物写成了
+  // `(e.degradeUntil??0)>t?`degraded`` —— 语义完全相同，却因为多了 `??0` 与括号而红。
+  // 这里改为「degradeUntil 参与比较、且其结果落到 degraded」这一**判据本身**。
+  assert.match(
+    src,
+    /degradeUntil[^;,]{0,24}>\s*t\s*\?[^;,]{0,12}degraded/,
     '⚠️ statusOf() 未识别 degradeUntil —— 降权号会显示「正常」',
   )
   assert.ok(/degraded:\{label:`降权中`/.test(src), '必须给 degraded 一个可读标签')
