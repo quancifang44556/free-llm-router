@@ -8,18 +8,25 @@
  *
  * | 维度 | 触发原因 | 语义 | 恢复条件 |
  * |---|---|---|---|
- * | `until` / `coolKind` | 402 余额耗尽、429 限流、403 WAF | 「近期被限流/没钱」 | 到期，或**面板「解冻」** |
+ * | `until` / `coolKind` | 402 余额耗尽、429 限流、403 WAF | 「近期被限流/没钱」 | 到期、**面板「解冻」**、或**余额刷新确认余额 > 0**（仅 `hard`） |
  * | `modelCooldowns` | 429 `code=6004`、`11102` | 「仅对**某几个模型**不可用」 | 各模型自己的重置墙钟 |
  * | `breakerUntil` | 连续 5xx/网络失败 | 「这个号反复失败，先别打」 | 指数退避到期 |
  * | `degradeUntil` | 连续业务失败 | 「降权，别当首选」 | 固定时长到期 |
 
  *
- * ⚠️ **`hard`（402 余额耗尽）不会「余额恢复后自动解冻」**（2026-10-21 审查澄清）。
+ * ⚠️ **`hard`（402 余额耗尽）的「余额恢复 ⇒ 自动解冻」曾长期只写在文档里**（2026-10-21 审查澄清）。
  * 本表原先写的是「到期，或余额恢复（仅 CoolHard）」，但全仓**从未实现**那条路径：
  * `updateBalance` 刻意「绝不动惩罚态」（否则 cron 每轮刷余额都会偷偷解冻，
- * 探测数据一抖账号就反复解冻/锁定 —— `tests/balance-refresh.test.ts` 专门守这条）。
- * 故实际恢复方式只有两种：**等次日 04:00**，或**用户在面板点「解冻」**
- *（`clearCooldowns`，现已清掉全部维度，见该方法的说明）。
+ * 探测数据一抖账号就反复解冻/锁定 —— `tests/balance-refresh.test.ts`、
+ * `tests/burn-rate.test.ts` 专门守这条）。
+ * ⇒ 现在由**独立方法** {@link AccountPoolDO.clearHardIfRecovered} 实现：两条余额刷新入口
+ *（`/admin/accounts/balance` 与整点 cron）在**余额落盘之后**显式调用它。
+ * 之所以不塞进 `updateBalance`：那个方法被现有单测钉住「只写额度、不碰惩罚态」，
+ * 而且「余额恢复」是一个**有条件的判断**（新余额 > 0 且确实因 `hard` 在冷却），
+ * 不是每次写余额都成立的副作用 —— 把它做成显式一步，才能被测试直接调用、也才能只清一维。
+ *
+ * 故 `hard` 的实际恢复方式有三种：**等次日 04:00**、**用户在面板点「解冻」**
+ *（`clearCooldowns`，清掉全部维度，见该方法的说明）、**余额刷新确认余额 > 0**。
  *
  * **关键正交性**（Go 侧 `transition.go:9-26` 明确记录）：
  * - `disableLocked`（禁用）只清**冷却域**，**不动熔断** —— 禁用是授权/session
@@ -133,9 +140,22 @@ export interface AccountState {
   nickname: string
   /** 域：`cn` / `global`。 */
   realm: string
-  /** 是否被禁用（终态，需人工或余额恢复解冻）。 */
+  /**
+   * 是否被禁用。
+   *
+   * ⚠️ **只有人工能解**（面板「启用」/ `setAccountDisabled(false)`）。
+   * 原文写「需人工或**余额恢复**解冻」—— 那是假的：
+   * `clearHardIfRecovered` 只清 `hard` 冷却，`revive` 也不碰 `disabled`
+   *（它只在导入凭据时被调用）。留着这句话，会让人以为充钱就能恢复。
+   */
   disabled: boolean
-  /** 禁用原因。 */
+  /**
+   * 禁用原因 —— ⚠️ **与「冷却原因」共用同一字段**。
+   *
+   * 因此任何清理冷却的代码都**不得**无条件 `reason = ''`：
+   * 那会把「已被手动停用」「session dead (12153 ×3)」这类真实故障从面板抹掉。
+   * 参见 `clearHardIfRecovered` 里的 `if (!state.disabled)` 守卫。
+   */
   reason: string
 
   // ── 冷却域 ──
@@ -356,6 +376,33 @@ export function normalizeAccountState(raw: unknown): AccountState | undefined {
 /** 该时刻是否仍在未来（`0` = 无，恒为 false）。 */
 export function isActive(deadline: number, now: number): boolean {
   return deadline > 0 && now < deadline
+}
+
+/**
+ * 是否**正因余额耗尽（`hard` / 402）处于冷却中**。
+ *
+ * ## 为什么必须是一个共用函数，而不是各处手抄 `coolKind === 'hard' && isActive(...)`
+ *
+ * 这个判据有**三个**用途，含义必须完全一致，否则状态会自相矛盾：
+ *
+ * 1. `applyFailure` 的 `soft` 分支：命中时**不得**把 `coolKind` 改写成 `'soft'`。
+ *    缺陷现象：账号因 402 余额耗尽被锁到次日 04:00，随后一次普通 429 失败
+ *    就把它改写成「临时冷却（soft）」—— 面板上「余额问题」变成「限流」，
+ *    用户按「等一分钟」去处理，实际要等到 04:00 或充值。**这是误导，不是显示问题。**
+ * 2. `enforceBurnRate`：命中时**跳过**消耗速率判定（余额为 0 时谈不上「烧太快」，
+ *    且软冷却分支会把 `hard` 降级成 `soft`）。
+ * 3. `clearHardIfRecovered`：只有命中时才允许「余额恢复 ⇒ 解冻」清掉它。
+ *
+ * ⚠️ 三处**只抄其中一处**正是本仓库反复踩到的「同一概念两处判据」缺陷
+ *（`modelExempt` 曾手抄 `healthy()` 的 4 个维度、漏了 `restrictedUntil`）。
+ * 故这里只写一份，三处都调它。
+ *
+ * ⚠️ 只看**冷却域**这一个维度：`breakerUntil` / `degradeUntil` / `restrictedUntil`
+ * 各有各的现实原因（我们自己怀疑它不行 / 连败降权 / 上游明确封号），
+ * 混进来会让「余额恢复」顺手清掉真实故障的观测。
+ */
+export function hardCooldownActive(state: AccountState, now: number): boolean {
+  return state.coolKind === 'hard' && isActive(state.until, now)
 }
 
 /**

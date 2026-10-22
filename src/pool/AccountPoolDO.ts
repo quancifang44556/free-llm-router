@@ -33,6 +33,7 @@ import { appendBalanceSample, detectBurnRate } from './burn-rate.js'
 import {
   type AccountState,
   createAccountState,
+  hardCooldownActive,
   healthy,
   healthyForModel,
   isActive,
@@ -478,6 +479,33 @@ export class AccountPoolDO extends DurableObject<Env> {
 
   /** 读取一个账号。 */
   async getAccount(uid: string): Promise<AccountState | undefined> {
+    const raw = readAccount(this.ctx.storage.sql, uid)
+    return raw === undefined ? undefined : normalizeAccountState(JSON.parse(raw))
+  }
+
+  /**
+   * 读账号 + **归一**（`JSON.parse` + `normalizeAccountState`），供所有「读-改-写」路径共用。
+   *
+   * ## 为什么必须抽出来（2026-10-21 审查，写路径口径分叉）
+   *
+   * `noteSuccess` / `revive` / `noteCheckinDone` / `disable` 这四条写路径当时是裸的
+   * `JSON.parse(raw) as AccountState`，**没过 `normalizeAccountState`**，而
+   * `applyFailure` / `updateBalance` / `setAccountDisabled` / `clearCooldowns` /
+   * `pick` / `listAccounts` 全都过了。后果是**新增字段会在这四条路径上静默丢失**：
+   *
+   * - `normalizeAccountState` 是**逐字段重建**对象的，裸 `JSON.parse` 则是原样返回 ——
+   *   升级前落盘的记录缺 `provider` / `samples` / `restrictedUntil` 时，
+   *   这四条路径把对象**整体写回**，缺的字段就永远是 `undefined`；
+   * - 而 `undefined` 在算术里是 `NaN`、在布尔语境里是 falsy，故障会出现在
+   *   **很远的地方**（`Math.max(undefined, x)` → 写库读回 0，见 `state.ts` 的注释），
+   *   排查极难。
+   *
+   * ## 为什么返回 `undefined` 而不是抛错
+   *
+   * 调用方原有的语义都是「账号不存在 ⇒ 什么都不做」（`if (raw === undefined) return`），
+   * 归一失败（缺 `uid` 等）同理属于「这条记录不可用」，保持一致即可。
+   */
+  private readState(uid: string): AccountState | undefined {
     const raw = readAccount(this.ctx.storage.sql, uid)
     return raw === undefined ? undefined : normalizeAccountState(JSON.parse(raw))
   }
@@ -1126,18 +1154,44 @@ export class AccountPoolDO extends DurableObject<Env> {
       case 'hard': {
         // 余额耗尽：冷却到次日 04:00（UTC+8）。
         //
-        // ⚠️ **不会「余额恢复后自动解冻」**（2026-10-21 审查澄清）。
-        // 这里原先写的是「签到后余额恢复会自动解冻」，但全仓从未实现该路径 ——
-        // 而 `updateBalance` 反而刻意「绝不动惩罚态」（理由见该方法注释：
-        // cron 每轮刷余额，若自动解冻会让探测抖动直接变成账号抖动）。
-        // ⇒ 实际恢复方式：**等次日 04:00**，或**面板点「解冻」**（`clearCooldowns`）。
-        // 用户充了钱却仍被锁到 04:00 是已知取舍，不是 bug；但文案必须说实话。
+        // 恢复方式三种（`tests/hard-recovery.test.ts` 钉住第一条）：
+        //   1. **余额刷新确认余额 > 0** ⇒ {@link clearHardIfRecovered} 立刻清掉；
+        //   2. 等次日 04:00 自然到期；
+        //   3. 面板点「解冻」（`clearCooldowns`，清全部维度）。
+        //
+        // ⚠️ 第 1 条曾长期只写在注释里、全仓从未实现（2026-10-21 审查发现）：
+        // 原注释声称「签到后余额恢复会自动解冻」，但 `updateBalance` 刻意
+        // 「绝不动惩罚态」（否则 cron 每轮刷余额都会偷偷解冻，探测数据一抖
+        // 账号就反复解冻/锁定），于是充值后仍被锁到 04:00 —— 用户只能干等到次日。
+        // 现在改由**独立一步**在余额落盘之后显式判定，且**只清这一维**。
         state.until = nextDay4AmUtc8(now)
         state.coolKind = 'hard'
         state.reason = input.reason ?? 'credit exhausted'
         break
       }
       case 'soft': {
+        // 🔴 当前是「余额耗尽（hard）」且仍在冷却期内 ⇒ 本次 soft 失败**一个字都不许改**。
+        //
+        // ## 缺陷（2026-10-21 审查，`AccountPoolDO.ts:1141`）
+        //
+        // 下面第一行是无条件赋值，于是「因 402 余额耗尽被锁到次日 04:00」的账号，
+        // 只要再来一次普通 429 失败，`coolKind` 就被改写成 `'soft'` ——
+        // 面板从「余额耗尽」变成「临时冷却」，`/admin/accounts/diagnose` 说
+        // 「账号冷却中（限流），还剩 40 分钟」，而真实恢复时刻仍是次日 04:00。
+        // 用户按「等一分钟」去处理，永远等不到 —— 这比不显示更糟。
+        //
+        // 更隐蔽的一层：若这次 soft 带上游重置墙钟（`resetAt`），下面会把
+        // `until` **提前缩短**到那个墙钟，于是「余额问题」凭空变成一次短冷却。
+        //
+        // 全仓此前只有 `enforceBurnRate` 挡了一处（同一个判据），这就是
+        // 「同一个概念两处判据、只修一处」的典型 ⇒ 现在统一走
+        // {@link hardCooldownActive}，两处（以及解冻判定）共用同一份判据。
+        //
+        // ⚠️ `reason` 也保持不动：冷却域的 `reason` 会被面板当作「冷却原因」展示，
+        // 留下 `credit exhausted` 与 `coolKind='hard'` 才是自洽的一对；
+        // 若改成 `rate limited`，界面就会出现「余额耗尽（rate limited）」这种自相矛盾。
+        // ⚠️ `softStreak` 也不推进：它不是 soft 冷却，不该累计退避档位。
+        if (hardCooldownActive(state, now)) break
         state.coolKind = 'soft'
         state.reason = input.reason ?? 'rate limited'
         // 有上游重置墙钟就对齐它，否则按连续次数指数退避（封顶 30 分钟）。
@@ -1311,6 +1365,10 @@ export class AccountPoolDO extends DurableObject<Env> {
    *   - `busy`：**不动**。限频是随时间的，成功一次不构成解除证据；
    *   - `absent` / `denied`：**真实成功即清除**。成功本身就是最强反证 ——
    *     一个刚被 200 走通的模型，绝不可能「不存在」。
+   *
+   * ⚠️ 读账号走 {@link readState}（`JSON.parse` + `normalizeAccountState`）。
+   * 原来是裸的 `JSON.parse(raw) as AccountState` —— 升级前落盘的记录缺新字段时，
+   * 这里会把**整体对象原样写回**，缺的字段永远是 `undefined`（详见 `readState` 的说明）。
    */
   async noteSuccess(
     uid: string,
@@ -1319,9 +1377,8 @@ export class AccountPoolDO extends DurableObject<Env> {
     /** 本次成功实际使用的模型名（用于反证对应的模型冷却）。 */
     model?: string,
   ): Promise<void> {
-    const raw = readAccount(this.ctx.storage.sql, uid)
-    if (raw === undefined) return
-    const state = JSON.parse(raw) as AccountState
+    const state = this.readState(uid)
+    if (state === undefined) return
 
     state.successCount += 1
     state.lastSuccess = now
@@ -1430,7 +1487,11 @@ export class AccountPoolDO extends DurableObject<Env> {
     // ⚠️ 已在**硬冷却**（余额耗尽，直到次日 04:00）时不再判：软冷却分支会把
     // `coolKind` 从 `hard` 改写成 `soft`，等于把「没钱」降级成「被限流」，
     // 而 `until` 仍指向次日 —— 状态自相矛盾。余额为 0 时也谈不上「烧太快」。
-    if (state.coolKind === 'hard' && isActive(state.until, now)) return
+    //
+    // ⚠️ 判据统一走 `hardCooldownActive()`，**不要在这里手抄一遍**
+    //（`applyFailure` 的 soft 分支与 `clearHardIfRecovered` 用的是同一份）——
+    // 手抄判据 = 等着下次改判据时再漏一处，本仓库已经因此踩过多次。
+    if (hardCooldownActive(state, now)) return
 
     const trip = detectBurnRate(state.samples, now, config)
     if (trip === undefined) return
@@ -1455,15 +1516,28 @@ export class AccountPoolDO extends DurableObject<Env> {
     })
   }
 
-  /** 解冻账号（面板「解冻」/ 签到后余额恢复）。清全部惩罚态，但不动 `disabled`。 */
+  /**
+   * 解冻账号（面板「解冻」/ 导入新凭据后重置）。清全部惩罚态，但不动 `disabled`。
+   *
+   * ⚠️ 注释里原先还写着「签到后余额恢复」—— 那条路径**从未实现**，也不要在这里实现：
+   * 「余额恢复」只该清 **`hard` 一维**（见 {@link clearHardIfRecovered}），
+   * 而 `revive` 会把熔断/降权/模型冷却一起清掉。用 `revive` 做余额恢复
+   * 等于「充了钱就顺手抹掉所有真实故障的观测」。
+   *
+   * ⚠️ 读账号走 {@link readState}（原来裸 `JSON.parse`，缺字段会随整体写回被固化）。
+   */
   async revive(uid: string, now: number, credits?: number): Promise<boolean> {
-    const raw = readAccount(this.ctx.storage.sql, uid)
-    if (raw === undefined) return false
-    const state = JSON.parse(raw) as AccountState
+    const state = this.readState(uid)
+    if (state === undefined) return false
 
     state.until = 0
     state.coolKind = ''
-    state.reason = ''
+    // ⚠️ **`reason` 是共用字段**：它同时承载「冷却原因」与「停用原因」
+    //（`state.ts` 里 `disabled` 的注释就写着 reason 是停用原因）。
+    // 无条件清空会把「已被手动停用」「session dead (12153 ×3)」这类真实故障
+    // 从面板 hint 上抹掉 —— 账号明明还停着，却看不到为什么。
+    // ⇒ 只在**没被停用**时才清；停用原因必须留着。
+    if (!state.disabled) state.reason = ''
     state.softStreak = 0
     state.breakerUntil = 0
     state.retryCount = 0
@@ -1480,6 +1554,69 @@ export class AccountPoolDO extends DurableObject<Env> {
     if (credits !== undefined) state.credits = credits
 
     writeAccount(this.ctx.storage.sql, state.uid, state.realm, JSON.stringify(state), now)
+    return true
+  }
+
+  /**
+   * **余额恢复 ⇒ 解冻 `hard`（402 余额耗尽）冷却**。
+   *
+   * ## 🔴 缺陷（2026-10-21 审查：这条能力曾只存在于注释里）
+   *
+   * `applyFailure` 的 `hard` 分支注释、`state.ts` 的维度表、`plans.ts:90` 与
+   * `actions.ts:144` 都写着「余额恢复的冷却账号由调用方解冻」/「签到后余额恢复会自动解冻」，
+   * 但全仓**从未实现**那条路径 —— `updateBalance` 刻意「绝不动惩罚态」，
+   * `revive` 又只在导入凭据时被调用。后果是**实测可复现的**：
+   * 用户充了钱、余额已是 2870，账号仍被锁到次日 04:00，
+   * 面板显示「余额耗尽」，只能干等或手动点「解冻」。
+   *
+   * ## 为什么是「独立一步」而不是塞进 `updateBalance`
+   *
+   * 1. `updateBalance` 的语义被现有单测钉死为「只写额度三元组 + 采样，不碰惩罚态」
+   *   （`tests/balance-refresh.test.ts`、`tests/burn-rate.test.ts`）。把解冻塞进去，
+   *    那两个测试立刻红，而且「余额写入」会重新变成「会偷偷改惩罚态」的操作 ——
+   *    正是当初它们要防的东西。
+   * 2. 解冻是有**条件**的（新余额 > 0 且确实因 `hard` 在冷却），不是一个无条件的副作用。
+   *    做成显式一步，调用点读起来就是「先落盘余额，再判是否恢复」，时序看得见。
+   *
+   * ## ⚠️ 只清 `hard` 这一维（这是本方法的全部要点）
+   *
+   * `until` / `coolKind` 是**冷却域**，与另外四维正交：
+   * `breakerUntil`（我们自己怀疑它反复失败）、`degradeUntil`（连败降权）、
+   * `restrictedUntil`（上游明确封号）、`modelCooldowns`（模型级限流）。
+   * 它们各有**不同的现实原因**，充钱不能证明它们也好了 ——
+   * 顺手清掉会掩盖真实故障（本仓库反复踩过「混清一维、真实故障被抹掉」的坑）。
+   * 故这里**只**动 `until` / `coolKind` / `reason`，其余一个字段都不碰。
+   *
+   * ⚠️ `reason` 必须一起清：它是**冷却域**的展示文案（面板把它当作冷却原因），
+   * 留着 `credit exhausted` 而冷却已解除，就会出现「账号可用但带着一条余额错误」，
+   * 与 `setAccountDisabled(…, false)` 清 `reason` 的理由完全一致。
+   *
+   * @param credits 本次刷新到的**可用余额**（未取整前的原值即可，负数/NaN 一律视为未恢复）
+   * @returns 是否真的清掉了一个 `hard` 冷却（供调用方记日志 / 测试断言）
+   */
+  async clearHardIfRecovered(uid: string, credits: number, now: number): Promise<boolean> {
+    // ⚠️ 余额 0 / 负数 / NaN 都表示「没恢复」：上游偶尔回负值，而
+    // `NaN <= 0` 是 false —— 若只写 `credits <= 0` 就会把 NaN 当成「有余额」。
+    if (!Number.isFinite(credits) || credits <= 0) return false
+
+    const state = this.readState(uid)
+    if (state === undefined) return false
+    // 只认「因 hard 且在冷却期内」这一种形态。已过期的 hard（等到了次日 04:00）
+    // 不需要清 —— 它自己已经失效，动它只会产生一次无意义的写。
+    if (!hardCooldownActive(state, now)) return false
+
+    state.until = 0
+    state.coolKind = ''
+    // ⚠️ `reason` 是共用字段（冷却原因 + 停用原因）。停用中的账号必须留着它，
+    // 否则面板上「停用」那一行的原因变成空白，用户不知道是谁、为什么停的。
+    if (!state.disabled) state.reason = ''
+
+    writeAccount(this.ctx.storage.sql, state.uid, state.realm, JSON.stringify(state), now)
+    // ⚠️ 日志只放 uid 前 8 位与余额数字，**不含任何凭据**（与本文件其它日志同口径）。
+    // 这条日志是「为什么账号突然能用了」的唯一可观测依据。
+    console.log(
+      `[pool] 余额恢复，解冻 hard 冷却：uid=${state.uid.slice(0, 8)}… credits=${credits}`,
+    )
     return true
   }
 
@@ -1501,11 +1638,12 @@ export class AccountPoolDO extends DurableObject<Env> {
    *
    * ⚠️ 日期用**固定 UTC+8**（复用 `upstream/travel.ts:45` 的 `cstDay`，
    * 与签到活动的日界口径一致），不取本机时区 —— Workerd 恒为 UTC。
+   *
+   * ⚠️ 读账号走 {@link readState}（原来裸 `JSON.parse`，缺字段会随整体写回被固化）。
    */
   async noteCheckinDone(uid: string, now: number): Promise<void> {
-    const raw = readAccount(this.ctx.storage.sql, uid)
-    if (raw === undefined) return
-    const state = JSON.parse(raw) as AccountState
+    const state = this.readState(uid)
+    if (state === undefined) return
     state.lastCheckinDay = cstDay(now)
     writeAccount(this.ctx.storage.sql, state.uid, state.realm, JSON.stringify(state), now)
   }
@@ -1555,11 +1693,16 @@ export class AccountPoolDO extends DurableObject<Env> {
     return true
   }
 
-  /** 显式禁用（人工或 11140 这类强信号）。 */
+  /**
+   * 显式禁用（人工或 11140 这类强信号）。
+   *
+   * ⚠️ 读账号走 {@link readState}（原来裸 `JSON.parse`）。这条路径尤其不能漏归一：
+   * 它写的是 `disabled=true` —— **终态**，用户之后很可能再也不会碰这条记录，
+   * 缺字段（`provider` / `samples` / `restrictedUntil`）就被永久固化在库里。
+   */
   async disable(uid: string, reason: string, now: number): Promise<void> {
-    const raw = readAccount(this.ctx.storage.sql, uid)
-    if (raw === undefined) return
-    const state = JSON.parse(raw) as AccountState
+    const state = this.readState(uid)
+    if (state === undefined) return
     state.disabled = true
     state.reason = reason
     writeAccount(this.ctx.storage.sql, state.uid, state.realm, JSON.stringify(state), now)

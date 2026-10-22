@@ -43,7 +43,7 @@ import {
   useSetPin,
   useToggleAccount,
 } from '@/lib/queries'
-import { accountStatus, STATUS_META, type AccountStatus } from '@/lib/status'
+import { accountStatus, recoveryText, STATUS_META, type AccountStatus } from '@/lib/status'
 import type { Account, PinMode, Provider } from '@/lib/types'
 import { cn, fmtInt, fmtRelative } from '@/lib/utils'
 import { AddAccountDialog } from './AddAccountDialog'
@@ -462,17 +462,20 @@ export function AccountsTable({
           {rows.map((a) => {
             const s = accountStatus(a)
             const meta = STATUS_META[s]
-            // ⚠️ 封号/降权也要给出「什么时候恢复」，否则用户只能猜
+            // ⚠️ 封号 / 降权 / 模型限流都要给出「什么时候恢复、还剩多久」，否则用户只能猜
+            const recovery = recoveryText(a, s)
             const hint =
               s === 'disabled'
                 ? a.reason
                 : s === 'restricted'
-                  ? `上游封号，${fmtRelative(a.restrictedUntil)}恢复`
+                  ? `上游封号，${recovery}`
                   : s === 'degraded'
-                    ? `降权中，${fmtRelative(a.degradeUntil)}恢复`
-                    : s === 'cooling' || s === 'breaker'
-                      ? `${fmtRelative(Math.max(a.until, a.breakerUntil))}恢复`
-                      : ''
+                    ? `降权中，${recovery}`
+                    : s === 'model'
+                      ? `模型限流，${recovery}`
+                      : s === 'cooling' || s === 'breaker'
+                        ? recovery
+                        : ''
             const mode = pinModeOf(a, pins.data)
             return (
               <TR key={a.realm + a.uid}>
@@ -485,6 +488,7 @@ export function AccountsTable({
                   {/* ⚠️ 会真实打一次上游（消耗极少配额），故只在点击时触发 */}
                   <button
                     type="button"
+                    aria-label="探测该账号当前是否可用"
                     title="探测该账号当前是否可用（会真实打一次上游，消耗极少配额）"
                     className="text-muted-foreground hover:text-foreground mt-1 cursor-pointer text-[11px] underline decoration-dotted"
                     onClick={() => probe.mutate({ uid: a.uid, realm: a.realm })}
@@ -505,7 +509,14 @@ export function AccountsTable({
                   <Badge tone={meta.tone} dot>
                     {meta.label}
                   </Badge>
-                  {hint && <div className="text-muted-foreground mt-1 max-w-32 truncate text-[11.5px]">{hint}</div>}
+                  {hint && (
+                    // ⚠️ 加了「还剩 X」倒计时后这条提示会变长（如「上游封号，11/22 12:30恢复（还剩 7 分钟）」），
+                    // 原来的 `max-w-32` 会把倒计时整段截掉 ⇒ 等于没加。故放宽一档并补 `title`，
+                    // 极窄屏仍能悬停看到全文。
+                    <div className="text-muted-foreground mt-1 max-w-44 truncate text-[11.5px]" title={hint}>
+                      {hint}
+                    </div>
+                  )}
                 </TD>
                 <TD className="tabular text-right font-medium">{fmtInt(a.credits)}</TD>
                 {!compact && (
@@ -592,6 +603,7 @@ export function AccountsTable({
     </>
   )
 }
+
 function PinOption({ title, desc, checked }: { title: string; desc: string; checked: boolean }) {
   return (
     <>

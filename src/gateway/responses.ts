@@ -411,11 +411,48 @@ export function toResponsesObject(
     items.push({ kind: 'reasoning', id: hexId('rs'), outputIndex: idx++, text: reasoning, callId: '', name: '', args: '' })
   }
   const content = typeof message.content === 'string' ? message.content : ''
+  /**
+   * 🔴 **拒答（`refusal`）必须变成可见的文本**（2026-10-22，G10 收尾）。
+   *
+   * `aggregateSse` 现在会累积 `refusal`，`isEmptyAssistantTurn` 因此不再把
+   * 「纯拒答」判成空响应 —— 这是修好的部分。但如果这里不读它，
+   * `/v1/responses` 就会把**合法拒答**渲染成 `output_text: ""`：
+   * 从「502 明确报错」翻转成「200 但答案空白」。
+   *
+   * 按本项目的铁律「空回复比报错更糟」，那反而是更坏的形态 ——
+   * 所以判据修好后，**这条出口必须同步消费 `refusal`**。
+   */
+  const refusal = typeof message.refusal === 'string' ? message.refusal : ''
   const calls = Array.isArray(message.tool_calls) ? message.tool_calls : []
   // ⚠️ 正文为空但**有**工具调用时，不发空的 message 项 ——
   // 那会让客户端多渲染一个空气泡。
-  if (content !== '' || calls.length === 0) {
-    items.push({ kind: 'message', id: hexId('msg'), outputIndex: idx++, text: content, callId: '', name: '', args: '' })
+  // ⚠️ 拒答同理：它没有 tool_calls，必须发出去（内容就是拒答原文）。
+  if (content !== '' || refusal !== '' || calls.length === 0) {
+    items.push({
+      kind: 'message',
+      id: hexId('msg'),
+      outputIndex: idx++,
+      text: content !== '' ? content : refusal,
+      callId: '',
+      name: '',
+      args: '',
+    })
+  }
+  /**
+   * 旧式 `function_call`（非 `tool_calls` 数组形态）同样要映射成输出项，
+   * 否则「只有 function_call 的响应」在这里又会变成一个空 items。
+   */
+  const legacyCall = isObject(message.function_call) ? message.function_call : undefined
+  if (legacyCall !== undefined) {
+    items.push({
+      kind: 'function_call',
+      id: hexId('fc'),
+      outputIndex: idx++,
+      text: '',
+      callId: '',
+      name: nonEmptyString(legacyCall.name) ?? '',
+      args: typeof legacyCall.arguments === 'string' ? legacyCall.arguments : '',
+    })
   }
   for (const call of calls) {
     const c = isObject(call) ? call : {}
@@ -701,7 +738,19 @@ export function toResponsesSse(
         )
       }
     }
-    const content = typeof delta.content === 'string' ? delta.content : ''
+    /**
+     * 🔴 **拒答分片也要透出**（2026-10-22，G10 收尾）。
+     *
+     * 上游拒答时给的是 `delta.refusal`，不是 `delta.content`。
+     * 原来这里只读 `content` ⇒ 整段拒答被丢弃 ⇒ 客户端收到一条
+     * 「什么也没说、正常结束」的流 —— 用户完全不知道模型拒绝了。
+     *
+     * 归一到 `content` 通道（与 `aggregateSse` 把 refusal 拼进 message 的做法一致），
+     * 这样 `response.output_text.delta` 事件、收尾的 `output[]` 都不用再分支。
+     */
+    const rawContent = typeof delta.content === 'string' ? delta.content : ''
+    const refusalDelta = typeof delta.refusal === 'string' ? delta.refusal : ''
+    const content = rawContent !== '' ? rawContent : refusalDelta
     if (content !== '') {
       // ⚠️ 正文开始 ⇒ **先关掉推理项**：协议里 reasoning 是独立输出项，
       // 与 message 并列；让它们同时"开着"会让客户端把两者串在一起。

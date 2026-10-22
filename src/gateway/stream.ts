@@ -605,13 +605,13 @@ export function isEmptyAssistantTurn(
   choice: AggregatedCompletion['choices'][number] | undefined,
 ): boolean {
   if (choice === undefined) return false
-  const msg = choice.message as {
-    content?: string
-    reasoning_content?: string
-    tool_calls?: unknown[]
-    refusal?: unknown
-    function_call?: unknown
-  }
+  // ⚠️ 这里**不再**把 `message` 断言成一个临时形状。
+  // 原来那句 `const msg = choice.message as { … refusal?: unknown … }` 正是本缺陷的温床：
+  // 断言「message 上有 refusal / function_call」让编译器闭嘴，于是
+  // 「判据读的两个字段**根本没人生产**」这件事**类型系统看不见** ——
+  // 判据成了死代码，而代码看起来完全正常（注释还写着「已补上漏判」）。
+  // 字段现已进 `AggregatedCompletion`，直接读即可由类型检查兜住。
+  const msg = choice.message
   if (Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0) return false
   // ⚠️ `refusal` 与旧式 `function_call` 同样是「有产出」——
   // 漏掉它们会把**合法的拒答/函数调用**反向误报成「上游空响应」（502）。
@@ -668,7 +668,27 @@ export interface AggregatedCompletion {
   model: string
   choices: Array<{
     index: number
-    message: { role: 'assistant'; content: string; reasoning_content?: string; tool_calls?: unknown[] }
+    message: {
+      role: 'assistant'
+      content: string
+      reasoning_content?: string
+      tool_calls?: unknown[]
+      /**
+       * 拒答正文（`delta.refusal` 累积出来的）。
+       *
+       * ⚠️ **为什么它必须出现在这个类型里**：`isEmptyAssistantTurn` 早就把
+       * 「有 `refusal`」当成「不是空响应」的判据，但本类型的 message 里
+       * **没有这个字段**、`aggregateSse` 也**从不累积它** —— 于是那条判据
+       * 永远读到 `undefined`，是一段**不可达的死代码**（修复前后行为完全一致）。
+       * 字段进类型后，「谁生产、谁消费」才由编译器看住。
+       */
+      refusal?: string
+      /**
+       * 旧式函数调用（`delta.function_call` 累积出来的）。
+       * 同上：`isEmptyAssistantTurn` 已在判它，而生产者此前根本没有。
+       */
+      function_call?: { name: string; arguments: string }
+    }
     finish_reason: string | null
   }>
   usage?: unknown
@@ -706,6 +726,31 @@ export function aggregateSse(
 
   let content = ''
   let reasoning = ''
+  /**
+   * 拒答正文（`delta.refusal`）。
+   *
+   * ## 🔴 为什么必须在这里累积（2026-10-21 审查发现的「修了等于没修」）
+   *
+   * `isEmptyAssistantTurn` 早就把「有 `refusal`」写成了「不是空响应」的判据
+   * （注释还写着「拒答也是产出」），但**本函数从不累积它** ——
+   * 而 `AggregatedCompletion` **只由本函数生产** ⇒ 那条判据永远拿不到非空值。
+   *
+   * 于是修复前后的**可观察行为完全一致**：上游只回一句拒答
+   * `data: {"choices":[{"index":0,"delta":{"refusal":"我不能协助这个请求。"}}]}`
+   * ⇒ 聚合出 `{content:''}` ⇒ `nonStreamingResponse` 判「空响应」⇒ **502**，
+   * 用户看到「上游返回了空响应…」，而真相是**模型明确拒答了**（这是合法产出）。
+   *
+   * ⚠️ 更刺眼的是**流式路径根本没这个问题**：`normalizeFrame` 只删「空值」，
+   * 非空 `refusal` 原样透传 ⇒ 同一个响应「流式能看、非流式报 502」。
+   * 又是本项目最主要的缺陷形态：**同一概念两条路径口径漂移**。
+   */
+  let refusal = ''
+  /**
+   * 旧式函数调用（`delta.function_call`，与 `tool_calls` 并存的废弃形态）。
+   *
+   * 同上：判据已在判它，生产者此前没有 ⇒ 纯 `function_call` 的响应同样被判空 ⇒ 502。
+   */
+  let functionCall: { name: string; arguments: string } | undefined
   const toolCalls: Array<Record<string, unknown>> = []
   const choice = result.choices[0]
   if (choice === undefined) return result
@@ -745,6 +790,21 @@ export function aggregateSse(
         const d = delta as Record<string, unknown>
         if (typeof d['content'] === 'string') content += d['content']
         if (typeof d['reasoning_content'] === 'string') reasoning += d['reasoning_content']
+        // ⚠️ `refusal` 也是**分片**到达的（拒答同样是逐 token 生成），必须拼接 ——
+        // 只取最后一片会把拒答截成半句，客户端看到的是一句没说完的话。
+        if (typeof d['refusal'] === 'string') refusal += d['refusal']
+        // 旧式 `function_call`：`name` 只在首片给全，`arguments` 是分片。
+        // ⇒ name 保留**首个非空值**、arguments 拼接。
+        //（若照 `tool_calls` 那样每片覆盖 name，遇到把 name 切开的 upstream 就只剩尾巴。）
+        const rawFunctionCall = d['function_call']
+        if (rawFunctionCall !== null && typeof rawFunctionCall === 'object') {
+          const fc = rawFunctionCall as Record<string, unknown>
+          functionCall ??= { name: '', arguments: '' }
+          if (functionCall.name === '' && typeof fc['name'] === 'string' && fc['name'] !== '') {
+            functionCall.name = fc['name']
+          }
+          if (typeof fc['arguments'] === 'string') functionCall.arguments += fc['arguments']
+        }
         if (Array.isArray(d['tool_calls'])) {
           // ⚠️ 工具调用的 arguments 是**分片**到达的，必须按 index 合并，
           // 否则客户端拿到的是被截断的 JSON（无法解析）。
@@ -772,6 +832,17 @@ export function aggregateSse(
   choice.message.content = content
   if (reasoning !== '') choice.message.reasoning_content = reasoning
   if (toolCalls.length > 0) choice.message.tool_calls = toolCalls
+  // ⚠️ 只在**真拿到值**时才挂字段（与 `normalizeFrame` 对 delta 的同一口径：
+  // 「字段存在」本身就是客户端的判断依据，空值比没有更坏）。
+  //
+  // 反过来说：`function_call: {}` 这种**空壳**不能当成「有产出」——
+  // 若上游每帧都带一个空对象（buddy 就爱发 `"function_call":null` 这类占位），
+  // 挂上去会让「上游什么都没给」被判成「有内容」⇒ 静默 200 空答案，
+  // 与本缺陷正好相反的假阴性（同样违反「失败必须显式」）。
+  if (refusal !== '') choice.message.refusal = refusal
+  if (functionCall !== undefined && (functionCall.name !== '' || functionCall.arguments !== '')) {
+    choice.message.function_call = functionCall
+  }
   // ⚠️ 流里没给 finish_reason 时**不能编造** —— 但也不能留 null 让客户端困惑。
   // 有 tool_calls 说明是工具调用，否则按正常结束。
   if (choice.finish_reason === null) {

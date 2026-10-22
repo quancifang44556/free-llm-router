@@ -141,7 +141,13 @@ const ACTIONS: Record<string, ActionHandler> = {
     }
   },
 
-  /** 查询余额（只读，用于签到后解冻冷却账号）。 */
+  /**
+   * 查询余额（**只读**，结果只用于展示）。
+   *
+   * ⚠️ 原文写「用于签到后解冻冷却账号」—— 那是假的：这里既不写 `credits`，
+   * 也不调 `clearHardIfRecovered`。解冻只发生在两条余额刷新入口
+   *（`/admin/accounts/balance` 与整点 cron），见 `src/index.ts`。
+   */
   async balance(ctx, _step, env): Promise<ActionResult> {
     try {
       const result = await fetchBalance({ uid: ctx.uid, accessToken: ctx.accessToken }, env, ctx.now)

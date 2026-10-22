@@ -87,7 +87,10 @@ export function planDaily(): TaskStep[] {
   return [
     { code: '_probe', action: 'listTasks', delayMs: GAP.report },
     { code: 'checkin', action: 'checkin', delayMs: GAP.report },
-    // 签到后查余额：余额恢复的冷却账号由调用方解冻
+    // 签到后查余额（只读展示）。
+    // ⚠️ 它**不会**解冻任何账号：本引擎的 balance 动作不写 credits、也不调
+    // `clearHardIfRecovered`。真正的「余额恢复 ⇒ 解冻 hard」只在
+    // `/admin/accounts/balance` 与整点 cron 两条入口（见 `src/index.ts`）。
     { code: '_probe', action: 'balance', delayMs: 0 },
   ]
 }

@@ -1585,7 +1585,11 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
    * ⚠️ 与 cron 用**同一段逻辑**（`refreshAccountBalances`）：
    * 两处各写一份必然慢慢分叉（本项目已吃过「只修一半」的亏多次）。
    *
-   * ⚠️ 只读上游（`billing/meter/get-user-resource`），不改任何账号状态。
+   * ⚠️ 上游是**只读**的（`billing/meter/get-user-resource`，不消耗配额），
+   * 但**本地会写状态**：余额三元组 + 采样史（`updateBalance`），
+   * 以及「余额恢复 ⇒ 解冻 hard 冷却」（`clearHardIfRecovered`，**只清这一维**）。
+   * 原注释写的是「不改任何账号状态」—— 那是 `clearHardIfRecovered` 落地前的说法，
+   * 已不成立；留着会让下一个人以为调它不会影响选号。
    */
   if (path === '/admin/accounts/balance' && request.method === 'POST') {
     const body = (await request.json().catch(() => ({}))) as { realm?: string; uid?: string }
@@ -1618,6 +1622,14 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
             credits: b.total,
             expiring: b.expiring,
             earliestExpiry: b.earliestExpiry,
+          })
+          // 🔴 余额恢复 ⇒ 解冻 `hard`（402 余额耗尽）冷却。**必须显式调用**：
+          // `updateBalance` 刻意只写额度、不碰惩罚态（见该方法注释），
+          // 所以「充值后自动恢复」这件事此前全仓从未实现 —— 用户充了钱仍被锁到次日 04:00。
+          // ⚠️ 只清这一维（breaker/soft/restricted 各有各的现实原因，见 `clearHardIfRecovered`）。
+          // ⚠️ 失败**不改变**余额刷新结论（余额已经落盘了），故单独兜住并留痕。
+          await pool.clearHardIfRecovered(account.uid, b.total, now).catch((error: unknown) => {
+            console.warn('[balance] 解冻 hard 冷却失败：', error instanceof Error ? error.message : String(error))
           })
           results.push({ uid: account.uid, provider: providerId, ok: true, credits: b.total })
         } catch (error) {
@@ -4754,6 +4766,13 @@ async function refreshAccountBalances(env: Env, now: number): Promise<void> {
           credits: b.total,
           expiring: b.expiring,
           earliestExpiry: b.earliestExpiry,
+        })
+        // 🔴 余额恢复 ⇒ 解冻 `hard`（402 余额耗尽）冷却（与 `/admin/accounts/balance`
+        // 同一段逻辑，两处各写一份必然分叉）。余额为 0 / 仍在冷却的其它维度一律不动，
+        // 细节见 `AccountPoolDO.clearHardIfRecovered`。
+        // ⚠️ 失败不影响本轮「刷新成功」的结论：余额已经落盘了。
+        await pool.clearHardIfRecovered(account.uid, b.total, now).catch((error: unknown) => {
+          console.warn(`[cron] ${providerId} ${account.uid} 解冻 hard 冷却失败：`, error instanceof Error ? error.message : String(error))
         })
         refreshed += 1
       } catch (error) {
