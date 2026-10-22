@@ -2602,12 +2602,50 @@ export async function handleProviderChat(input: {
      */
     let refreshFailure = ''
     let upstream: Response
+    /**
+     * 🔴 **分支 B 的上下文裁剪**（2026-10-22 补，修我自己引入的回归）。
+     *
+     * ## 缺陷：裁剪曾经在分支 A，但 workbuddy **不走分支 A**
+     *
+     * `DEFAULT_PROVIDER === 'buddy'`，而 `providerId === 'workbuddy'`
+     * 在分流点（`if (providerId !== DEFAULT_PROVIDER)`）就被送进**本函数**。
+     * 我把裁剪从「分流之前」挪到「选号之后」（为了支持按账号上限），
+     * 于是它落进了分支 A 的循环里 —— **workbuddy 永远走不到那里**。
+     *
+     * 后果：裁剪对唯一需要它的供应商**完全失效**
+     *（实测：改动后日志里 `context-trim` 出现 0 次，改动前正常）。
+     *
+     * ## 为什么放在这里而不是循环外
+     *
+     * 上限是**按账号**的，换号后可能不同 ⇒ 必须在循环内、拿到 `acctSafety` 之后裁。
+     * 与分支 A 用**同一个** `trimMessagesByLimit`（不另写一份，否则两处判据会漂）。
+     *
+     * ⚠️ 只对 workbuddy 生效：它来自封号复盘的「伪装成官方客户端」，
+     * 而 qodercn/cline 等用自家官方凭据、无需伪装 —— 给它们裁只会损坏请求。
+     */
+    let sendBody: Record<string, unknown> = body
+    if (providerId === 'workbuddy' && acctSafety.maxContextMessages > 0) {
+      const withMessages = body as Record<string, unknown>
+      if (Array.isArray(withMessages.messages)) {
+        const before = withMessages.messages as unknown[]
+        const trimmed = trimMessagesByLimit(before, acctSafety.maxContextMessages)
+        if (trimmed.messages !== before) {
+          sendBody = { ...withMessages, messages: trimmed.messages }
+          // ⚠️ 隐私红线：**不打任何消息内容**，只打条数与模型名。
+          console.log(
+            `[context-trim] 消息数超限已压缩：${before.length} 条 → ${trimmed.messages.length} 条`
+              + `（省略更早 ${trimmed.dropped} 条）limit=${acctSafety.maxContextMessages} model=${providerId}/${model}`,
+          )
+        }
+      }
+    }
+
     try {
       // 防封：按账号排队 + 抖动 —— **只对 workbuddy 生效**（见 throttle.ts）。
       await throttleUpstream(picked.uid, undefined, undefined, providerId,
         { qps: acctSafety.rateLimitQps, jitterMs: acctSafety.rateJitterMs })
       upstream = await provider.chat(credential, {
-        model, body, signal: request.signal,
+        model, body: sendBody, signal: request.signal,
         conversation: { conversationId: providerConversationId, turnRequestId: providerTurnRequestId },
       })
     } catch (error) {

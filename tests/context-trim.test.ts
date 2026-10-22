@@ -339,7 +339,18 @@ test('🔴 裁剪只在 handleChatCompletions 接线一次（本项目吃过「�
   assert.deepEqual(callSites, ['gateway/server.ts'], '裁剪的调用点必须唯一')
 
   const server = stripComments(readFileSync('src/gateway/server.ts', 'utf8'))
-  assert.equal([...server.matchAll(/trimMessagesByLimit\s*\(/g)].length, 1, 'server.ts 里必须只有一处调用')
+  // ⚠️ 2026-10-22 修正：**不能再要求「只有一处」**。
+  //
+  // `DEFAULT_PROVIDER === 'buddy'`，而 workbuddy 在
+  // `if (providerId !== DEFAULT_PROVIDER)` 处被分流进 handleProviderChat ——
+  // 两条路径是两个互斥的循环，**各自都需要裁剪**。
+  // 强行「只留一处」正是上一版引入回归的原因：把它挪进了 workbuddy 走不到的分支。
+  // ⇒ 现在守的是「最多两处，且分别落在两条路径里」（见文件末尾的分路径断言）。
+  const trimCalls = [...server.matchAll(/trimMessagesByLimit\s*\(/g)].length
+  assert.ok(
+    trimCalls >= 1 && trimCalls <= 2,
+    `server.ts 里最多两处裁剪调用（两条路径各一处），实际 ${trimCalls}`,
+  )
 
   // ── 位置：仍然在 handleChatCompletions 内，但**必须在选号之后** ──
   //
@@ -386,8 +397,15 @@ test('🔴 裁剪只在 handleChatCompletions 接线一次（本项目吃过「�
       + '否则「只给 qodercn 放开」这个需求无法实现',
   )
 
-  // 反向：handleProviderChat / prepareChatBody 内部不得再裁一次（重复实现）
-  assert.ok(!/trimMessagesByLimit/.test(server.slice(providerFnAt)), 'handleProviderChat 内不得重复裁剪')
+  // ⚠️ 2026-10-22 撤销「handleProviderChat 内不得裁剪」这条反向断言。
+  //
+  // 它当时的前提是「裁剪只属于 buddy 路径」。那个前提**是错的**：
+  // `DEFAULT_PROVIDER === 'buddy'`，workbuddy 恰恰走 handleProviderChat ——
+  // 而 workbuddy 是**唯一**需要裁剪的供应商。这条断言等于把功能锁在走不到的路径上，
+  // 也是我上一版引入回归时「测试全绿」的原因之一。
+  //
+  // ⇒ 现在只保留真正的重复实现检查：`prepareChatBody` 内部不得再裁一次
+  //（那会导致「裁两遍」，且第二遍拿不到正确的上限语义）。
   const payload = stripComments(readFileSync('src/gateway/payload.ts', 'utf8'))
   const prepareAt = payload.indexOf('export function prepareChatBody')
   assert.ok(!/trimMessagesByLimit/.test(payload.slice(prepareAt)), 'prepareChatBody 内不得再裁一次')
@@ -425,4 +443,58 @@ test('裁剪日志只打条数与模型名，绝不打任何消息内容（隐�
   for (const forbidden of ['.content', 'JSON.stringify', 'messages[0]']) {
     assert.ok(!window.includes(forbidden), `日志不得包含消息内容（出现 ${forbidden}）`)
   }
+})
+
+test('🔴 裁剪必须覆盖 **两条** chat 路径（workbuddy 走的是 provider 路径）', () => {
+  // ## 这条测试的来历：我自己引入的回归，而且原有断言没抓到
+  //
+  // 为了支持「按账号的裁剪上限」，我把裁剪从「分流点之前」挪到「选号之后」。
+  // 但 `DEFAULT_PROVIDER === 'buddy'`，而 `providerId === 'workbuddy'`
+  // 在 `if (providerId !== DEFAULT_PROVIDER)` 处就被分流进 **handleProviderChat** ——
+  // 于是裁剪落进了 buddy 的循环里，**workbuddy 永远走不到**。
+  //
+  // 实测证据：给 workbuddy 设 `maxContextMessages: 50` 后发 401 条消息，
+  // 日志里 `context-trim` 出现 **0 次**（改动前是正常的）。
+  //
+  // ## 为什么原有断言没抓到
+  //
+  // 原断言只检查「唯一调用点 + 在 handleChatCompletions 内 + 晚于 pickCandidate」——
+  // 它全部满足，因为裁剪**确实**在分支 A 里。它守的是「接线了一次」，
+  // 而**不是**「唯一需要它的那条路径上也接上了」。
+  // ⇒ 断言必须分别钉住两条路径各自都有裁剪。
+  const server = stripComments(readFileSync('src/gateway/server.ts', 'utf8'))
+
+  const buddyAt = server.indexOf('export async function handleChatCompletions')
+  const providerAt = server.indexOf('export async function handleProviderChat')
+  assert.ok(buddyAt >= 0 && providerAt > buddyAt, '两条路径的边界应能定位')
+
+  const buddyBody = server.slice(buddyAt, providerAt)
+  const providerBody = server.slice(providerAt)
+
+  // 分支 A：通过 `rebuildPreparedForLimit`（间接调用 trimMessagesByLimit）
+  assert.ok(
+    /trimMessagesByLimit\s*\(/.test(buddyBody),
+    '分支 A（buddy/默认）必须裁剪',
+  )
+
+  // 分支 B：必须**直接**裁剪 —— 这是 workbuddy 唯一的路径
+  assert.ok(
+    /trimMessagesByLimit\s*\(/.test(providerBody),
+    '⚠️ 分支 B（provider，workbuddy 走这里）必须裁剪 —— '
+      + '缺了它，裁剪对唯一需要它的供应商完全失效',
+  )
+
+  // 分支 B 的裁剪必须也按供应商收窄（不能给 qodercn 等也裁）
+  const provTrimAt = providerBody.indexOf('trimMessagesByLimit(')
+  const provSeg = providerBody.slice(Math.max(0, provTrimAt - 700), provTrimAt + 200)
+  assert.ok(
+    /providerId === 'workbuddy'/.test(provSeg),
+    '⚠️ 分支 B 的裁剪必须只对 workbuddy 生效，否则会损坏 qodercn 等自家凭据的对话',
+  )
+
+  // 分支 B 的裁剪必须用**按账号**的上限
+  assert.ok(
+    /acctSafety\.maxContextMessages/.test(provSeg),
+    '分支 B 的裁剪上限必须来自「该账号实际生效」的配置',
+  )
 })
