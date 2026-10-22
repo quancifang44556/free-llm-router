@@ -32,6 +32,10 @@ export interface Account {
   lastErr: number
   fails: number
   breakerUntil: number
+  /** 上游明确封号（11140）的解禁时刻；> now 表示「上游封号」而不是「模型限流」。 */
+  restrictedUntil: number
+  /** 降权（能发但慢/易失败）的解除时刻；后端 `healthy()` 把它当不可用。 */
+  degradeUntil: number
   modelCooldowns: { model: string; until: number }[]
 }
 

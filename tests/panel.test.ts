@@ -549,3 +549,32 @@ test('🔴 面板状态徽章必须识别「降权中」（degradeUntil）', () 
   assert.ok(/n!==`degraded`/.test(src), '「有问题」筛选必须包含 degraded')
   assert.ok(/t===`degraded`/.test(src), '「解除限制」菜单必须对 degraded 可用')
 })
+
+test('🔴 面板源码的状态标签必须覆盖产物里的每一个（否则重建即丢功能）', () => {
+  // ## 为什么这条测试存在（P1/P2，2026-10-22）
+  //
+  // 线上跑的是 `src/panel/web/assets/*.js.txt`（压缩产物），而它的源码在 `web/`。
+  // 两者**已经漂了**：产物里有 `degraded`（降权中）与 `restricted`（上游封号），
+  // `web/src/lib/status.ts` 里一个都没有 —— 因为之前几轮修 UI 都是**直接改产物**。
+  //
+  // 后果：谁跑一次 `npm run build:web`，这些状态就从面板上消失，
+  // 账号又变回「绿着正常但一直失败」。
+  //
+  // 这条测试把「产物领先于源码」变成**红灯**，而不是等人踩。
+  const bundleFiles = readdirSync('src/panel/web/assets').filter((f) => /^index-.*\.js\.txt$/.test(f))
+  assert.ok(bundleFiles.length > 0, '应能找到面板主包')
+  const bundle = readFileSync(path.join('src/panel/web/assets', bundleFiles[0]!), 'utf8')
+  const source = readFileSync('web/src/lib/status.ts', 'utf8')
+
+  // 产物里 STATUS_META 的标签（形如 breaker:{label:`熔断`）
+  const labels = new Set<string>()
+  for (const m of bundle.matchAll(/\{label:`([^`]{2,8})`,tone:/g)) labels.add(m[1]!)
+  assert.ok(labels.size >= 5, `应能解析出状态标签（实际 ${labels.size}）`)
+
+  const missing = [...labels].filter((l) => !source.includes(`'${l}'`))
+  assert.deepEqual(
+    missing,
+    [],
+    `⚠️ 这些状态标签只存在于产物、源码里没有 ⇒ 重建面板就会丢：${missing.join('、')}`,
+  )
+})

@@ -31,7 +31,7 @@ import { Input } from '@/components/ui/input'
 import { Menu, MenuContent, MenuItem, MenuLabel, MenuSeparator, MenuTrigger } from '@/components/ui/menu'
 import { Empty, ProviderAvatar, Segmented, Skeleton } from '@/components/ui/misc'
 import { Table, TD, TH, THead, TR } from '@/components/ui/table'
-import { useClearCooldowns, useSetProviderOrder } from '@/lib/config'
+import { useClearCooldowns, useProbeAccount, useSetProviderOrder } from '@/lib/config'
 import {
   pinModeOf,
   useAccounts,
@@ -80,7 +80,9 @@ export function ProvidersPage() {
     return (accounts.data ?? []).filter((a) => {
       const s = accountStatus(a)
       if (filter === 'ok' && s !== 'ok') return false
-      if (filter === 'issue' && !(s === 'cooling' || s === 'breaker' || s === 'model')) return false
+      // ⚠️ 「有问题」必须覆盖全部非正常态，否则新加的状态会变成「孤儿」：
+      // 面板上明明标红，用户点「有问题」却筛不到它。
+      if (filter === 'issue' && !(s === 'cooling' || s === 'breaker' || s === 'model' || s === 'degraded' || s === 'restricted')) return false
       if (filter === 'disabled' && s !== 'disabled') return false
       return !kw || `${a.nickname} ${a.uid} ${a.provider}`.toLowerCase().includes(kw)
     })
@@ -372,7 +374,9 @@ function HealthBar({ list }: { list: Account[] }) {
     ok: 'bg-success',
     cooling: 'bg-warning',
     model: 'bg-warning',
+    degraded: 'bg-warning',
     breaker: 'bg-danger',
+    restricted: 'bg-danger',
     disabled: 'bg-muted-foreground/30',
   }
   return (
@@ -403,6 +407,7 @@ export function AccountsTable({
   const remove = useRemoveAccount()
   const balance = useRefreshBalance()
   const clearCd = useClearCooldowns()
+  const probe = useProbeAccount()
   const pins = usePins()
   const setPin = useSetPin()
   const providers = useProviders()
@@ -457,8 +462,17 @@ export function AccountsTable({
           {rows.map((a) => {
             const s = accountStatus(a)
             const meta = STATUS_META[s]
+            // ⚠️ 封号/降权也要给出「什么时候恢复」，否则用户只能猜
             const hint =
-              s === 'disabled' ? a.reason : s === 'cooling' || s === 'breaker' ? `${fmtRelative(Math.max(a.until, a.breakerUntil))}恢复` : ''
+              s === 'disabled'
+                ? a.reason
+                : s === 'restricted'
+                  ? `上游封号，${fmtRelative(a.restrictedUntil)}恢复`
+                  : s === 'degraded'
+                    ? `降权中，${fmtRelative(a.degradeUntil)}恢复`
+                    : s === 'cooling' || s === 'breaker'
+                      ? `${fmtRelative(Math.max(a.until, a.breakerUntil))}恢复`
+                      : ''
             const mode = pinModeOf(a, pins.data)
             return (
               <TR key={a.realm + a.uid}>
@@ -468,6 +482,16 @@ export function AccountsTable({
                     {mode && <PinBadge mode={mode} />}
                   </div>
                   <div className="text-muted-foreground font-mono text-[11.5px]">{a.uid}</div>
+                  {/* ⚠️ 会真实打一次上游（消耗极少配额），故只在点击时触发 */}
+                  <button
+                    type="button"
+                    title="探测该账号当前是否可用（会真实打一次上游，消耗极少配额）"
+                    className="text-muted-foreground hover:text-foreground mt-1 cursor-pointer text-[11px] underline decoration-dotted"
+                    onClick={() => probe.mutate({ uid: a.uid, realm: a.realm })}
+                    disabled={probe.isPending}
+                  >
+                    {probe.isPending ? '探测中…' : '探测'}
+                  </button>
                 </TD>
                 {providerName && (
                   <TD className="hidden md:table-cell">
@@ -518,7 +542,7 @@ export function AccountsTable({
                           <RefreshCw /> 刷新余额
                         </MenuItem>
                       )}
-                      {(s === 'cooling' || s === 'breaker' || s === 'model') && (
+                      {(s === 'cooling' || s === 'breaker' || s === 'model' || s === 'degraded' || s === 'restricted') && (
                         <MenuItem onSelect={() => clearCd.mutate({ uid: a.uid, realm: a.realm })}>
                           <Snowflake /> 清除冷却
                         </MenuItem>

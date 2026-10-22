@@ -140,6 +140,62 @@ export function useClearWaf() {
 }
 
 /** 清空冷却：不传 uid = 全部账号（两个分片）；传 uid = 只清这一个号。 */
+/** 单账号探测结果（`POST /admin/accounts/probe`）。 */
+export interface ProbeResult {
+  uid: string
+  provider: string
+  nickname: string
+  model: string
+  ok: boolean
+  latencyMs: number
+  /** healthy | account_problem | model_problem | upstream_problem | timeout */
+  verdict: string
+  detail: string
+  note: string
+}
+
+export interface ProbeResponse {
+  realm: string
+  probedAt: number
+  results: ProbeResult[]
+  summary: Record<string, number>
+}
+
+/**
+ * 探测账号当前是否真的可用。
+ *
+ * ⚠️ **会真实打一次上游**（`max_tokens: 32`，消耗极少配额），
+ * 故只在用户主动点击时调用，绝不定时轮询。
+ *
+ * ⚠️ 这个功能此前**只存在于压缩产物里**、源码没有（P1：产物领先于源码）。
+ * 一旦有人重建面板它就会消失，所以这里把它补回源码。
+ */
+export function useProbeAccount() {
+  const qc = useQueryClient()
+  return useMutation<ProbeResponse, Error, { uid: string; realm?: Realm }>({
+    mutationFn: (v) => api<ProbeResponse>('/admin/accounts/probe', { json: v, timeoutMs: 120_000 }),
+    onSuccess: (r) => {
+      const one = r.results[0]
+      if (!one) {
+        toast.error('探测没有返回结果')
+        return
+      }
+      const label: Record<string, string> = {
+        healthy: '上游正常',
+        account_problem: '账号问题',
+        model_problem: '模型问题',
+        upstream_problem: '上游问题',
+        timeout: '超时',
+      }
+      const text = `${label[one.verdict] ?? one.verdict} · ${one.latencyMs}ms`
+      if (one.verdict === 'healthy') toast.success(text)
+      else toast.warning(text, { description: one.note || one.detail })
+      void qc.invalidateQueries({ queryKey: ['accounts'] })
+    },
+    onError: (e) => toast.error('探测失败', { description: e.message }),
+  })
+}
+
 export function useClearCooldowns() {
   const qc = useQueryClient()
   return useMutation<{ cleared: number; resetCount: number }, Error, { uid?: string; realm?: Realm } | void>({

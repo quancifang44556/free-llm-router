@@ -700,6 +700,38 @@ function recordRequestFailure(
     .catch(() => undefined)
 }
 
+/**
+ * 流内失败也要记**用量**（T3，2026-10-22）。
+ *
+ * ## 缺陷
+ * 三条流式路径的 `onError` 都只 `recordLog()`，**从不 `recordUsage()`**。
+ * 而面板的「成功率」是按 `recordUsage.ok` 算的 ⇒ 流内失败的请求
+ * 既不计入失败、也不计入总数，成功率**恒接近 100%**。
+ *
+ * 这与请求级失败（`recordRequestFailure`）不是一回事，不会重复计数：
+ * 那条只在「一个候选都没成功、还没开始推流」时触发；本函数处理的是
+ * **已经 200 开流、推到一半上游断了**——请求级路径根本走不到。
+ */
+function recordStreamFailure(
+  pool: { recordUsage: (record: UsageRecord) => Promise<unknown> },
+  input: { uid: string; model: string; errorKind: string; startedAt: number },
+  ctx: ExecutionContext | undefined,
+): void {
+  const t = pool
+    .recordUsage({
+      at: Date.now(),
+      uid: input.uid,
+      model: input.model,
+      input: 0,
+      output: 0,
+      ok: false,
+      errorKind: input.errorKind,
+      ms: Math.max(0, Date.now() - input.startedAt),
+    })
+    .catch(() => undefined)
+  if (ctx !== undefined) ctx.waitUntil(t)
+}
+
 export async function handleChatCompletions(
   request: Request,
   env: Env,
@@ -1585,6 +1617,12 @@ export async function handleChatCompletions(
             })
             .catch(logPoolError('applyFailure'))
 
+          // ⚠️ 流内失败也要记**用量**（否则面板成功率虚高，见 recordStreamFailure）
+          recordStreamFailure(
+            pool,
+            { uid: candidate.uid, model: `buddy/${model}`, errorKind: punishmentForStreamError(message), startedAt },
+            ctx,
+          )
           recordLog(
             pool,
             {
@@ -2328,6 +2366,7 @@ export async function handleProviderChat(input: {
                     .applyFailure({ uid: picked.uid, kind: 'breaker', now: Date.now(), reason: m.slice(0, 200) })
                     .catch(logPoolError('applyFailure'))
                   if (ctx !== undefined) ctx.waitUntil(t)
+                  recordStreamFailure(pool, { uid: picked.uid, model: `${providerId}/${model}`, errorKind: 'breaker', startedAt: startedAt2 }, ctx)
                   recordLog(
                     pool,
                     {
@@ -2495,7 +2534,17 @@ export async function handleProviderChat(input: {
            * 上游在文案里给了重置墙钟时，冷却应对齐它而不是走我们自己猜的指数退避
            *（猜早了继续撞限流，猜晚了白白少用几小时）。
            */
-          const pRefined = refineModelScoped(c.kind, detail)
+          /**
+           * ⚠️ **必须传原始 message，不能传 `detail`**（2026-10-22，G3）。
+           *
+           * `detail` 在「已解析出业务码」时被换成了 `c.msg`（人话文案），
+           * 而 `refineModelScoped()` 内部是拿 `parseBusinessCode(bodyText)` 找码的 ——
+           * 传人话过去必然解析不出码，于是 `110/6004/14003/11134` 全部退化成
+           * **账号级 soft**：一个模型限流就把整个号锁掉，换个模型明明能用。
+           *
+           * 这与注释里声称的「与另两条路径对齐」并不一致：那两条传的都是原始文本。
+           */
+          const pRefined = refineModelScoped(c.kind, message)
           const pPunishKind =
             c.kind === 'rate_limited'
               ? pRefined.dimension
@@ -2622,6 +2671,7 @@ export async function handleProviderChat(input: {
                     })
                     .catch(logPoolError('applyFailure'))
                   if (ctx !== undefined) ctx.waitUntil(t)
+                  recordStreamFailure(pool, { uid: picked.uid, model: `${providerId}/${model}`, errorKind: punishmentForStreamError(message), startedAt: startedAt2 }, ctx)
                   recordLog(
                     pool,
                     {
@@ -2693,6 +2743,36 @@ export async function handleProviderChat(input: {
       // 改用共享的 `classify()` 后，11-128 会被认成 `channel_blocked`，
       // 走「不罚号 + 不换号 + 直出真实原因」的分支，与 buddy 路径口径一致。
       const classified = classify(upstream.status, text)
+      /**
+       * 🔴 **WAF / 11140 的「双记账」在这条出口也要做**（2026-10-22，G5）。
+       *
+       * ProviderError 出口（`2451`/`2454`）早就补了双记账，但**这条出口没有** ——
+       * 而 `trae` / `opencode` 恰恰是把非 2xx **原样 return**（不抛异常）的两家：
+       * ```
+       * trae.ts:1083   if (!upstream.ok || upstream.body === null) return upstream
+       * opencode.ts:815  return res
+       * ```
+       * ⇒ 这两家的真实 403-WAF / 11140 从来不给闸门投喂证据，
+       * 而顶部的 `wafGateActive` / `restrictionGateActive` 靠「短窗内多个不同号命中」
+       * 才激活 ⇒ 闸门对它们形同虚设。
+       *
+       * 这与本项目反复出现的「记录点在 A 路径、故障发生在 B 路径」是同一个毛病：
+       * 判据应该挂在**语义**上（这个 kind 该不该记账），而不是「我在哪个分支顺手」。
+       */
+      if (classified.kind === 'request_illegal') {
+        await pool.noteRestriction(picked.uid, Date.now()).catch(() => false)
+      }
+      if (classified.kind === 'waf_blocked') {
+        const ipBlocked = await pool.noteWaf(picked.uid, Date.now()).catch(() => false)
+        if (ipBlocked) {
+          lastError = {
+            status: 503,
+            message: '出口 IP 疑似被 WAF 拦截（短窗内多个账号接连 403）',
+            kind: 'waf_ip_blocked',
+          }
+          break
+        }
+      }
       const isChannelBlocked = classified.kind === 'channel_blocked'
       const rotate = isChannelBlocked
         ? false
@@ -2963,6 +3043,7 @@ export async function handleProviderChat(input: {
             })
             .catch(logPoolError('applyFailure'))
           if (ctx !== undefined) ctx.waitUntil(t)
+          recordStreamFailure(pool, { uid: picked.uid, model: `${providerId}/${model}`, errorKind: punishmentForStreamError(message), startedAt }, ctx)
           recordLog(
             pool,
             {
