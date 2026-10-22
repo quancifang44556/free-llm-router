@@ -1546,6 +1546,17 @@ export class AccountPoolDO extends DurableObject<Env> {
     state.consecutiveFails = 0
     state.sessionDeadFails = 0
     state.modelCooldowns = {}
+    /**
+     * ⚠️ **`restrictedUntil` 必须一起清**（S9，2026-10-22）。
+     *
+     * `revive` 的语义是「人工判定这个号是好的，重新开始」——面板「解冻」与
+     * 「重新导入凭据」都走它。原来清了 until / breaker / degrade / model，
+     * **唯独漏了 `restrictedUntil`**（11140 上游封号标记）⇒ 用户点完「解冻」，
+     * 面板显示正常，账号却仍被 `healthy()` 排除 —— 又一例「状态看着对、行为不对」。
+     *
+     * ⚠️ 与 `setAccountDisabled` 无关：`disabled` 不在本方法里动（见上面的 `reason` 守卫）。
+     */
+    state.restrictedUntil = 0
     // ⚠️ **必须一起清空采样历史**：revive 的语义是「人工判定这个号是好的，解冻」。
     // 若不清，上一轮触发熔断前的高消耗采样仍在观察窗口内（默认 1 小时），
     // 下一次 `updateBalance` 会拿它当基准**立刻再锁一次** ——
@@ -1694,7 +1705,12 @@ export class AccountPoolDO extends DurableObject<Env> {
   }
 
   /**
-   * 显式禁用（人工或 11140 这类强信号）。
+   * 显式禁用（人工操作）。
+   *
+   * ⚠️ **不是 11140 的入口**（S10，2026-10-22 澄清）：上游封号走
+   * `applyFailure(kind:'restricted')`，只写 `restrictedUntil`、**不动 `disabled`** ——
+   * 因为「上游封了这个号」和「用户主动停用」是两件事，前者会到期恢复，后者不会。
+   * 原注释把两者混成一句，会让人以为封号会自动把账号打成终态。
    *
    * ⚠️ 读账号走 {@link readState}（原来裸 `JSON.parse`）。这条路径尤其不能漏归一：
    * 它写的是 `disabled=true` —— **终态**，用户之后很可能再也不会碰这条记录，
@@ -1806,6 +1822,15 @@ export class AccountPoolDO extends DurableObject<Env> {
 
   /** 删除凭据。 */
   async removeCredential(uid: string): Promise<void> {
+    /**
+     * ⚠️ **必须先清内存缓存**（S12，2026-10-22）。
+     *
+     * 原来这里只删库，不清 `credentialCache` —— 而 `deleteCredential()` 会清。
+     * 于是「删掉凭据」之后，`getCredential` 仍能从缓存里拿到那份已删的凭据：
+     * 面板上账号没了凭据，实际却还能用（用户报「删了怎么还在跑」）。
+     * 两条删除路径必须同一口径。
+     */
+    this.credentialCache.delete(uid)
     deleteCredential(this.ctx.storage.sql, uid)
   }
 

@@ -1049,12 +1049,13 @@ export function traeStreamErrorMessage(code: number, message: string, model: str
  * OpenAI 客户端（客户端只会看到一堆无法解析的帧）。转换必须**流式**完成
  * —— 见 {@link createSoloToOpenAiTransform}。
  *
- * ⚠️ 通道选择：`traeChannels` 里记录了该模型所属的通道
+ * ⚠️ 通道选择：`cachedModelChannels` 里记录了该模型所属的通道
  * （**同一模型只在列出它的通道里可调用**，发错通道 → 流内 `4001`）。
- * 由 `listModels` 缓存下来，找不到时回退默认通道。
+ * 映射**未知**时（冷启动、或该账号从未列过模型）会先做一次惰性补齐
+ * —— 见 {@link resolveChannel}；补齐仍拿不到才回退 `TRAE_FUNCTION`。
  */
 async function chat(credential: ProviderCredential, request: ChatRequest): Promise<Response> {
-  const channel = cachedModelChannels.get(request.model) ?? TRAE_FUNCTION
+  const channel = await resolveChannel(credential, request.model, request.signal)
   const body: Record<string, unknown> = transformToSOLOBody(request.body, channel)
   // 输出额度收敛到安全上限（见 TRAE_MAX_COMPLETION_TOKENS 的说明）。
   const requested = readNumber(body, 'max_tokens')
@@ -1064,13 +1065,20 @@ async function chat(credential: ProviderCredential, request: ChatRequest): Promi
 
   let upstream: Response
   try {
-    upstream = await fetch(`${TRAE_AGENT_HOST}${TRAE_CHAT_PATH}`, {
-      method: 'POST',
-      headers: traeSOLOHeaders(credential, true),
-      body: JSON.stringify(body),
-      signal: request.signal,
-    })
+    upstream = await withFirstFrameTimeout('TRAE', request.signal, (signal) =>
+      fetch(`${TRAE_AGENT_HOST}${TRAE_CHAT_PATH}`, {
+        method: 'POST',
+        headers: traeSOLOHeaders(credential, true),
+        body: JSON.stringify(body),
+        signal,
+      }),
+    )
   } catch (error) {
+    // ⚠️ 首帧超时**原样抛**（普通 `Error`，见 {@link withFirstFrameTimeout}）。
+    // 若在这里包成 `ProviderError`，网关会先问 `shouldRotate(0, …)` —— 本家只认
+    // 4xx ⇒ 判成「不换号」⇒ 可恢复的超时变成终态失败。普通 Error 走网关的
+    // 传输层分支：**换号且不惩罚账号**。
+    if (isFirstFrameTimeout(error)) throw error
     throw new ProviderError({
       provider: 'trae',
       message: `TRAE 请求失败（网络层）：${error instanceof Error ? error.message : String(error)}`,
@@ -1095,10 +1103,162 @@ async function chat(credential: ProviderCredential, request: ChatRequest): Promi
   })
 }
 
+// ── 首帧超时 ──
+
+/**
+ * 「发出请求 → 收到响应头」的预算（毫秒）。超时即中止，交给网关换号。
+ *
+ * 与 `buddy.ts` 的同名常量、`qoder.ts` 的 `INFER_TIMEOUT_MS` 同一口径。
+ */
+const FIRST_FRAME_TIMEOUT_MS = 120_000
+
+/**
+ * 在「首帧超时」守卫下发起请求，返回上游响应。
+ *
+ * ## 为什么需要它（缺陷）
+ *
+ * 原先 `chat()` 把 `request.signal` **直接**交给 `fetch`，而那个信号只在
+ * **客户端断开**时触发 ⇒ 上游「接了连接但永不回响应头」（黑洞 / 半开连接 /
+ * 网关侧卡死）时，这条请求会**一直挂着**：用户看到「一直转圈」，而网关这边
+ * 既不换号也不报错。`buddy.chat` 早已用 `AbortController + setTimeout` 修过
+ * 同一形态，本家（以及 cline / minimax / opencode）漏了。
+ *
+ * ## 为什么计时器必须「拿到响应头就撤掉」
+ *
+ * ⚠️ **不能**改成把 `AbortSignal.timeout()` 直接挂在 `fetch` 上：那个信号
+ * **同样管着响应体**，会把超过阈值的**长回答拦腰截断**（`qoder.ts:1305` 有
+ * 本地实测记录）。故这里用 `AbortController` + `setTimeout`，且在
+ * `finally` 里 `clearTimeout` —— 只覆盖「到响应头」这一段。
+ *
+ * ## 为什么超时抛**普通 `Error`** 而不是 `ProviderError`
+ *
+ * 网关对「非 `ProviderError`」走**传输层失败**分支（`server.ts` 的
+ * `lastError = {status: 502, message}` + `continue`）⇒ **换号**且**不惩罚账号**，
+ * 正是这里要的语义（上游不响应不是某个账号的错）。
+ * 若包成 `ProviderError`，网关会先问 `provider.shouldRotate(0, …)`，而本家的
+ * 判据只认 4xx ⇒ 判成「不换号」，反而把可恢复的超时变成终态失败
+ * （`chat()` 的 catch 里为此显式放行，见 {@link isFirstFrameTimeout}）。
+ *
+ * ## 客户端取消
+ *
+ * 客户端信号仍然**穿透**到上游（组合信号），且成功路径**保留**监听 ——
+ * 用户点停止时上游流照样被掐断。
+ */
+function withFirstFrameTimeout(
+  label: string,
+  clientSignal: AbortSignal,
+  send: (signal: AbortSignal) => Promise<Response>,
+): Promise<Response> {
+  const controller = new AbortController()
+  const onClientAbort = (): void => controller.abort(clientSignal.reason)
+  if (clientSignal.aborted) controller.abort(clientSignal.reason)
+  else clientSignal.addEventListener('abort', onClientAbort, { once: true })
+  const timer = setTimeout(() => {
+    const timeout = new Error(
+      `${label} 首帧超时：${Math.round(FIRST_FRAME_TIMEOUT_MS / 1000)} 秒内没有收到响应头`
+      + '（上游不响应或连接半开，已中止本次请求）。',
+    )
+    timeout.name = 'TimeoutError'
+    controller.abort(timeout)
+  }, FIRST_FRAME_TIMEOUT_MS)
+  let gotResponse = false
+  return send(controller.signal)
+    .then((response) => {
+      gotResponse = true
+      return response
+    })
+    .finally(() => {
+      // 计时器只管到「拿到响应头」；拿到就撤，否则会掐断正在进行的流。
+      clearTimeout(timer)
+      // 失败路径摘掉客户端监听；成功路径保留（客户端中途取消仍要能掐断上游）。
+      if (!gotResponse) clientSignal.removeEventListener('abort', onClientAbort)
+    })
+}
+
+/**
+ * 该错误是不是 {@link withFirstFrameTimeout} 抛出的首帧超时。
+ *
+ * ⚠️ 只认 `name === 'TimeoutError'`（上面显式设置）。**不能**按消息文本
+ * 模糊匹配 —— 客户端取消抛的是 `AbortError`，两者处置完全不同：
+ * 超时要换号重试，客户端取消不该重发。
+ */
+function isFirstFrameTimeout(error: unknown): boolean {
+  return error instanceof Error && error.name === 'TimeoutError'
+}
+
 // ── 模型目录 ──
 
-/** 模型 id → 所属通道（`chat` 时用它选对 `function`）。 */
+/**
+ * 「该模型存在，但所属通道未知」的占位值。
+ *
+ * ⚠️ 必须与「通道就是 `TRAE_FUNCTION`」区分开：兜底表（{@link fallbackModels}）
+ * 里的 id **没有通道归属信息**（归属只能从 `batch_get_detail_param` 的
+ * `function_configs[].function` 拿到），把兜底一律当成 `solo_work_lite`
+ * 会让不属于该通道的模型全部回 `4001`（见 {@link resolveChannel}）。
+ */
+const UNKNOWN_CHANNEL = 'unknown'
+
+/** 模型 id → 所属通道（`chat` 时用它选对 `function`）。值是真实通道或 {@link UNKNOWN_CHANNEL}。 */
 const cachedModelChannels = new Map<string, string>()
+
+/**
+ * 上次「惰性补齐通道映射」的时刻。
+ *
+ * ⚠️ 用途是**限流**：目录端点持续故障时，不能让每个 chat 都白等一次
+ * （`listModels` 的请求带 30 秒超时）。故两次补齐之间至少间隔
+ * {@link CHANNEL_BACKFILL_INTERVAL_MS}。
+ */
+let channelBackfillAt = 0
+const CHANNEL_BACKFILL_INTERVAL_MS = 60_000
+
+/**
+ * 解析该模型该发哪个对话通道。
+ *
+ * ## 🔴 为什么必须惰性补齐（缺陷，B5）
+ *
+ * 原先 `chat()` 直接 `cachedModelChannels.get(model) ?? TRAE_FUNCTION`，而这张
+ * 映射表的**唯一写点**在 `listModels()` 里（且 `fallbackModels()` 不填表）。
+ * ⇒ 没跑过 `listModels` 的进程（冷启动、或该账号从未列过模型）走 chat 时，
+ * **所有模型都被当成同一个通道**（`solo_work_lite`）⇒ 凡不属于该通道的模型
+ * 一律回 `4001 param is invalid`，多模型路由直接失效，且**不会自愈**
+ * （只有某次 `/v1/models` 成功才把表填上）。
+ *
+ * ## 做法
+ * 1. 映射命中且不是 {@link UNKNOWN_CHANNEL} ⇒ 直接用；
+ * 2. 未知 ⇒ 先补一次 `listModels`（30 分钟缓存，成功后就不再是冷启动），
+ *    再读一次映射；
+ * 3. 仍未知（目录拉不到 / 模型不在目录里）⇒ 回退 `TRAE_FUNCTION`。
+ *
+ * ⚠️ 第 3 步是**最后兜底**，不是「默认值」：它仍然可能回 `4001`，但此时我们
+ * 确实没有任何依据选别的通道。`traeStreamErrorMessage` 对 4001 的提示
+ * （「通常是该模型不属于当前对话通道」）正是为这种情况准备的。
+ *
+ * ⚠️ 补齐失败**不能让对话失败**：目录只是补充信息（与 minimax 的 `lookupModel`
+ * 同一纪律），故这里吞掉异常并回退。
+ */
+async function resolveChannel(
+  credential: ProviderCredential,
+  model: string,
+  signal: AbortSignal,
+): Promise<string> {
+  const known = cachedModelChannels.get(model)
+  if (known !== undefined && known !== UNKNOWN_CHANNEL) return known
+
+  const now = Date.now()
+  if (now - channelBackfillAt >= CHANNEL_BACKFILL_INTERVAL_MS) {
+    channelBackfillAt = now
+    try {
+      await listModels(credential, signal)
+    } catch {
+      // 目录只是补充信息：拉不到（含 401/403）就回退默认通道。
+      // ⚠️ 这里刻意不把 401/403 透出去：chat 自己发出去时同样会 401，
+      // 那时网关的续期分支才会用正确的方式处置（带上真实的上游原文）。
+    }
+    const learned = cachedModelChannels.get(model)
+    if (learned !== undefined && learned !== UNKNOWN_CHANNEL) return learned
+  }
+  return TRAE_FUNCTION
+}
 
 /** 目录缓存（isolate 内存；Workers 没有持久磁盘）。 */
 let cachedModels: ProviderModel[] | undefined
@@ -1193,16 +1353,30 @@ async function listModels(credential: ProviderCredential, signal: AbortSignal): 
   return providerModels
 }
 
-/** 兜底模型目录。 */
+/**
+ * 兜底模型目录。
+ *
+ * ⚠️ 同时把兜底 id 记进 {@link cachedModelChannels}（值为 {@link UNKNOWN_CHANNEL}）。
+ * 原来这里**不填表**，于是「目录拉不到 ⇒ 用兜底表」之后，`chat()` 只能靠
+ * `?? TRAE_FUNCTION` 猜通道 —— 凡不属于该通道的模型全部回 `4001`（B5）。
+ * 记成「未知」而不是记成 `solo_work_lite`：这样才能区分「我们不知道」与
+ * 「上游说它就在这个通道」，`chat()` 据此做一次惰性补齐（{@link resolveChannel}）。
+ *
+ * ⚠️ 只在**没有已知值**时写入：万一先前已经从目录学到过真实通道，
+ * 一次目录抖动不该把它覆盖成「未知」。
+ */
 function fallbackModels(): ProviderModel[] {
-  return FALLBACK_MODELS.map((model) => ({
-    id: model.id,
-    name: model.name,
-    contextWindow: model.contextWindow,
-    maxOutput: 0,
-    supportsImage: false,
-    isFree: false,
-  }))
+  return FALLBACK_MODELS.map((model) => {
+    if (!cachedModelChannels.has(model.id)) cachedModelChannels.set(model.id, UNKNOWN_CHANNEL)
+    return {
+      id: model.id,
+      name: model.name,
+      contextWindow: model.contextWindow,
+      maxOutput: 0,
+      supportsImage: false,
+      isFree: false,
+    }
+  })
 }
 
 /** 解析出的远端模型条目。 */

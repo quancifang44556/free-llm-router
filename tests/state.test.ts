@@ -343,7 +343,9 @@ test('🔴 延迟记账：全池同样失败**不得**记熔断（否则上游�
   // ① 必须存在 blame 收件箱，且只收累加型维度
   // ⚠️ 2026-10-21 扩展：blame 原先只收 breaker/degrade。后来发现**单账号池的 soft
   // 也必须延迟**（否则唯一路径被掐断 60 秒，用户报「审查时被误判打断」）。
-  assert.match(src, /const blame: Array<\{ uid: string; kind: FailureKindForBlame; reason: string \}> = \[\]/,
+  // ⚠️ 不钉死类型字面量：S4 抽出了具名的 `BlameEntry`（补 `resetAt`）。
+  // 要守的是「存在 blame 收件箱且初始为空数组」，不是「类型必须写成内联形状」。
+  assert.match(src, /const blame: (?:Array<\{[^}]*FailureKindForBlame|BlameEntry\[\]) = \[\]/,
     'breaker/degrade（及单账号池下的 soft）必须走延迟记账')
 
   // ② 这两个维度不得直接 applyFailure
@@ -357,8 +359,8 @@ test('🔴 延迟记账：全池同样失败**不得**记熔断（否则上游�
   assert.match(src, /settleBlame\(pool, blame, Date\.now\(\)\)/,
     '首帧成功时必须结算 blame')
 
-  // ④ 全失败时必须丢弃并留日志
-  assert.match(src, /全池同样失败，丢弃/,
+  // ④ 全失败时必须丢弃并留日志（实现已抽成 discardBlame()，文案随之变化）
+  assert.match(src, /discardBlame\(blame, '全池同样失败'\)/,
     '全池失败时必须丢弃 blame 并打日志，不能静默记熔断')
 
   // ⑤ 有明确上游证据的维度**仍然立即记**（不能被误改成延迟）
@@ -595,7 +597,11 @@ test('🔴 两条 chat 路径都必须有延迟记账（本项目「只修一半
   const src = readFileSync('src/gateway/server.ts', 'utf8')
 
   // ① 必须有两条独立的 blame 数组（buddy 路径 + provider 路径各一条）
-  const blameDecls = [...src.matchAll(/const blame: Array<\{ uid: string; kind: FailureKindForBlame/g)]
+  // ⚠️ 匹配「有两条 blame 收件箱」即可，**不要**钉死类型字面量：
+  // S4 把元素类型抽成了具名的 `BlameEntry`（补 `resetAt`），
+  // 若这里仍匹配 `Array<{ uid: string; kind: FailureKindForBlame`，
+  // 一次纯粹的类型重构就会把这条测试打红 —— 它要守的是「两条路径各一个收件箱」。
+  const blameDecls = [...src.matchAll(/const blame: (?:Array<\{[^}]*FailureKindForBlame|BlameEntry\[\])/g)]
   assert.ok(
     blameDecls.length >= 2,
     `应有两个 blame 收件箱（buddy 路径 + provider 路径），实际 ${blameDecls.length} 个`,
@@ -647,7 +653,9 @@ test('🔴 两条 chat 路径都必须有延迟记账（本项目「只修一半
     `有 ${bindOrphans.length} 处 noteSuccess 之后缺少 bindSession（偏移：${bindOrphans.join(', ')}）`
       + ' —— 成功路径必须绑定会话，否则 prompt cache 永远不命中',
   )
-  const discardLogs = [...src.matchAll(/丢弃 \$\{blame\.length\} 条失败记录/g)]
+  // ⚠️ 丢弃日志已抽成 `discardBlame()`（S11），不再有两份手写的模板字符串。
+  // 这里数**调用点**：两条路径各一个循环尾，外加 4 个早退出口 ⇒ 至少 2 处。
+  const discardLogs = [...src.matchAll(/discardBlame\(blame,/g)]
   assert.ok(discardLogs.length >= 2, `两条路径都应有全失败丢弃日志，实际 ${discardLogs.length} 处`)
 
   // ④ 死代码守卫：applyFailure 的每一处调用，要么在 else 分支（立即记账），
@@ -721,4 +729,46 @@ test('🔴 面板资源不得 immutable 缓存（会让用户永远看到旧版�
   // ④ 必须支持条件请求回 304
   assert.match(idx, /if-none-match/, '必须处理 If-None-Match')
   assert.match(idx, /status: 304/, '内容未变时必须回 304')
+})
+
+test('🔴 normalizeAccountState 必须携带**每一个**字段（生成式，防「加字段忘了同步」）', async () => {
+  // ## 为什么这条必须是生成式的（2026-10-22，S13）
+  //
+  // `normalizeAccountState` 是**逐字段重建**对象 —— 不在它里面列出的字段，
+  // 归一后要么消失、要么拿到默认值。而账号状态是跨版本持久化的，
+  // 所以「给 `AccountState` 加字段却忘了加进 normalize」是一个**必然会发生**的错误，
+  // 而且症状很远：某个读路径上字段变 undefined，在别处才炸。
+  //
+  // 写死一份字段清单是没用的（新字段不会被列进去）。这里用
+  // `createAccountState()` 的产物当**基准**，与「最小输入归一后的产物」比字段集合 ——
+  // 将来谁加了字段忘了同步，这条立刻红。
+  const { createAccountState, normalizeAccountState } = await import('../src/pool/state.js')
+
+  const full = createAccountState({ uid: 'u1', nickname: 'n1', realm: 'cn', provider: 'buddy' })
+  const normalized = normalizeAccountState({ uid: 'u1' })
+  assert.ok(normalized !== undefined, '最小输入也应能归一（缺字段补默认值）')
+
+  const expectKeys = Object.keys(full).sort()
+  const actualKeys = Object.keys(normalized!).sort()
+  const missing = expectKeys.filter((k) => !actualKeys.includes(k))
+  const extra = actualKeys.filter((k) => !expectKeys.includes(k))
+  assert.deepEqual(missing, [], `⚠️ 这些字段没被 normalizeAccountState 携带（归一后会丢）：${missing.join(', ')}`)
+  assert.deepEqual(extra, [], `⚠️ normalizeAccountState 产出了 AccountState 里没有的字段：${extra.join(', ')}`)
+
+  // 归一后**不得有 undefined**：`undefined` 在布尔语境里 falsy、在算术里 NaN，
+  // 会在很远的地方引发难查的故障（这正是 normalize 存在的理由）。
+  const undef = Object.entries(normalized!).filter(([, v]) => v === undefined).map(([k]) => k)
+  assert.deepEqual(undef, [], `⚠️ 归一后仍是 undefined 的字段：${undef.join(', ')}`)
+
+  // 默认值口径必须与 createAccountState 一致（曾出现 workbuddy vs buddy 两套默认）
+  assert.equal(
+    (normalized as { provider?: string }).provider,
+    'buddy',
+    '⚠️ 缺失 provider 的默认值必须是 buddy（与 DEFAULT_PROVIDER 一致）',
+  )
+  assert.equal(
+    (full as { provider?: string }).provider,
+    'buddy',
+    '⚠️ createAccountState 的默认 provider 也必须与 normalize 一致',
+  )
 })

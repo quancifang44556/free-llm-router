@@ -11,8 +11,13 @@
  * | `until` / `coolKind` | 402 余额耗尽、429 限流、403 WAF | 「近期被限流/没钱」 | 到期、**面板「解冻」**、或**余额刷新确认余额 > 0**（仅 `hard`） |
  * | `modelCooldowns` | 429 `code=6004`、`11102` | 「仅对**某几个模型**不可用」 | 各模型自己的重置墙钟 |
  * | `breakerUntil` | 连续 5xx/网络失败 | 「这个号反复失败，先别打」 | 指数退避到期 |
- * | `degradeUntil` | 连续业务失败 | 「降权，别当首选」 | 固定时长到期 |
+ * | `degradeUntil` | 连续业务失败 | **完全不可用**（不是「降权但仍可发」） | 固定时长到期 |
 
+ *
+ * ⚠️ **`degradeUntil` 的语义是「不可用」，不是「降级但仍派单」**（2026-10-22 澄清）。
+ * `healthy()` 对它直接 `return false`。原表写「降权，别当首选」，
+ * 会让人以为降权号还能接活 —— 与实现相反。若将来真要「降权但可用」，
+ * 那是改 `healthy()` 的事，**不能只改这张表**。
  *
  * ⚠️ **`hard`（402 余额耗尽）的「余额恢复 ⇒ 自动解冻」曾长期只写在文档里**（2026-10-21 审查澄清）。
  * 本表原先写的是「到期，或余额恢复（仅 CoolHard）」，但全仓**从未实现**那条路径：
@@ -244,12 +249,22 @@ export function createAccountState(input: {
   uid: string
   nickname: string
   realm: string
-  /** 供应商 id。缺省 `workbuddy`（兼容升级前只可能是它）。 */
+  /**
+   * 供应商 id。
+   *
+   * ⚠️ 缺省必须是 **`buddy`**，与 `normalizeAccountState`、`DEFAULT_PROVIDER`
+   * 保持一致（2026-10-22 统一）。
+   *
+   * 原注释写「缺省 `workbuddy`（兼容升级前只可能是它）」，但那是**错的**：
+   * 读路径（`normalizeAccountState` / 选号 / 面板）对缺失字段一律按 `buddy` 解释，
+   * 于是「新建时缺省 workbuddy、老记录缺省 buddy」—— 同一份数据两种默认值。
+   * 结果是同一批账号按创建时间不同，被当成国内版/国际版两种东西。
+   */
   provider?: string
 }): AccountState {
   return {
     uid: input.uid,
-    provider: input.provider ?? 'workbuddy',
+    provider: input.provider ?? 'buddy',
     nickname: input.nickname,
     realm: input.realm,
     disabled: false,

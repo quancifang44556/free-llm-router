@@ -806,13 +806,88 @@ async function chat(credential: ProviderCredential, request: ChatRequest): Promi
   // ⚠️ 参考实现会在这里挂 undici 的 per-request `dispatcher`（`proxy`）。
   // Workers **没有 undici 的 Dispatcher**，`fetch` 也没有任何 per-request
   // 代理开关 ⇒ 这条能力整体丢弃。后果见文件头「必须丢掉的一件事」。
-  const res = await fetch(`${OPENCODE.baseUrl}${OPENCODE.chatPath}`, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(payload),
-    signal: request.signal,
-  })
-  return res
+  //
+  // ⚠️ 必须走 {@link withFirstFrameTimeout}：**不能**把 `request.signal` 直接交给
+  // `fetch`（那个信号只在客户端断开时触发 ⇒ 上游不响应时请求无限挂起）。
+  return withFirstFrameTimeout('OpenCode', request.signal, (signal) =>
+    fetch(`${OPENCODE.baseUrl}${OPENCODE.chatPath}`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(payload),
+      signal,
+    }),
+  )
+}
+
+/**
+ * 「发出请求 → 收到响应头」的预算（毫秒）。超时即中止，交给网关换号。
+ *
+ * 与 `buddy.ts` 的同名常量、`qoder.ts` 的 `INFER_TIMEOUT_MS` 同一口径。
+ */
+const FIRST_FRAME_TIMEOUT_MS = 120_000
+
+/**
+ * 在「首帧超时」守卫下发起请求，返回上游响应。
+ *
+ * ## 为什么需要它（缺陷）
+ *
+ * 原先 `chat()` 把 `request.signal` **直接**交给 `fetch`，而那个信号只在
+ * **客户端断开**时触发 ⇒ 上游「接了连接但永不回响应头」（黑洞 / 半开连接 /
+ * 网关侧卡死）时，这条请求会**一直挂着**：用户看到「一直转圈」，而网关这边
+ * 既不换号也不报错。`buddy.chat` 早已用 `AbortController + setTimeout` 修过
+ * 同一形态，本家（以及 cline / minimax / trae）漏了。
+ *
+ * ## 为什么计时器必须「拿到响应头就撤掉」
+ *
+ * ⚠️ **不能**改成把 `AbortSignal.timeout()` 直接挂在 `fetch` 上：那个信号
+ * **同样管着响应体**，会把超过阈值的**长回答拦腰截断**（`qoder.ts:1305` 有
+ * 本地实测记录）。故这里用 `AbortController` + `setTimeout`，且在
+ * `finally` 里 `clearTimeout` —— 只覆盖「到响应头」这一段。
+ *
+ * ## 为什么超时抛**普通 `Error`** 而不是 `ProviderError`
+ *
+ * 本家的 `chat()` **从不抛 `ProviderError`**（非 2xx 原样 `return`，由网关的
+ * `!upstream.ok` 分支分类）。超时若包成 `ProviderError`，网关会先问
+ * `provider.shouldRotate(0, …)` —— 本家的 `classifyOpencodeError(0, …)` 归
+ * `transport`，而 `shouldRotateForKind('transport')` 是 **false** ⇒ 判成
+ * 「不换号」，可恢复的超时变成终态失败。
+ * 抛普通 `Error` 则走网关的**传输层失败**分支：**换号**且**不惩罚账号**，
+ * 正是这里要的语义（上游不响应不是某个账号的错）。
+ *
+ * ## 客户端取消
+ *
+ * 客户端信号仍然**穿透**到上游（组合信号），且成功路径**保留**监听 ——
+ * 用户点停止时上游流照样被掐断。
+ */
+function withFirstFrameTimeout(
+  label: string,
+  clientSignal: AbortSignal,
+  send: (signal: AbortSignal) => Promise<Response>,
+): Promise<Response> {
+  const controller = new AbortController()
+  const onClientAbort = (): void => controller.abort(clientSignal.reason)
+  if (clientSignal.aborted) controller.abort(clientSignal.reason)
+  else clientSignal.addEventListener('abort', onClientAbort, { once: true })
+  const timer = setTimeout(() => {
+    const timeout = new Error(
+      `${label} 首帧超时：${Math.round(FIRST_FRAME_TIMEOUT_MS / 1000)} 秒内没有收到响应头`
+      + '（上游不响应或连接半开，已中止本次请求）。',
+    )
+    timeout.name = 'TimeoutError'
+    controller.abort(timeout)
+  }, FIRST_FRAME_TIMEOUT_MS)
+  let gotResponse = false
+  return send(controller.signal)
+    .then((response) => {
+      gotResponse = true
+      return response
+    })
+    .finally(() => {
+      // 计时器只管到「拿到响应头」；拿到就撤，否则会掐断正在进行的流。
+      clearTimeout(timer)
+      // 失败路径摘掉客户端监听；成功路径保留（客户端中途取消仍要能掐断上游）。
+      if (!gotResponse) clientSignal.removeEventListener('abort', onClientAbort)
+    })
 }
 
 export const opencodeProvider: Provider = {

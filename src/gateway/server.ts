@@ -183,21 +183,84 @@ export function modelCauseFor(kind: ErrorKind): 'busy' | 'absent' | 'denied' | u
 /** blame 收件箱的元素类型（延迟记账用）。 */
 type FailureKindForBlame = 'breaker' | 'degrade' | 'soft'
 
-async function settleBlame(
+/**
+ * blame 收件箱里的一条**待结算**失败。
+ *
+ * ## ⚠️ 为什么必须带 `resetAt`（2026-10-22 审查，S4）
+ *
+ * 同一次上游失败，走「立即结算」时会把上游给的重置墙钟一起交给池
+ *（`!upstream.ok` 与首帧预检两条路径都传了 `resetAt`），而走「延迟结算」时
+ * 元素类型里原来**只有 `uid/kind/reason`** ⇒ 上游墙钟在**进收件箱的那一刻**就被丢掉了。
+ *
+ * 后果是**同一个错误、两套口径**：
+ * - 立即结算 ⇒ 冷却对齐上游墙钟（`reset at … UTC+8` / `Retry-After`）；
+ * - 延迟结算 ⇒ 只能走我们自己猜的指数退避（猜早了继续撞限流，猜晚了白白少用几小时）。
+ *
+ * ⚠️ 说清楚边界：当前真正消费 `resetAt` 的只有 `soft` 与 `model` 两个维度 ——
+ * `AccountPoolDO.applyFailure` 里 `breaker` / `degrade` 是**计数型**（数到 3 次/5 次
+ * 才落一个固定窗口），**根本不读** `resetAt`。故这里补的是「口径统一、不再丢信息」，
+ * **不改变** `breaker` / `degrade` 的冷却时长。
+ */
+export type BlameEntry = {
+  uid: string
+  kind: FailureKindForBlame
+  reason: string
+  /** 上游给出的重置时刻（epoch ms）。来自文案 `reset at … UTC+8` 或 `Retry-After`。 */
+  resetAt?: number
+}
+
+export async function settleBlame(
   pool: DurableObjectStub<AccountPoolDO>,
-  blame: Array<{ uid: string; kind: FailureKindForBlame; reason: string }>,
+  blame: BlameEntry[],
   now: number,
 ): Promise<void> {
   if (blame.length === 0) return
   await Promise.all(
     blame.map((b) =>
-      pool.applyFailure({ uid: b.uid, kind: b.kind, now, reason: b.reason }).catch((error: unknown) => {
-        console.warn(
-          `[blame] 结算失败 uid=${b.uid} kind=${b.kind}: ` +
-            (error instanceof Error ? error.message : String(error)),
-        )
-      }),
+      pool
+        .applyFailure({
+          uid: b.uid,
+          kind: b.kind,
+          now,
+          reason: b.reason,
+          // ⚠️ 与「立即结算」那两条路径同一口径：上游给了墙钟就带过去，
+          // 不再因为「延迟」而把它吃掉（见 `BlameEntry` 的说明）。
+          ...(b.resetAt !== undefined ? { resetAt: b.resetAt } : {}),
+        })
+        .catch((error: unknown) => {
+          console.warn(
+            `[blame] 结算失败 uid=${b.uid} kind=${b.kind}: ` +
+              (error instanceof Error ? error.message : String(error)),
+          )
+        }),
     ),
+  )
+}
+
+/**
+ * 丢弃 blame：**不记账**，但必须留一条日志。
+ *
+ * ## 缺陷（2026-10-22 审查，S11）
+ *
+ * `blame` 的语义是「先把失败挂起、等换号成功后结算」，因此它只有两个出口：
+ * **结算**（{@link settleBlame}）与**丢弃**。丢弃本身是**正确**的
+ *（全池同样失败时更可能是上游整体故障 / 本机断网，逐个记账会造成连锁熔断，
+ * 见 `settleBlame` 的说明），缺的只是**可观测性**。
+ *
+ * 而「丢弃」的日志此前只写在**两处循环尾**。两个处理函数里另有 4 个
+ * **早退出口**（只用指定账号却不可用 / 跨渠道容灾 / 没有可用账号 ×2）直接
+ * `return`，`blame` 里的失败**既不结算也不打日志** ⇒ 账号该被罚却没罚，
+ * 事后又一点痕迹都没有。而「全池都失败」最常见的形态（所有号都在冷却 /
+ * 都被本次请求试过）恰好走的是**没有日志**的那条早退路径。
+ *
+ * ⚠️ 这里**一次 `applyFailure` 都不调**：丢弃就是丢弃。故签名里没有 `pool` ——
+ * 带上它会让读者以为这个函数会记账（本仓库最忌的「假承诺」）。
+ */
+export function discardBlame(blame: BlameEntry[], reason: string): void {
+  if (blame.length === 0) return
+  console.warn(
+    `[blame] ${reason}，丢弃 ${blame.length} 条失败记录（不记熔断）: ` +
+      blame.map((b) => `${b.uid.slice(0, 8)}/${b.kind}`).join(','),
   )
 }
 
@@ -1109,7 +1172,7 @@ export async function handleChatCompletions(
   // 因此只对「会累加失败计数」的维度（breaker / degrade）延迟记账；
   // restricted（上游明确标记）、model（模型级）、soft（限流）等**仍然立即记** ——
   // 它们都有明确的上游证据，不是「靠换号成功才反推」的推测。
-  const blame: Array<{ uid: string; kind: FailureKindForBlame; reason: string }> = []
+  const blame: BlameEntry[] = []
 
   /**
    * ⚠️ **单账号池的 soft 冷却必须延迟**（2026-10-21 实测踩到）。
@@ -1153,6 +1216,9 @@ export async function handleChatCompletions(
     )
     // ── 只用指定账号但它不可用：直接报它的原因（不换号、不跨渠道容灾）──
     if (candidate !== undefined && 'pinBlocked' in candidate) {
+      // ⚠️ **早退出口也要丢弃 blame**（S11）：指定账号在本次请求里已经失败过
+      //（`lastError` 有值即证明），那些失败挂在这里既不结算也不打日志。
+      discardBlame(blame, '只用指定账号且它已不可用（早退，不换号）')
       return {
         response: jsonError(
           lastError?.status ?? 503,
@@ -1176,6 +1242,10 @@ export async function handleChatCompletions(
           )
           if (hasIntlUsable) {
             console.log(`[failover] 国内版 ${DEFAULT_PROVIDER} 全部不可用或已限流，自动无缝跨渠道容灾至国际版 workbuddy (模型: ${model})`)
+            // ⚠️ 容灾是**早退出口**（S11）：`handleProviderChat` 有它**自己的**空
+            // `blame` 收件箱，本路径挂起的失败不会跟着过去 ⇒ 必须在这里显式丢弃，
+            // 否则它们静默消失（既不结算也不打日志）。
+            discardBlame(blame, '已跨渠道容灾至国际版（blame 不移交）')
             return await handleProviderChat({
               providerId: 'workbuddy',
               model,
@@ -1204,6 +1274,17 @@ export async function handleChatCompletions(
         errorKind: lastError?.kind ?? 'no_available_account',
         startedAt: requestStartedAt,
       })
+      // ⚠️ **下面两条 return 都是早退出口**（S11），一起在这里丢弃 blame。
+      //
+      // 放在 `if` **之前**而不是各分支里：只有一条会执行（if/else），
+      // 两处各调一次会重复打日志。而第一条（`lastError !== undefined`）
+      // 正是「有 blame 却静默丢弃」的典型场景 —— 全池都失败、账号全在冷却时
+      // 走的就是它，此前一条日志都没有。
+      //
+      // ⚠️ 第二条（`lastError === undefined`）此时 blame **必然为空**
+      //（没有失败就没有 `lastError`，而 `blame.push` 与 `lastError` 赋值同块发生），
+      // 故它不会产生日志；保留同一次调用只是为了不让「出口 → 丢弃」这条规则出现例外。
+      discardBlame(blame, '没有可用账号（所有候选都已尝试或全在冷却/禁用）')
       // 没有可用账号了：若之前有过失败，报最后一次的真实原因（更有信息量）
       if (lastError !== undefined) {
         return {
@@ -1348,8 +1429,16 @@ export async function handleChatCompletions(
         // 累加失败的维度延迟到「换号成功」时再记（见 blame 的注释）。
         // ⚠️ `soft` 在**单账号池**下也要延迟：池里只有一个号时，立即冷却
         // 等于立即掐断唯一路径 60 秒，而冷却换不来任何好处（见 deferSoft）。
+        //
+        // ⚠️ 延迟记账**也必须带上 `resetAt`**：下面「立即结算」那条分支传了它，
+        // 若这里不传，同一个 429 只因走了延迟就丢掉上游墙钟（见 `BlameEntry`）。
         if (punishKind === 'breaker' || punishKind === 'degrade' || (punishKind === 'soft' && deferSoft())) {
-          blame.push({ uid: candidate.uid, kind: punishKind, reason: `${kind}: ${msg}`.slice(0, 200) })
+          blame.push({
+            uid: candidate.uid,
+            kind: punishKind,
+            reason: `${kind}: ${msg}`.slice(0, 200),
+            ...(resetAt !== undefined ? { resetAt } : {}),
+          })
         } else {
         await pool
           .applyFailure({
@@ -1434,8 +1523,14 @@ export async function handleChatCompletions(
           kind === 'rate_limited' ? dimension : mapped.dimension === 'model' ? 'model' : mapped.dimension
         // ⚠️ 与 buddy 路径同一套纪律：累加型维度 + 单账号池的 soft 都延迟记账，
         // 只有「换号后成功」才落账；全失败则丢弃（见上方 blame 的说明）。
+        // ⚠️ `resetAt` 同样要带进收件箱（见 `BlameEntry`）：下面立即结算那条传了它。
         if (punishKind === 'breaker' || punishKind === 'degrade' || (punishKind === 'soft' && deferSoft())) {
-          blame.push({ uid: candidate.uid, kind: punishKind, reason: `${kind}: ${msg}`.slice(0, 200) })
+          blame.push({
+            uid: candidate.uid,
+            kind: punishKind,
+            reason: `${kind}: ${msg}`.slice(0, 200),
+            ...(resetAt !== undefined ? { resetAt } : {}),
+          })
         } else {
           await pool
             .applyFailure({
@@ -1647,12 +1742,10 @@ export async function handleChatCompletions(
   // 就不能断定是那几个号坏了（更可能是上游整体故障 / 本机断网）。
   // 记账会累加 `fails`，3 次后全池熔断 30 分钟且期间无成功请求复位 ——
   // 那会把一次上游抖动放大成半小时不可用。留日志便于事后判断。
-  if (blame.length > 0) {
-    console.warn(
-      `[blame] 全池同样失败，丢弃 ${blame.length} 条失败记录（不记熔断）: ` +
-        blame.map((b) => `${b.uid.slice(0, 8)}/${b.kind}`).join(','),
-    )
-  }
+  //
+  // ⚠️ 丢弃逻辑统一走 `discardBlame`（S11）：函数里还有 4 个早退出口也要丢弃，
+  // 若各写一份，日志格式与「是否留痕」就会再次分叉。
+  discardBlame(blame, '全池同样失败')
   return {
     response: jsonError(
       lastError?.status ?? 502,
@@ -2174,8 +2267,15 @@ export async function handleProviderChat(input: {
    * ⚠️ 这是本项目第三次「同一个 bug 只修一半」
    *（前两次：`developer→system` 归一化、SSE `data:` 前缀解析）。
    * ⇒ 以后修任何记账/归一化逻辑，**必须 grep 出所有 `applyFailure` 调用点**再动手。
+   *
+   * ⚠️ 本函数的出口共 4 类，**每一类都必须对 blame 表态**（S11）：
+   * - 循环内的成功返回（3 处）⇒ `settleBlame`（见各自的 `onFirstChunk`）；
+   * - 循环尾（全失败）⇒ `discardBlame`；
+   * - 跨渠道容灾（`return await handleChatCompletions(...)`）⇒ `discardBlame`；
+   * - 进循环**之前**的两道闸门（`wafGateActive` / `restrictionGateActive`）⇒
+   *   此时 `blame` **必然为空**（本行以下到循环之间没有任何 `blame.push`），无需调用。
    */
-  const blame: Array<{ uid: string; kind: FailureKindForBlame; reason: string }> = []
+  const blame: BlameEntry[] = []
   let poolSize = 0
   try {
     /**
@@ -2553,7 +2653,16 @@ export async function handleProviderChat(input: {
                 : pm.dimension
           const pResetAt = pRefined.resetAt
           if (pPunishKind === 'breaker' || pPunishKind === 'degrade' || (pPunishKind === 'soft' && deferSoft())) {
-            blame.push({ uid: picked.uid, kind: pPunishKind, reason: `${c.kind}: ${detail}`.slice(0, 200) })
+            // ⚠️ `resetAt` 也必须带进收件箱（S4）：下面立即结算那条分支传了
+            // `pResetAt`，若这里不传，同一个错误只因走了延迟就丢掉上游墙钟。
+            // ⚠️ 本路径拿不到 `Retry-After` 头（上游是**抛异常**，没有 `Response`），
+            // 故只有文案里解析出的 `pResetAt` —— 与立即结算分支的可用信息同源。
+            blame.push({
+              uid: picked.uid,
+              kind: pPunishKind,
+              reason: `${c.kind}: ${detail}`.slice(0, 200),
+              ...(pResetAt !== undefined ? { resetAt: pResetAt } : {}),
+            })
           } else {
             await pool
               .applyFailure({
@@ -3136,6 +3245,11 @@ export async function handleProviderChat(input: {
           signal: request.signal,
           body: JSON.stringify(fallbackBody),
         })
+        // ⚠️ 容灾是**早退出口**（S11）：`handleChatCompletions` 有它**自己的**空
+        // `blame` 收件箱，本路径挂起的失败不会跟着过去 ⇒ 必须在这里显式丢弃。
+        // 否则它们静默消失：既不在国际版结算、也不打日志、更不会走到下面那段
+        // 循环尾的「丢弃」日志（那段在 `return` 之后，永远执行不到）。
+        discardBlame(blame, '已跨渠道容灾至国内版（blame 不移交）')
         return await handleChatCompletions(fallbackRequest, env, 'cn', ctx, 1)
       }
     } catch (failoverError) {
@@ -3147,12 +3261,10 @@ export async function handleProviderChat(input: {
   // 没有「换号后成功」这个证据，就不能断定是那几个号坏了。
   // 不丢弃的话这些记录会留在数组里既不算也不清 —— 虽然随函数返回被回收，
   // 但**日志缺失**会让排障时误以为「没有失败过」。
-  if (blame.length > 0) {
-    console.warn(
-      `[blame] provider 路径全池同样失败，丢弃 ${blame.length} 条失败记录（不记熔断）: ` +
-        blame.map((b) => `${b.uid.slice(0, 8)}/${b.kind}`).join(','),
-    )
-  }
+  //
+  // ⚠️ 与 buddy 路径同一份实现（`discardBlame`，S11）：那边的 4 个早退出口
+  // 也要丢弃，各写一份会让「是否留痕」再次分叉。
+  discardBlame(blame, 'provider 路径全池同样失败')
   // 🔴 请求级失败用量（emit 一次，不按尝试次数重复记）。
   recordRequestFailure(pool, {
     uid: tried[tried.length - 1] ?? '',

@@ -936,16 +936,20 @@ async function chat(credential: ProviderCredential, request: ChatRequest): Promi
   const token = accessTokenOf(credential)
   const body: Record<string, unknown> = { ...request.body, model: request.model, stream: true }
 
-  const res = await fetch(`${API_BASE}${CHAT_PATH}`, {
-    method: 'POST',
-    headers: clineHeaders(token, {
-      'Content-Type': 'application/json',
-      // Cline 只支持 SSE（与官方客户端一致）。
-      Accept: 'text/event-stream',
+  // ⚠️ 必须走 {@link withFirstFrameTimeout}：**不能**把 `request.signal` 直接交给
+  // `fetch`（那个信号只在客户端断开时触发 ⇒ 上游不响应时请求无限挂起）。
+  const res = await withFirstFrameTimeout('Cline', request.signal, (signal) =>
+    fetch(`${API_BASE}${CHAT_PATH}`, {
+      method: 'POST',
+      headers: clineHeaders(token, {
+        'Content-Type': 'application/json',
+        // Cline 只支持 SSE（与官方客户端一致）。
+        Accept: 'text/event-stream',
+      }),
+      body: JSON.stringify(body),
+      signal,
     }),
-    body: JSON.stringify(body),
-    signal: request.signal,
-  })
+  )
 
   if (!res.ok) {
     const text = await res.text().catch(() => '')
@@ -959,23 +963,132 @@ async function chat(credential: ProviderCredential, request: ChatRequest): Promi
   return res
 }
 
-/** 提取上游错误文案（Cline 的失败体是 `{error:"…", success:false}`，不是 OpenAI 的嵌套 error）。 */
+/**
+ * 「发出请求 → 收到响应头」的预算（毫秒）。超时即中止，交给网关换号。
+ *
+ * 与 `buddy.ts` 的同名常量、`qoder.ts` 的 `INFER_TIMEOUT_MS` 同一口径。
+ */
+const FIRST_FRAME_TIMEOUT_MS = 120_000
+
+/**
+ * 在「首帧超时」守卫下发起请求，返回上游响应。
+ *
+ * ## 为什么需要它（缺陷）
+ *
+ * 原先 `chat()` 把 `request.signal` **直接**交给 `fetch`，而那个信号只在
+ * **客户端断开**时触发 ⇒ 上游「接了连接但永不回响应头」（黑洞 / 半开连接 /
+ * 网关侧卡死）时，这条请求会**一直挂着**：用户看到「一直转圈」，而网关这边
+ * 既不换号也不报错。`buddy.chat` 早已用 `AbortController + setTimeout` 修过
+ * 同一形态，本家（以及 minimax / trae / opencode）漏了。
+ *
+ * ## 为什么计时器必须「拿到响应头就撤掉」
+ *
+ * ⚠️ **不能**改成把 `AbortSignal.timeout()` 直接挂在 `fetch` 上：那个信号
+ * **同样管着响应体**，会把超过阈值的**长回答拦腰截断**（`qoder.ts:1305` 有
+ * 本地实测记录）。故这里用 `AbortController` + `setTimeout`，且在
+ * `finally` 里 `clearTimeout` —— 只覆盖「到响应头」这一段。
+ *
+ * ## 为什么超时抛**普通 `Error`** 而不是 `ProviderError`
+ *
+ * 网关对「非 `ProviderError`」走**传输层失败**分支（`server.ts` 的
+ * `lastError = {status: 502, message}` + `continue`）⇒ **换号**且**不惩罚账号**，
+ * 正是这里要的语义（上游不响应不是某个账号的错）。
+ * 若包成 `ProviderError`，网关会先问 `provider.shouldRotate(0, …)`，而本家的
+ * 判据只认 4xx ⇒ 判成「不换号」，反而把可恢复的超时变成终态失败。
+ *
+ * ## 客户端取消
+ *
+ * 客户端信号仍然**穿透**到上游（组合信号），且成功路径**保留**监听 ——
+ * 用户点停止时上游流照样被掐断。
+ */
+function withFirstFrameTimeout(
+  label: string,
+  clientSignal: AbortSignal,
+  send: (signal: AbortSignal) => Promise<Response>,
+): Promise<Response> {
+  const controller = new AbortController()
+  const onClientAbort = (): void => controller.abort(clientSignal.reason)
+  if (clientSignal.aborted) controller.abort(clientSignal.reason)
+  else clientSignal.addEventListener('abort', onClientAbort, { once: true })
+  const timer = setTimeout(() => {
+    const timeout = new Error(
+      `${label} 首帧超时：${Math.round(FIRST_FRAME_TIMEOUT_MS / 1000)} 秒内没有收到响应头`
+      + '（上游不响应或连接半开，已中止本次请求）。',
+    )
+    timeout.name = 'TimeoutError'
+    controller.abort(timeout)
+  }, FIRST_FRAME_TIMEOUT_MS)
+  let gotResponse = false
+  return send(controller.signal)
+    .then((response) => {
+      gotResponse = true
+      return response
+    })
+    .finally(() => {
+      // 计时器只管到「拿到响应头」；拿到就撤，否则会掐断正在进行的流。
+      clearTimeout(timer)
+      // 失败路径摘掉客户端监听；成功路径保留（客户端中途取消仍要能掐断上游）。
+      if (!gotResponse) clientSignal.removeEventListener('abort', onClientAbort)
+    })
+}
+
+/** 上游错误体在 `ProviderError.message` 里的**原文留证**上限（字符）。 */
+const RAW_BODY_LIMIT = 400
+
+/**
+ * 提取上游错误文案，**并保留原始响应体片段**。
+ *
+ * ## 🔴 为什么必须留原文（缺陷，B4）
+ *
+ * 原实现只从 `error` / `message` / `msg` / `detail` 里取**字符串**，于是上游
+ * 信封里的 `{"code":11134,…}` 这种结构在进入 `ProviderError.message` 前就被拆掉了。
+ * 而网关正是拿**整条 message** 去 `classify()` / `refineModelScoped()` 的
+ * （`server.ts` 的 ProviderError 分支），后者靠 `parseBusinessCode()` 找
+ * `"code": 数字` 形态。
+ *
+ * ⇒ 后果：业务码丢失后，这些家的错误在网关侧只能退化成**通用分类**
+ * （例如模型级限流 11134 被当成账号级 `soft`）—— 于是「只该冷却这个模型」
+ * 变成「锁住整个账号」。
+ *
+ * ## 做法
+ *
+ * 可读文案照旧放最前面（不改变既有文案），原文以 `（上游原文：…）` 追加；
+ * 原文单行化并截到 {@link RAW_BODY_LIMIT} 字符 —— 真实业务信封通常只有几十字符，
+ * 400 足够装下 `code` + `msg`；被截断的只会是 HTML/WAF 页那类本来就没有业务码的响应。
+ *
+ * ⚠️ 诚实边界：只有上游把码写成 `"code": 数字` 时 `parseBusinessCode` 才命中。
+ * 若上游把码只写在自然语言里（MiniMax 的 `…(2013)` 就是这种），网关侧判据仍需
+ * 放宽 —— 那在 `src/gateway/server.ts`，不在本文件。
+ */
 function detailOf(text: string): string {
   const trimmed = text.trim()
   if (trimmed === '') return '(空响应体)'
+  const raw = rawSnippet(trimmed)
   try {
     const record = asRecord(JSON.parse(trimmed))
     if (record !== undefined) {
       const text_ = readString(record, ['error', 'message', 'msg', 'detail', 'error_description'])
-      if (text_ !== undefined) return text_
+      if (text_ !== undefined) return withRawBody(text_, raw)
       const nested = asRecord(record.error)
       const nestedMessage = nested === undefined ? undefined : readString(nested, ['message'])
-      if (nestedMessage !== undefined) return nestedMessage
+      if (nestedMessage !== undefined) return withRawBody(nestedMessage, raw)
     }
   } catch {
     // 不是 JSON（可能是 HTML 错误页）—— 直接用原文片段。
   }
-  return trimmed.slice(0, 300)
+  return raw
+}
+
+/** 把原文压成单行并截到 {@link RAW_BODY_LIMIT} 字符（避免多行 HTML 塞满日志与面板）。 */
+function rawSnippet(text: string): string {
+  const oneLine = text.replace(/\s+/g, ' ')
+  return oneLine.length <= RAW_BODY_LIMIT ? oneLine : `${oneLine.slice(0, RAW_BODY_LIMIT)}…`
+}
+
+/** 已有可读文案时，把原文**追加**在后面（两者逐字相同时不重复一遍）。 */
+function withRawBody(detail: string, raw: string): string {
+  if (detail === raw) return raw
+  return `${detail}（上游原文：${raw}）`
 }
 
 /**
