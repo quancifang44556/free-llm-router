@@ -78,7 +78,9 @@ async function readState(pool: any, uid: string, now: number): Promise<any> {
 
 /** 读**原始**（未归一）的落盘 JSON —— 用来判定「默认值有没有真的写进库」。 */
 function readRaw(pool: any, uid: string): string | undefined {
-  return readAccount(pool.ctx.storage.sql, uid)
+  // ⚠️ 必须带 realm（2026-10-22）：accounts 主键改成了 (uid, realm)，
+  // 因为两个 realm 共用同一个 router.db，旧主键会互相覆盖。
+  return readAccount(pool.ctx.storage.sql, uid, REALM)
 }
 
 /** 造一个「因 402 余额耗尽被锁到次日 04:00」的账号。 */

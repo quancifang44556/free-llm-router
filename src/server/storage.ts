@@ -250,6 +250,22 @@ export function createNodeDurableObjectState(options: NodeDurableObjectStateOpti
 
   return {
     storage,
+    /**
+     * 与 Cloudflare 真实语义一致：`ctx.id.name` 是 `idFromName()` 传入的名字。
+     *
+     * ## 为什么必须补上（2026-10-22）
+     *
+     * `AccountPoolDO` 需要知道自己服务的是哪个 realm（cn / global），
+     * 才能把账号读写限定在本分片内 —— 因为**所有 realm 共用一张 `accounts` 表**，
+     * 只按 uid 查会跨 realm 串味（探针实测：cn 的账号被 global 的同 uid 覆盖）。
+     *
+     * 真实 Cloudflare 环境本来就有 `ctx.id.name`，只有本 Node 适配层漏了 ——
+     * 补上它，业务代码就能用**平台原生语义**而不是自己维护一份我是谁的映射。
+     */
+    id: {
+      name: instanceId.includes(':') ? instanceId.slice(instanceId.indexOf(':') + 1) : instanceId,
+      toString: () => instanceId,
+    },
     async blockConcurrencyWhile<T>(fn: () => Promise<T>): Promise<T> {
       return await fn()
     },

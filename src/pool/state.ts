@@ -239,7 +239,46 @@ export interface AccountState {
    * ⚠️ 旧数据没有这个字段（升级前的记录）⇒ `normalizeAccountState` 补 `[]`，**不清号、不报错**。
    */
   samples: BalanceSample[]
+  /**
+   * **本账号**对「防封」配置的覆盖（缺省 = 沿用全局）。
+   *
+   * ## 为什么必须能按账号配（用户 2026-10-22 要求）
+   *
+   * 用户原话：「我希望这个功能放到账号那里，因为我目前只是不想给 qd 限制，
+   * 防封开关也是，我希望我可以每个账号不同设置」。
+   *
+   * 这句话点出了全局开关的根本问题：**不同上游的风控模型完全不同**。
+   * - `workbuddy` 是我们在冒充桌面客户端，需要伪装（节奏、b3 三件套）；
+   * - `qodercn` 用的是它自己的官方凭据，实测 20 并发零损伤 ——
+   *   给它加延迟、给它锁模型，纯粹是自己限制自己。
+   *
+   * 一个全局开关只能让两种诉求互相迁就：关掉则 workbuddy 失去保护，
+   * 开着则 qodercn 被无谓限制。**配置的粒度必须与被约束对象对齐。**
+   *
+   * ## 语义：逐字段覆盖，`undefined` = 沿用全局
+   *
+   * 只存用户真正改过的字段。这让「全局改了默认值」仍能作用到
+   * 没有单独设置过的账号上 —— 若整体存一份完整配置，全局后续调整
+   * 就再也影响不到老账号（`setSafetyConfig` 上已踩过这个坑）。
+   */
+  safetyOverride?: SafetyOverride
 }
+
+/**
+ * 单个账号对防封配置的**局部覆盖**（`undefined` 字段 = 用全局值）。
+ *
+ * ⚠️ 字段名必须与 `SafetyConfig` **同名同义**。这里刻意用 `Partial`，
+ * 而不是另立一套结构 —— 两套结构必然分叉（本项目最反复的缺陷类型）。
+ */
+export type SafetyOverride = Partial<{
+  sessionTrace: boolean
+  modelCooldownEnabled: boolean
+  maxContextMessages: number
+  burnRateWindowMs: number
+  burnRateThresholdPct: number
+  rateLimitQps: number
+  rateJitterMs: number
+}>
 
 /** 连续 12153 达此值才禁用（Go 侧 `entry.go:516`）。 */
 export const SESSION_DEAD_THRESHOLD = 3
@@ -292,6 +331,10 @@ export function createAccountState(input: {
     creditsExpiring: 0,
     creditsEarliestExpiry: 0,
     samples: [],
+    // ⚠️ 刻意**不**初始化 `safetyOverride: {}`：
+    // `undefined` 与「空对象」在语义上都表示「沿用全局」，但只有 `undefined`
+    // 不会让 `normalizeAccountState` 把「没设置过」和「设置过又清空」区别对待。
+    // 少一个字段就少一处需要解释的状态。
   }
 }
 
@@ -385,6 +428,24 @@ export function normalizeAccountState(raw: unknown): AccountState | undefined {
     // ⚠️ 旧数据（升级前）没有该字段 ⇒ `[]`。补空是**必须**的：`undefined` 会让
     // `appendBalanceSample` 的展开抛 `TypeError`（整个余额刷新路径 500）。
     samples: normalizeSamples(o.samples),
+    /**
+     * ⚠️ **新增字段必须在这里显式列出**（2026-10-22 我自己又踩了一次）。
+     *
+     * 本函数是**逐字段重建**，没列出的字段不会被保留。我加 `safetyOverride`
+     * 时只改了接口与 `setAccountSafety`，忘了这里 ⇒ 写进去的覆盖**读出来就没了**，
+     * 表现为「面板保存成功、但行为毫无变化」。四条测试同时抓到。
+     *
+     * 这种「加字段忘了同步归一化」在本文件已记录过一次（`restrictedUntil`，
+     * 后果是 11140 罚了看不出罚）。故这里用 `obj()` 而非直接透传：
+     * 非法形态（数组 / 字符串 / null）一律当「没设置过」，不让脏数据流进判定。
+     *
+     * ⚠️ 注意**不能**把 `{}` 补成默认值：`undefined` 与 `{}` 在合并语义上等价，
+     * 但前者才表示「从没设置过」。补成 `{}` 会让「删除全部覆盖」这个操作
+     * 无法与「没设置过」区分。
+     */
+    ...(o.safetyOverride !== null && typeof o.safetyOverride === 'object' && !Array.isArray(o.safetyOverride)
+      ? { safetyOverride: o.safetyOverride as SafetyOverride }
+      : {}),
   }
 }
 

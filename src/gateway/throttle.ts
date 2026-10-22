@@ -109,9 +109,25 @@ export async function throttleUpstream(
    * 一条本来正常的链路。
    */
   providerId?: string,
+  /**
+   * 该账号**实际生效**的限速参数（已合并全局与账号级覆盖）。
+   *
+   * ## 为什么从「模块级全局」改成「调用方传入」（2026-10-22）
+   *
+   * 原来是 `configureThrottle()` 写模块级变量，于是**全进程只有一份参数** ——
+   * 无法让 `qodercn` 不限速、`workbuddy` 限速。用户要求按账号配置后，
+   * 全局变量在结构上就不可能满足需求。
+   *
+   * ⚠️ 不传时回落模块级全局值（保持既有行为与测试兼容）：
+   * 这样旧调用点即使没改也仍然可用，不会因为漏传就静默变成「不限速」——
+   * 失败方向选「保持原样」而不是「意外放开」。
+   */
+  params?: { qps: number; jitterMs: number },
 ): Promise<void> {
   if (providerId !== 'workbuddy') return
-  if (qps <= 0 && jitterMs <= 0) return
+  const effQps = params === undefined ? qps : params.qps
+  const effJitter = params === undefined ? jitterMs : params.jitterMs
+  if (effQps <= 0 && effJitter <= 0) return
 
   /**
    * 🔴 **必须先占位、再 await**（2026-10-21 审查补，并发专项）。
@@ -138,13 +154,13 @@ export async function throttleUpstream(
    */
   if (lastReleaseAt.size > MAX_KEYS) lastReleaseAt.clear()
 
-  if (qps > 0) {
-    const minInterval = 1000 / qps
+  if (effQps > 0) {
+    const minInterval = 1000 / effQps
     const t = now()
     const last = lastReleaseAt.get(key)
     // 预约：不早于「现在」，也不早于「上一个出场 + 最小间隔」
     const slot = (last === undefined ? t : Math.max(t, last + minInterval))
-      + (jitterMs > 0 ? Math.random() * jitterMs : 0)
+      + (effJitter > 0 ? Math.random() * effJitter : 0)
     lastReleaseAt.set(key, slot)
     const wait = slot - t
     if (wait > 0) await sleep(wait)
@@ -153,7 +169,7 @@ export async function throttleUpstream(
 
   // 只开抖动、不限速：仍然把抖动预约进 Map，保持键的语义一致
   const t0 = now()
-  const slot = t0 + (jitterMs > 0 ? Math.random() * jitterMs : 0)
+  const slot = t0 + (effJitter > 0 ? Math.random() * effJitter : 0)
   lastReleaseAt.set(key, slot)
   const wait = slot - t0
   if (wait > 0) await sleep(wait)

@@ -28,10 +28,11 @@ import type { Env } from '../env.js'
 import { resolveBurnRate, resolveMaxContextMessages } from '../env.js'
 // ⚠️ 限速参数解析放在 `gateway/safety.ts`（与 `envFallback` 同处），
 // 由 DO 在"面板没存值"时回落到此 —— 这是限速唯一的开启途径。
-import { resolveRateJitterMs, resolveRateLimitQps } from '../gateway/safety.js'
+import { resolveRateJitterMs, resolveRateLimitQps, resolveSafetyFor } from '../gateway/safety.js'
 import { appendBalanceSample, detectBurnRate } from './burn-rate.js'
 import {
   type AccountState,
+  type SafetyOverride,
   createAccountState,
   hardCooldownActive,
   healthy,
@@ -503,6 +504,28 @@ export class AccountPoolDO extends DurableObject<Env> {
     })
   }
 
+  /**
+   * 本 DO 实例服务的 realm（`cn` / `global`），来自 `ctx.id.name`。
+   *
+   * ## 🔴 为什么需要它（2026-10-22，探针实测的真缺陷）
+   *
+   * **所有 realm 共用同一个 `router.db`**，`accounts` 是全库一张表。
+   * 而 `readAccount/deleteAccount` 原来只按 `uid` 操作 ⇒
+   * 同一个 uid 出现在两个 realm 时互相覆盖：探针里 cn 那条**直接消失**。
+   *
+   * 线上目前靠「uid 带供应商前缀」侥幸没撞上（`workbuddy:…` / `qodercn:…`），
+   * 但那是运气。修法：表主键改为 `(uid, realm)`，且所有单条读写都带 realm。
+   *
+   * ⚠️ 用 `ctx.id.name` 而不是自己维护映射：那是平台原生语义，
+   * 生产环境（真 Cloudflare）本来就有；Node 适配层已补齐。
+   * ⚠️ 取不到时回落 `'cn'`（安全方向）：`cn` 是历史默认 realm，
+   * 老数据都在那里 —— 回落错成 `global` 会让账号看起来消失。
+   */
+  private get realm(): string {
+    const name = (this.ctx as { id?: { name?: string } }).id?.name
+    return typeof name === 'string' && name !== '' ? name : 'cn'
+  }
+
   /** 写入 / 覆盖一个账号的完整状态。 */
   async upsertAccount(state: AccountState, now: number): Promise<void> {
     writeAccount(this.ctx.storage.sql, state.uid, state.realm, JSON.stringify(state), now)
@@ -510,7 +533,7 @@ export class AccountPoolDO extends DurableObject<Env> {
 
   /** 读取一个账号。 */
   async getAccount(uid: string): Promise<AccountState | undefined> {
-    const raw = readAccount(this.ctx.storage.sql, uid)
+    const raw = readAccount(this.ctx.storage.sql, uid, this.realm)
     return raw === undefined ? undefined : normalizeAccountState(JSON.parse(raw))
   }
 
@@ -537,7 +560,7 @@ export class AccountPoolDO extends DurableObject<Env> {
    * 归一失败（缺 `uid` 等）同理属于「这条记录不可用」，保持一致即可。
    */
   private readState(uid: string): AccountState | undefined {
-    const raw = readAccount(this.ctx.storage.sql, uid)
+    const raw = readAccount(this.ctx.storage.sql, uid, this.realm)
     return raw === undefined ? undefined : normalizeAccountState(JSON.parse(raw))
   }
 
@@ -615,7 +638,7 @@ export class AccountPoolDO extends DurableObject<Env> {
   /** 删除账号（连带其会话绑定与凭据内存缓存）。 */
   async removeAccount(uid: string): Promise<void> {
     this.credentialCache.delete(uid)
-    deleteAccount(this.ctx.storage.sql, uid)
+    deleteAccount(this.ctx.storage.sql, uid, this.realm)
     this.ctx.storage.sql.exec('DELETE FROM sessions WHERE uid = ?', uid)
     // ⚠️ 连带清掉指向它的「指定账号」：否则「只用它」会让该供应商永远报
     // 「指定的账号不存在」，而用户已经不记得设过指定了。
@@ -665,8 +688,11 @@ export class AccountPoolDO extends DurableObject<Env> {
     let permLockSkipped = 0
     // ⚠️ 在读账号**之前**取（`getSafetyConfig` 有缓存，代价可忽略），
     // 避免循环里每条账号都 await 一次。
-    // 见 `SafetyConfig.modelCooldownEnabled`：关掉后模型级冷却既不写入也不拦截。
-    const modelCooldownEnabled = (await this.getSafetyConfig()).modelCooldownEnabled
+    //
+    // ⚠️ 这只是**全局默认值**。循环内每个账号还要看它自己的 `safetyOverride`
+    //（用户 2026-10-22 要求按账号配）—— 故下面用 `resolveSafetyFor` 合并，
+    // 不要再用这个变量直接判断。
+    const globalSafety = await this.getSafetyConfig()
 
     // ── 指定账号 ──
     //
@@ -701,10 +727,16 @@ export class AccountPoolDO extends DurableObject<Env> {
       }
       pruneExpired(state, now, MODEL_COST_TTL_MS)
       // ⚠️ 模型冷却关闭时，**已存在的**旧冷却条目也必须一并忽略
-      //（用户关开关的那一刻，池里已经挂着 5 小时的条目；只挡新写入不够）。
+      //（用户关开关那一刻，池里已经挂着 5 小时的条目；只挡新写入不够）。
       // 判据：`modelCooldownEnabled ? healthyForModel(...) : healthy(...)` ——
       // 即「账号级 5 维照旧，模型级 1 维跳过」。
-      const usable = modelCooldownEnabled ? healthyForModel(state, now, model) : healthy(state, now)
+      //
+      // ⚠️ 这里必须用**该账号自己的**配置（`globalSafety` + 它的 override）。
+      // 用全局值会让"只给 qodercn 放开"失效 —— 那正是用户要的。
+      const acctSafety = resolveSafetyFor(globalSafety, state.safetyOverride)
+      const usable = acctSafety.modelCooldownEnabled
+        ? healthyForModel(state, now, model)
+        : healthy(state, now)
       if (!usable) {
         if (isPin) pinReason = unavailableReason(state, now, model, { excluded: false, permLocked: false })
         continue
@@ -909,6 +941,72 @@ export class AccountPoolDO extends DurableObject<Env> {
     return { order, disabled }
   }
 
+  /**
+   * 写入**单账号**的防封覆盖（`AccountState.safetyOverride`）。
+   *
+   * ## 语义：只写调用方真正提供的字段（与 `setSafetyConfig` 同一纪律）
+   *
+   * - 字段**不出现** ⇒ 保持原样；
+   * - 字段显式给 `null` ⇒ **删除该覆盖**，回到「沿用全局」。
+   *
+   * ⚠️ 为什么需要 `null` 这条路径：用户给某个账号调过设置后，
+   * 唯一的「恢复默认」办法就是删掉那一条。若只能写值，
+   * 用户就只能手动填一个"看起来像默认值"的数字 ——
+   * 而全局默认将来一改，它就不再等于默认了（静默偏离）。
+   *
+   * ## ⚠️ 校验必须在这里（写入侧）
+   *
+   * 读路径（`resolveSafetyFor`）刻意不校验，否则"越界时用谁"又是一份判据。
+   * 故越界值必须在这里挡住，并**如实告诉调用方哪些被拒**（不能静默吞）。
+   */
+  async setAccountSafety(
+    uid: string,
+    patch: Record<string, unknown>,
+  ): Promise<{ override: SafetyOverride; rejected: string[] } | undefined> {
+    const raw = readAccount(this.ctx.storage.sql, uid, this.realm)
+    if (raw === undefined) return undefined
+    const state = normalizeAccountState(JSON.parse(raw))
+    if (state === undefined) return undefined
+
+    const next: SafetyOverride = { ...(state.safetyOverride ?? {}) }
+    const rejected: string[] = []
+    const num = (v: unknown, min: number, max: number): number | undefined =>
+      typeof v === 'number' && Number.isFinite(v) && v >= min && v <= max ? v : undefined
+
+    // ⚠️ 布尔：`true` / `false` 都是合法覆盖值（`false` 是"关闭"，最常用）。
+    for (const key of ['sessionTrace', 'modelCooldownEnabled'] as const) {
+      if (!(key in patch)) continue
+      const v = patch[key]
+      if (v === null) delete next[key]
+      else if (typeof v === 'boolean') next[key] = v
+      else rejected.push(key)
+    }
+    for (const [key, min, max] of [
+      ['maxContextMessages', 0, 100_000],
+      ['burnRateWindowMs', 0, 86_400_000],
+      ['burnRateThresholdPct', 0, 100],
+      ['rateLimitQps', 0, 50],
+      ['rateJitterMs', 0, 10_000],
+    ] as const) {
+      if (!(key in patch)) continue
+      const v = patch[key]
+      if (v === null) delete next[key]
+      else {
+        const n = num(v, min, max)
+        // ⚠️ `0` 是合法值（不限制 / 关闭 / 不限速），绝不能用 `||` 兜底。
+        if (n === undefined) rejected.push(key)
+        else next[key] = n
+      }
+    }
+
+    // 全删空 ⇒ 移除整个字段（与「从没设置过」等价，少一个需解释的状态）。
+    if (Object.keys(next).length === 0) delete state.safetyOverride
+    else state.safetyOverride = next
+
+    writeAccount(this.ctx.storage.sql, state.uid, state.realm, JSON.stringify(state), Date.now())
+    return { override: next, rejected }
+  }
+
   /** 写供应商面板设置（整体覆盖，调用方负责传完整值）。 */
   async setProviderSettings(input: { order: string[]; disabled: string[] }): Promise<void> {
     await this.ctx.storage.put('providerSettings', {
@@ -1093,7 +1191,7 @@ export class AccountPoolDO extends DurableObject<Env> {
      * 保留条目是有意的（用户随时可以重新打开开关，那时不该从零开始学），
      * 所以这里也必须**按开关解释状态**，而不是依赖条目已被清空。
      */
-    const modelCooldownEnabled = (await this.getSafetyConfig()).modelCooldownEnabled
+    const globalSafety = await this.getSafetyConfig()
 
     for (const raw of raws) {
       const state = normalizeAccountState(JSON.parse(raw))
@@ -1117,7 +1215,7 @@ export class AccountPoolDO extends DurableObject<Env> {
       //
       // ⚠️ `modelCooldownEnabled` 必须参与判断（见上方声明处的说明）：
       // 关掉开关后模型冷却不拦请求，面板就不能再说它「模型限流」。
-      if (modelCooldownEnabled && modelExempt(state, now)) {
+      if (resolveSafetyFor(globalSafety, state.safetyOverride).modelCooldownEnabled && modelExempt(state, now)) {
         exempt += 1
       } else if (healthy(state, now)) {
         healthyCount += 1
@@ -1194,7 +1292,7 @@ export class AccountPoolDO extends DurableObject<Env> {
     // 软冷却起步时长来自路由配置（默认 60 秒）。⚠️ 在读账号**之前**取，
     // 避免「读账号 → await → 写回」之间插入别的写。
     const softBaseMs = input.kind === 'soft' ? (await this.routingConfig()).softCooldownSeconds * 1000 : 60_000
-    const raw = readAccount(this.ctx.storage.sql, input.uid)
+    const raw = readAccount(this.ctx.storage.sql, input.uid, this.realm)
     if (raw === undefined) return { disabled: false }
     const state = normalizeAccountState(JSON.parse(raw))
     if (state === undefined) return { disabled: false }
@@ -1338,10 +1436,13 @@ export class AccountPoolDO extends DurableObject<Env> {
          * ⚠️ 为什么连 `modelConfirm` 也不涨：那是「这个模型确实不存在」的
          * **坐实计数**，只在冷却阶梯里有意义。冷却关了还继续累加，等到某天
          * 用户重新打开开关，这些陈年计数会让第一次失败直接吃到封顶 24 小时 ——
-         * 也就是"关开关期间的表现"污染了"开开关之后的行为"。
+         * 也就是「关开关期间的表现」污染了「开开关之后的行为」。
+         *
+         * ⚠️ 判据用**该账号自己的**配置（`state.safetyOverride`），不是全局值 ——
+         * 用户要的是「qodercn 放开、workbuddy 保留」。
          */
-        if (!(await this.getSafetyConfig()).modelCooldownEnabled) {
-          console.log(`[punish] 模型冷却已关闭，跳过记账 uid=${input.uid} model=${model}`)
+        if (!resolveSafetyFor(await this.getSafetyConfig(), state.safetyOverride).modelCooldownEnabled) {
+          console.log(`[punish] 模型冷却已关闭（含账号级覆盖），跳过记账 uid=${input.uid} model=${model}`)
           break
         }
         // ⚠️ 先剪枝再读 `hits`：否则一个**已自然到期**的旧冷却会让本次新失败
@@ -1537,7 +1638,7 @@ export class AccountPoolDO extends DurableObject<Env> {
     now: number,
     balance: { credits: number; expiring: number; earliestExpiry: number },
   ): Promise<boolean> {
-    const raw = readAccount(this.ctx.storage.sql, uid)
+    const raw = readAccount(this.ctx.storage.sql, uid, this.realm)
     if (raw === undefined) return false
     const state = normalizeAccountState(JSON.parse(raw))
     if (state === undefined) return false
@@ -1566,7 +1667,11 @@ export class AccountPoolDO extends DurableObject<Env> {
   private async enforceBurnRate(state: AccountState, now: number): Promise<void> {
     // ⚠️ 读**面板配置**而不是环境变量：面板改完要能立刻生效，
     // 否则「关掉熔断」还得重启容器，用户会以为开关坏了。
-    const safety = await this.getSafetyConfig()
+    //
+    // ⚠️ 合并该账号自己的覆盖（用户 2026-10-22 要求按账号配）：
+    // 「某几个号省着用、别的号随便烧」是真实需求，而熔断判的本来就是
+    // **单个账号**的消耗曲线 —— 粒度天然在账号上。
+    const safety = resolveSafetyFor(await this.getSafetyConfig(), state.safetyOverride)
     const config = { windowMs: safety.burnRateWindowMs, thresholdPct: safety.burnRateThresholdPct }
     // 关闭时直接返回：连判定函数都不进，省掉每条账号一次遍历。
     if (config.windowMs <= 0 || config.thresholdPct <= 0) return
@@ -1767,7 +1872,7 @@ export class AccountPoolDO extends DurableObject<Env> {
    * 「正常」却带着一条旧错误，误导排查。
    */
   async setAccountDisabled(uid: string, disabled: boolean, now: number): Promise<boolean> {
-    const raw = readAccount(this.ctx.storage.sql, uid)
+    const raw = readAccount(this.ctx.storage.sql, uid, this.realm)
     if (raw === undefined) return false
     const state = normalizeAccountState(JSON.parse(raw))
     if (state === undefined) return false
@@ -1816,7 +1921,7 @@ export class AccountPoolDO extends DurableObject<Env> {
     input: { uid: string; nickname: string; realm: string; provider?: string },
     now: number,
   ): Promise<AccountState> {
-    const existing = readAccount(this.ctx.storage.sql, input.uid)
+    const existing = readAccount(this.ctx.storage.sql, input.uid, this.realm)
     if (existing !== undefined) {
       const parsed = normalizeAccountState(JSON.parse(existing))
       if (parsed !== undefined) return parsed
@@ -1989,7 +2094,7 @@ export class AccountPoolDO extends DurableObject<Env> {
   async clearCooldowns(realm: string, uid?: string): Promise<number> {
     const states: Array<AccountState | undefined> = uid === undefined
       ? listAccounts(this.ctx.storage.sql, realm).map((r) => normalizeAccountState(JSON.parse(r)))
-      : [normalizeAccountState(JSON.parse(readAccount(this.ctx.storage.sql, uid) ?? 'null'))]
+      : [normalizeAccountState(JSON.parse(readAccount(this.ctx.storage.sql, uid, this.realm) ?? 'null'))]
     let n = 0
     for (const state of states) {
       if (state === undefined) continue
@@ -2153,7 +2258,7 @@ export class AccountPoolDO extends DurableObject<Env> {
     // ⚠️ 只有传了 uid 时才需要读单条；不传就扫整个 realm。
     // （DO 本身按 realm 分片，故 realm 只是过滤条件，不是路由信息。）
     if (uid !== undefined) {
-      const raw = readAccount(this.ctx.storage.sql, uid)
+      const raw = readAccount(this.ctx.storage.sql, uid, this.realm)
       if (raw === undefined) return 0
       const state = normalizeAccountState(JSON.parse(raw))
       if (state === undefined) return 0
@@ -2286,7 +2391,7 @@ export class AccountPoolDO extends DurableObject<Env> {
    * 不要拿它当"绕过限制"的常规手段（见 RESTRICTED_HOLD_MS 的注释）。
    */
   async clearAccountRestriction(uid: string): Promise<{ found: boolean; cleared: boolean }> {
-    const raw = readAccount(this.ctx.storage.sql, uid)
+    const raw = readAccount(this.ctx.storage.sql, uid, this.realm)
     if (raw === undefined || raw === '') return { found: false, cleared: false }
     const state = normalizeAccountState(JSON.parse(raw))
     if (state === undefined) return { found: false, cleared: false }

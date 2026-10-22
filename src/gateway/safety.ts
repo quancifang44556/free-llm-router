@@ -17,6 +17,7 @@
 import type { Env } from '../env.js'
 import { resolveBurnRate, resolveMaxContextMessages } from '../env.js'
 import type { AccountPoolDO, SafetyConfig } from '../pool/AccountPoolDO.js'
+import type { SafetyOverride } from '../pool/state.js'
 import { setSessionTraceEnabled } from '../upstream/headers.js'
 import { configureThrottle } from './throttle.js'
 
@@ -142,4 +143,47 @@ export async function safetyConfigFor(
   setSessionTraceEnabled(value.sessionTrace)
   configureThrottle({ qps: value.rateLimitQps, jitterMs: value.rateJitterMs })
   return value
+}
+
+/**
+ * 把**全局配置**与**账号级覆盖**合并成该账号实际生效的配置。
+ *
+ * ## 为什么必须有这个函数（而不是各处 `override.x ?? global.x`）
+ *
+ * ……因为那样就变成「每个调用点各写一遍合并逻辑」——
+ * 本项目最反复的缺陷类型（同一个语义写了两份，改一处漏一处）。
+ * 合并**只能有一个实现**，否则「某个字段忘了合并」会表现为
+ * 「这个开关对某些账号不生效」，而且极难定位。
+ *
+ * ## 语义：逐字段覆盖
+ *
+ * - `override` 里 `undefined` 的字段 ⇒ 用全局值；
+ * - `override` 里显式给了值（**包括 `0` 与 `false`**）⇒ 用该值。
+ *
+ * ⚠️⚠️ **`0` 与 `false` 是合法覆盖值，绝对不能用 `||` 兜底。**
+ * 这正是本项目 `parseInt(x) || 默认值` 同型缺陷的翻版：
+ * `rateLimitQps: 0`（不限速）、`maxContextMessages: 0`（不裁剪）、
+ * `modelCooldownEnabled: false`（不锁模型）—— 三个最常用的"关闭"语义
+ * 全是 falsy。用 `||` 会让它们**静默失效**，用户点了"关闭"却毫无变化。
+ * ⇒ 判据一律是 `=== undefined`。
+ *
+ * ## ⚠️ 越界值不在这里校验
+ *
+ * 校验发生在写入时（`setSafetyConfig` / `setAccountSafety`）。
+ * 这里**信任已存储的值**，理由：读路径上做校验就必须决定「越界时用谁」，
+ * 而那个决定又是一份判据。写入时拦住非法值，读路径保持纯粹。
+ */
+export function resolveSafetyFor(global: SafetyConfig, override?: SafetyOverride): SafetyConfig {
+  if (override === undefined) return global
+  const pick = <K extends keyof SafetyConfig>(key: K): SafetyConfig[K] =>
+    override[key] === undefined ? global[key] : (override[key] as SafetyConfig[K])
+  return {
+    sessionTrace: pick('sessionTrace'),
+    modelCooldownEnabled: pick('modelCooldownEnabled'),
+    maxContextMessages: pick('maxContextMessages'),
+    burnRateWindowMs: pick('burnRateWindowMs'),
+    burnRateThresholdPct: pick('burnRateThresholdPct'),
+    rateLimitQps: pick('rateLimitQps'),
+    rateJitterMs: pick('rateJitterMs'),
+  }
 }

@@ -198,20 +198,26 @@ export function intlConversationHeaders(input: {
 /**
  * 会话链**运行时开关**（面板「防封」分区控制，见 `SafetyConfig.sessionTrace`）。
  *
- * ## ⚠️ 为什么是模块级变量而不是参数
+ * ## ⚠️ 从「模块级全局」改成「按账号参数透传」（2026-10-22）
  *
- * 组装头的调用点有三处（`models.ts` 列目录、`buddy.ts` 发对话、内部委派），
- * 而后者在 provider 内部、拿不到网关层的配置。要一路透传就得改
- * `Provider.chat` 的签名 —— 为一个**全局唯一**的开关改一层接口不划算。
+ * 原注释写着：*「该配置是**全局单值**，不存在『不同请求要不同值』的情况，
+ * 故模块级变量不会读串。若将来要按账号区分配置，必须改成参数透传。」*
  *
- * ## ⚠️ 并发安全
+ * 这个「将来」在用户提出「我希望我可以每个账号不同设置」时到了。
+ * 保留模块级变量会让 `qodercn` 与 `workbuddy` 只能共用一个值 ——
+ * 正是用户要摆脱的约束。
  *
- * 该配置是**全局单值**（整个服务一个值），不存在「不同请求要不同值」的情况，
- * 故模块级变量不会读串。若将来要按账号区分配置，必须改成参数透传。
+ * ## 现在的作用域
+ *
+ * `sessionTraceHeaders` 的**第三个参数**就是本次调用的值（`input`、`includeB3` 之后的那个）；
+ * 不传时回落模块级 `sessionTraceEnabled`（既有调用点行为不变）。
+ *
+ * ⚠️ 回落而不是「默认 false」：漏传时应当维持原样，不能静默把 b3 关掉 ——
+ * 那会让国际服丢掉渠道要求的链路头，表现为莫名的 11-128。
  */
 let sessionTraceEnabled = true
 
-/** 设置会话链开关（由网关按面板配置刷新）。 */
+/** 设置会话链开关（由网关按面板配置刷新；仅作为未显式传参时的回落值）。 */
 export function setSessionTraceEnabled(enabled: boolean): void {
   sessionTraceEnabled = enabled
 }
@@ -226,7 +232,7 @@ export function sessionTraceHeaders(input: {
   conversationId?: string
   /** 轮级 id：重试须复用（调用方在重试循环外算一次），缺省则现生成。 */
   turnRequestId?: string
-} = {}, includeB3 = true): HeaderMap {
+} = {}, includeB3 = true, traceEnabled?: boolean): HeaderMap {
   // ⚠️⚠️ 这里**千万不能**整段 return {}。
   //
   // `intlConversationHeaders` 那 5 个会话头是 v0.1.2 为修「11‑128 渠道拦截
@@ -249,8 +255,10 @@ export function sessionTraceHeaders(input: {
     // b3 受两道闸门控制：
     // ① `includeB3`（调用方按变体决定）—— ⚠️ **国内版必须传 false**，
     //    否则上游判「两套 trace 并存」回 `11-128 request illegal`；
-    // ② 面板开关 `sessionTraceEnabled`。
-    ...(sessionTraceEnabled && includeB3 ? b3TraceHeaders({ conversationId }) : {}),
+    // ② 开关：本次调用显式传入的值优先，未传才回落模块级全局
+    //    （`traceEnabled ?? sessionTraceEnabled`，注意 `false` 是合法值，
+    //     不能用 `||` —— 那会把"显式关闭"吞成"用全局"）。
+    ...((traceEnabled ?? sessionTraceEnabled) && includeB3 ? b3TraceHeaders({ conversationId }) : {}),
   }
 }
 
@@ -498,6 +506,13 @@ export function referenceChatHeaders(input: {
   sessionId?: string
   /** 国际服轮级 ID（重试须复用，否则上游视作新的一轮）。拿不到就省略。 */
   turnRequestId?: string
+  /**
+   * 会话链（b3 三件套）开关，**按账号**取值（见 `SafetyConfig.sessionTrace`
+   * 与 `AccountState.safetyOverride`）。
+   *
+   * ⚠️ 不传 ⇒ 回落模块级全局（既有调用点行为不变）。
+   */
+  sessionTrace?: boolean
 }): HeaderMap {
   if (input.variant === 'workbuddy') return intlReferenceChatHeaders(input)
 
@@ -548,6 +563,8 @@ function intlReferenceChatHeaders(input: {
   turnRequestId?: string
   machineId?: string
   sessionId?: string
+  /** 该账号生效的会话链开关（不传则回落全局，见 `sessionTraceHeaders`）。 */
+  sessionTrace?: boolean
 }): HeaderMap {
   // ⚠️ 官方值就是 `SaaS`（部署类型），不是产品名 `WorkBuddy` ——
   // 与 `X-IDE-Name` 分工不同，发成 `WorkBuddy` 会被判身份不自洽。
@@ -593,6 +610,8 @@ function intlReferenceChatHeaders(input: {
       // 国际版**要** b3：渠道要求链路可串联，且它的指纹是桌面口径，
       // 与 b3 不冲突（国内版才冲突，见 `referenceChatHeaders` 主分支的说明）。
       true,
+      // 第三个参数 = 该账号生效的会话链开关（不传则回落全局）。
+      input.sessionTrace,
     ),
   }
   if (input.accessToken !== '') {

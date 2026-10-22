@@ -13,13 +13,14 @@ import {
   Power,
   RefreshCw,
   Search,
+  Shield,
   Snowflake,
   Star,
   Timer,
   Trash2,
   Users,
 } from 'lucide-react'
-import { useMemo, useRef, useState, type KeyboardEvent, type PointerEvent } from 'react'
+import { useEffect, useMemo, useRef, useState, type KeyboardEvent, type PointerEvent } from 'react'
 import { PageHeader } from '@/components/layout/PageHeader'
 import { PIN_META, PinBadge } from '@/components/PinBadge'
 import { StatCard } from '@/components/StatCard'
@@ -27,11 +28,17 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Dialog } from '@/components/ui/dialog'
-import { Input } from '@/components/ui/input'
+import { Input, Switch } from '@/components/ui/input'
 import { Menu, MenuContent, MenuItem, MenuLabel, MenuSeparator, MenuTrigger } from '@/components/ui/menu'
 import { Empty, ProviderAvatar, Segmented, Skeleton } from '@/components/ui/misc'
 import { Table, TD, TH, THead, TR } from '@/components/ui/table'
-import { useClearCooldowns, useProbeAccount, useSetProviderOrder } from '@/lib/config'
+import {
+  useAccountSafety,
+  useClearCooldowns,
+  useProbeAccount,
+  useSaveAccountSafety,
+  useSetProviderOrder,
+} from '@/lib/config'
 import {
   pinModeOf,
   useAccounts,
@@ -44,7 +51,7 @@ import {
   useToggleAccount,
 } from '@/lib/queries'
 import { accountStatus, recoveryText, STATUS_META, type AccountStatus } from '@/lib/status'
-import type { Account, PinMode, Provider } from '@/lib/types'
+import type { Account, PinMode, Provider, Realm } from '@/lib/types'
 import { cn, fmtInt, fmtRelative } from '@/lib/utils'
 import { AddAccountDialog } from './AddAccountDialog'
 import { ProviderSheet, type SheetTab } from './ProviderSheet'
@@ -412,6 +419,8 @@ export function AccountsTable({
   const setPin = useSetPin()
   const providers = useProviders()
   const [confirm, setConfirm] = useState<Account | null>(null)
+  /** 正在编辑防封设置的账号（null = 弹窗关闭）。 */
+  const [safetyFor, setSafetyFor] = useState<Account | null>(null)
 
   const pinTo = (a: Account, mode: PinMode | null) => {
     const s = accountStatus(a)
@@ -558,6 +567,9 @@ export function AccountsTable({
                           <Snowflake /> 清除冷却
                         </MenuItem>
                       )}
+                      <MenuItem onSelect={() => setSafetyFor(a)}>
+                        <Shield /> 防封设置（本账号）
+                      </MenuItem>
                       <MenuItem onSelect={() => toggle.mutate(a)}>
                         <Power /> {a.disabled ? '启用（同时清除冷却）' : '停用'}
                       </MenuItem>
@@ -600,6 +612,8 @@ export function AccountsTable({
           </div>
         )}
       </Dialog>
+
+      <AccountSafetyDialog account={safetyFor} onClose={() => setSafetyFor(null)} />
     </>
   )
 }
@@ -613,5 +627,193 @@ function PinOption({ title, desc, checked }: { title: string; desc: string; chec
       </span>
       {checked && <Check className="text-primary" />}
     </>
+  )
+}
+
+/**
+ * 单账号的防封设置弹窗。
+ *
+ * ## 为什么是「三态」而不是「开关」
+ *
+ * 每个字段有三种状态：**沿用全局** / **显式开** / **显式关**。
+ * 只给两态（开关）就无法表达「这个号跟随全局」——
+ * 用户关掉全局后，所有账号都变成"显式关"，从此全局默认再也管不到它们。
+ *
+ * ⚠️ 故每个字段都有「跟随全局」这个第三选项，且**默认就是它**。
+ * 这也是后端 `patch` 里用 `null` 表示删除覆盖的原因（见 `useSaveAccountSafety`）。
+ */
+function AccountSafetyDialog({ account, onClose }: { account: Account | null; onClose: () => void }) {
+  const uid = account?.uid ?? null
+  const realm = (account?.realm ?? 'cn') as Realm
+  const q = useAccountSafety(uid, realm)
+  const save = useSaveAccountSafety()
+
+  // 本地待提交的 patch：只放**用户真的改过**的字段。
+  // `undefined` = 没动（保持服务端原值）；`null` = 恢复跟随全局。
+  const [patch, setPatch] = useState<Record<string, unknown>>({})
+
+  // 关闭 / 切换账号时清空草稿，避免把上一个号的修改带到下一个号。
+  useEffect(() => {
+    if (account === null) setPatch({})
+  }, [account])
+
+  const override = q.data?.override ?? {}
+  const global = q.data?.global
+
+  /**
+   * 某个字段当前是否「显式覆盖」。
+   * ⚠️ 判据必须查 `patch` 优先（含 `null`）、其次查服务端 `override` ——
+   * 否则用户点了「恢复跟随全局」之后界面不会立刻变。
+   */
+  const hasOverride = (key: string): boolean => {
+    if (key in patch) return patch[key] !== null
+    return override[key as keyof typeof override] !== undefined
+  }
+
+  /** 该字段当前显示的值：本地草稿 > 服务端覆盖 > 全局值。 */
+  const valueOf = <T,>(key: string, fallback: T): T => {
+    if (key in patch) {
+      const v = patch[key]
+      return (v === null ? fallback : (v as T))
+    }
+    const o = override[key as keyof typeof override]
+    return (o === undefined ? fallback : (o as T))
+  }
+
+  const setField = (key: string, v: unknown) => setPatch((p) => ({ ...p, [key]: v }))
+  const clearField = (key: string) => setPatch((p) => ({ ...p, [key]: null }))
+
+  const submit = () => {
+    if (account === null) return
+    save.mutate(
+      { uid: account.uid, realm, patch },
+      { onSuccess: () => { setPatch({}); onClose() } },
+    )
+  }
+
+  const Field = ({
+    k, title, desc, kind,
+  }: {
+    k: string
+    title: string
+    desc: string
+    kind: 'bool' | 'num'
+  }) => {
+    const on = hasOverride(k)
+    const label = global === undefined ? '' : (
+      kind === 'bool'
+        ? ((global as unknown as Record<string, boolean>)[k] ? '开' : '关')
+        : String((global as unknown as Record<string, number>)[k])
+    )
+    return (
+      <div className={cn('rounded-lg border px-3.5 py-3', !on && 'bg-muted/40')}>
+        <div className="flex items-start gap-3">
+          <div className="min-w-0 flex-1">
+            <div className="flex items-center gap-2 text-[13px] font-medium">
+              {title}
+              <Badge tone={on ? 'info' : 'neutral'}>
+                {on ? '本账号单独设置' : `跟随全局（${label}）`}
+              </Badge>
+            </div>
+            <div className="text-muted-foreground mt-0.5 text-xs leading-relaxed">{desc}</div>
+          </div>
+          {on && (
+            <button
+              type="button"
+              className="text-muted-foreground hover:text-foreground shrink-0 cursor-pointer text-[11.5px] underline decoration-dotted"
+              onClick={() => clearField(k)}
+            >
+              恢复跟随全局
+            </button>
+          )}
+        </div>
+        <div className="mt-2.5">
+          {kind === 'bool' ? (
+            <Switch
+              label={title}
+              checked={valueOf<boolean>(k, Boolean(global && (global as unknown as Record<string, boolean>)[k]))}
+              onCheckedChange={(v) => setField(k, v)}
+            />
+          ) : (
+            <Input
+              type="number"
+              className="tabular w-32"
+              value={String(valueOf<number>(k, Number(global && (global as unknown as Record<string, number>)[k]) ?? 0))}
+              onChange={(e) => setField(k, e.target.value === '' ? 0 : Number(e.target.value))}
+            />
+          )}
+        </div>
+      </div>
+    )
+  }
+
+  return (
+    <Dialog
+      open={account !== null}
+      onOpenChange={(o) => !o && onClose()}
+      title="这个账号的防封设置"
+      description="只影响这一个账号。没单独设置的项一律跟随「配置 → 防封」里的全局值。"
+      footer={
+        <>
+          <Button variant="outline" onClick={onClose}>
+            取消
+          </Button>
+          <Button onClick={submit} disabled={save.isPending || Object.keys(patch).length === 0}>
+            {save.isPending ? '保存中…' : '保存'}
+          </Button>
+        </>
+      }
+    >
+      {account && (
+        <div className="space-y-3">
+          <div className="bg-muted/60 rounded-lg px-4 py-2.5">
+            <div className="font-medium">{account.nickname || '未命名'}</div>
+            <div className="text-muted-foreground font-mono text-[11.5px]">{account.uid}</div>
+          </div>
+
+          {q.isLoading && <Skeleton className="h-24 w-full" />}
+          {q.isError && (
+            <div className="text-danger bg-danger/5 rounded-md px-3 py-2 text-xs">
+              读不到该账号的设置（{q.error.message}）
+            </div>
+          )}
+
+          {q.data && (
+            <>
+              <Field
+                k="modelCooldownEnabled"
+                title="模型级冷却"
+                desc="关掉后：这个号的请求失败照样报错、照样换号，但不再把「这个账号 + 这个模型」锁起来。实测上游 429 / 排队多为瞬时，锁起来经常变成「明明还能用却选不到号」。"
+                kind="bool"
+              />
+              <Field
+                k="sessionTrace"
+                title="会话链（b3 三件套）"
+                desc="关掉 = 不再发 b3 追踪头。注意：只有国际版会发 b3，国内版本来就强制不发（发了会 11-128）。"
+                kind="bool"
+              />
+              <Field
+                k="rateLimitQps"
+                title="每账号 QPS 上限"
+                desc="0 = 不限速。限速的本意是让它「像真人操作有停顿」，只对需要伪装的上游有意义。"
+                kind="num"
+              />
+              <Field
+                k="rateJitterMs"
+                title="抖动上限（毫秒）"
+                desc="0 = 不抖动。把等距的请求打散，避免出现精确等距的机器特征。"
+                kind="num"
+              />
+              <Field
+                k="maxContextMessages"
+                title="上下文消息数上限"
+                desc="0 = 不裁剪。只对国际版生效；裁剪是**有损**的，会把早期消息与工具结果丢掉。"
+                kind="num"
+              />
+            </>
+          )}
+        </div>
+      )}
+    </Dialog>
   )
 }

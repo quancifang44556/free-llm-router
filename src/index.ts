@@ -73,7 +73,7 @@ import type { LoginCredential } from './upstream/auth.js'
 import { parseAuthDocument, parseAuthPayload } from './upstream/import.js'
 import { handleResponses } from './gateway/responses.js'
 import { handleChatCompletions, refineModelScoped, resetMaxRotateCache } from './gateway/server.js'
-import { resetSafetyConfigCache } from './gateway/safety.js'
+import { resetSafetyConfigCache, resolveSafetyFor } from './gateway/safety.js'
 import {
   emptyApiKeyUsage,
   generateApiKey,
@@ -1557,6 +1557,82 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
   //
   // ⚠️ 与 `/admin/accounts/remove` 的区别：这个**可逆**，故**不需要 confirm**。
   // 用户点错了再点一次就好，加确认反而烦。
+  /**
+   * 单账号的**防封覆盖**（`/admin/accounts/safety`）。
+   *
+   * ## 为什么是账号级（用户 2026-10-22 要求）
+   *
+   * 用户原话：「我希望这个功能放到账号那里，因为我目前只是不想给 qd 限制，
+   * 防封开关也是，我希望我可以每个账号不同设置」。
+   *
+   * 不同上游的风控模型完全不同（`workbuddy` 要伪装、`qodercn` 用官方凭据
+   * 实测 20 并发零损伤），一个全局开关只能让两边互相迁就。
+   *
+   * ## 协议
+   *
+   * - 字段**不出现** ⇒ 保持原样（与 `setSafetyConfig` 同一纪律）；
+   * - 字段给 `null` ⇒ **删除该覆盖**，回到「沿用全局」；
+   * - 字段给值 ⇒ 覆盖（`0` / `false` 是合法值，不是「没设置」）。
+   *
+   * ⚠️ 返回体里带上 `effective`（合并后的**实际生效**值）：
+   * 面板据此回显，用户能直接看到「这个号现在到底受不受限制」，
+   * 而不是自己去推断全局值加覆盖的结果。
+   */
+  if (path === '/admin/accounts/safety' && request.method === 'POST') {
+    const body = (await request.json().catch(() => ({}))) as {
+      uid?: unknown; realm?: unknown; patch?: unknown
+    }
+    if (typeof body.uid !== 'string' || body.uid === '') {
+      return json({ error: { message: 'uid 必填', type: 'invalid_request_error' } }, 400)
+    }
+    if (body.patch === null || typeof body.patch !== 'object' || Array.isArray(body.patch)) {
+      return json({ error: { message: 'patch 必须是对象', type: 'invalid_request_error' } }, 400)
+    }
+    const realm = typeof body.realm === 'string' && body.realm !== '' ? body.realm : 'cn'
+    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
+    const result = await pool.setAccountSafety(body.uid, body.patch as Record<string, unknown>)
+    if (result === undefined) {
+      return json({ error: { message: '账号不存在', type: 'not_found' } }, 404)
+    }
+    // 合并后的实际生效值（面板回显用）
+    const effective = resolveSafetyFor(await pool.getSafetyConfig(), result.override)
+    return json({
+      ok: true,
+      uid: body.uid,
+      realm,
+      override: result.override,
+      effective,
+      // ⚠️ 越界字段**必须如实回报**，不能静默忽略 ——
+      // 静默会让用户以为「已经设上了」，而这个开关的意义就是控制行为。
+      ...(result.rejected.length > 0 ? { rejected: result.rejected } : {}),
+    })
+  }
+
+  /** 读单账号的防封覆盖 + 实际生效值（面板打开弹窗时用）。 */
+  if (path === '/admin/accounts/safety' && request.method === 'GET') {
+    const uid = url.searchParams.get('uid') ?? ''
+    if (uid === '') {
+      return json({ error: { message: 'uid 必填', type: 'invalid_request_error' } }, 400)
+    }
+    const realm = url.searchParams.get('realm') ?? 'cn'
+    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
+    const accounts = await pool.listAccounts(realm, Date.now())
+    const account = accounts.find((a) => a.uid === uid)
+    if (account === undefined) {
+      return json({ error: { message: '账号不存在', type: 'not_found' } }, 404)
+    }
+    const global = await pool.getSafetyConfig()
+    return json({
+      ok: true,
+      uid,
+      realm,
+      override: account.safetyOverride ?? {},
+      global,
+      effective: resolveSafetyFor(global, account.safetyOverride),
+    })
+  }
+
+
   if (path === '/admin/accounts/toggle' && request.method === 'POST') {
     const body = (await request.json().catch(() => ({}))) as {
       uid?: string; realm?: string; disabled?: boolean

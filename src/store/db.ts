@@ -27,14 +27,71 @@ export type SqlStorage = DurableObjectStorage['sql']
 
 /** 创建表结构。幂等，可在构造时安全重复调用。 */
 export function migrate(sql: SqlStorage): void {
+  // ── 账号表：主键必须是 **(uid, realm)**，不能只是 uid ──
+  //
+  // ## 🔴 真实缺陷（2026-10-22 探针实测）
+  //
+  // 原主键是 `uid PRIMARY KEY`，而 `readAccount(sql, uid)` 只按 uid 查。
+  // 但**所有 realm 共用同一个 `router.db`**（`accounts` 是全库一张表；
+  // 只有 `system_kv` / `system_alarms` 用 `instanceId` 隔离）。
+  // ⇒ 同一个 uid 出现在两个 realm 时，后写的**直接覆盖**先写的那条：
+  //
+  // ```
+  // cn  里 same 的数量: 0      ← 被顶掉了
+  // gl  里 same 的数量: 1
+  // cn 读到的 nickname: undefined
+  // ```
+  //
+  // 线上目前没触发（uid 都带供应商前缀：`workbuddy:…` / `qodercn:…`，天然不重叠）。
+  // 但这是**运气**，不是保证：一旦某家凭据的 uid 是裸 uuid（多家上游确实如此），
+  // 两个 realm 就会互相吃掉对方的账号 —— 表现为「账号莫名消失」，极难定位。
+  //
+  // ⚠️ 迁移必须**幂等且不丢数据**：老表 `uid PRIMARY KEY` 没法 ALTER 改主键，
+  // 只能「建新表 → 搬数据 → 换名」。老数据里同一 uid 最多一条（旧主键保证），
+  // 故搬迁不会冲突。
+  const accountsDdl = (): string => {
+    try {
+      const rows = sql
+        .exec("SELECT sql FROM sqlite_master WHERE type='table' AND name='accounts'")
+        .toArray() as Array<{ sql?: string }>
+      return rows[0]?.sql ?? ''
+    } catch {
+      return ''
+    }
+  }
+
   sql.exec(`
     CREATE TABLE IF NOT EXISTS accounts (
-      uid       TEXT PRIMARY KEY,
+      uid       TEXT NOT NULL,
       realm     TEXT NOT NULL DEFAULT 'cn',
       state     TEXT NOT NULL,
-      updated_at INTEGER NOT NULL
+      updated_at INTEGER NOT NULL,
+      PRIMARY KEY (uid, realm)
     )
   `)
+
+  // 老库已存在同一张表时，上面的 `CREATE IF NOT EXISTS` 不会改结构 ⇒ 需要重建。
+  const ddl = accountsDdl()
+  if (ddl !== '' && !/PRIMARY KEY\s*\(\s*uid\s*,\s*realm\s*\)/i.test(ddl)) {
+    sql.exec('DROP TABLE IF EXISTS accounts_migrated')
+    sql.exec(`
+      CREATE TABLE accounts_migrated (
+        uid       TEXT NOT NULL,
+        realm     TEXT NOT NULL DEFAULT 'cn',
+        state     TEXT NOT NULL,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (uid, realm)
+      )
+    `)
+    sql.exec(`
+      INSERT OR REPLACE INTO accounts_migrated (uid, realm, state, updated_at)
+      SELECT uid, realm, state, updated_at FROM accounts
+    `)
+    sql.exec('DROP TABLE accounts')
+    sql.exec('ALTER TABLE accounts_migrated RENAME TO accounts')
+    console.log('[migrate] accounts 主键已升级为 (uid, realm)')
+  }
+
   sql.exec(`CREATE INDEX IF NOT EXISTS idx_accounts_realm ON accounts(realm)`)
 
   // 会话粘性：会话键 → uid 绑定。带过期时间，由 GC 惰性清理。
@@ -170,9 +227,40 @@ function firstRow<T extends Record<string, SqlStorageValue>>(cursor: { toArray()
   return rows.length === 0 ? undefined : rows[0]
 }
 
-/** 读单条账号状态（JSON 文本）。不存在返回 undefined。 */
-export function readAccount(sql: SqlStorage, uid: string): string | undefined {
-  return firstRow(sql.exec<{ state: string }>('SELECT state FROM accounts WHERE uid = ?', uid))?.state
+/**
+ * 读单条账号状态（JSON 文本）。不存在返回 undefined。
+ *
+ * ## 🔴 必须带 `realm`（2026-10-22 修）
+ *
+ * 原来只按 `uid` 查。而**所有 realm 共用同一个 `router.db`** ——
+ * 同一个 uid 在两个 realm 各存一份时，只按 uid 查会随机拿到错的那条，
+ * 更糟的是 `writeAccount` 那边的 `ON CONFLICT(uid)` 会把它**覆盖掉**。
+ *
+ * 探针实测：cn 里写一条、global 里写同 uid 一条 ⇒ cn 那条直接消失。
+ * 线上目前靠「uid 带供应商前缀」侥幸没撞上，但那是运气不是保证。
+ *
+ * ⚠️ 参数**不设默认值**：漏传 realm 会静默退回跨 realm 查询，
+ * 而那正是要被消灭的行为。让类型系统逼调用方明确。
+ */
+/**
+ * 读单条账号状态（JSON 文本）。不存在返回 undefined。
+ *
+ * ## 🔴 必须带 `realm`（2026-10-22 修）
+ *
+ * 原来只按 `uid` 查。而**所有 realm 共用同一个 `router.db`** ——
+ * 同一个 uid 在两个 realm 各存一份时，只按 uid 查会拿到**任意一条**
+ *（SQLite 不保证顺序），而 `writeAccount` 的 `ON CONFLICT(uid)`
+ * 更会把它**覆盖掉**。探针实测：cn 写一条、global 写同 uid ⇒ cn 那条消失。
+ *
+ * 线上目前靠「uid 带供应商前缀」侥幸没撞上，但那是运气不是保证。
+ *
+ * ⚠️ 参数**不设默认值**：漏传 realm 会静默退回跨 realm 查询，
+ * 而那正是要被消灭的行为。让类型系统逼调用方明确。
+ */
+export function readAccount(sql: SqlStorage, uid: string, realm: string): string | undefined {
+  return firstRow(
+    sql.exec<{ state: string }>('SELECT state FROM accounts WHERE uid = ? AND realm = ?', uid, realm),
+  )?.state
 }
 
 /** 列出某 realm 的全部账号状态（**只取 state 列**，不取多余的）。 */
@@ -186,8 +274,11 @@ export function listAccounts(sql: SqlStorage, realm: string): string[] {
 /** 写入（upsert）单条账号状态。 */
 export function writeAccount(sql: SqlStorage, uid: string, realm: string, state: string, now: number): void {
   sql.exec(
+    // ⚠️ 冲突目标必须是**复合主键** `(uid, realm)`（2026-10-22）。
+    // 原来写 `ON CONFLICT(uid)` —— 两个 realm 的同 uid 账号会互相覆盖，
+    // 且 SQLite 会因找不到唯一约束而报错（表结构已改）。
     `INSERT INTO accounts (uid, realm, state, updated_at) VALUES (?, ?, ?, ?)
-     ON CONFLICT(uid) DO UPDATE SET state = excluded.state, realm = excluded.realm, updated_at = excluded.updated_at`,
+     ON CONFLICT(uid, realm) DO UPDATE SET state = excluded.state, updated_at = excluded.updated_at`,
     uid,
     realm,
     state,
@@ -196,8 +287,9 @@ export function writeAccount(sql: SqlStorage, uid: string, realm: string, state:
 }
 
 /** 删除单条账号。 */
-export function deleteAccount(sql: SqlStorage, uid: string): void {
-  sql.exec('DELETE FROM accounts WHERE uid = ?', uid)
+export function deleteAccount(sql: SqlStorage, uid: string, realm: string): void {
+  // ⚠️ 必须带 realm：只按 uid 删会**连带删掉另一个 realm 的同名账号**。
+  sql.exec('DELETE FROM accounts WHERE uid = ? AND realm = ?', uid, realm)
 }
 
 /** 读会话绑定；已过期视为不存在。 */

@@ -341,19 +341,27 @@ test('🔴 裁剪只在 handleChatCompletions 接线一次（本项目吃过「�
   const server = stripComments(readFileSync('src/gateway/server.ts', 'utf8'))
   assert.equal([...server.matchAll(/trimMessagesByLimit\s*\(/g)].length, 1, 'server.ts 里必须只有一处调用')
 
-  // 位置：在 handleChatCompletions 内。
+  // ── 位置：仍然在 handleChatCompletions 内，但**必须在选号之后** ──
   //
-  // ⚠️ 2026-10-22 语义变更：裁剪改为 **workbuddy 专属**（见下方断言），
-  // 因此它必须放在 `splitModelName` **之后**才能拿到 `providerId`。
-  // 原断言要求它「早于聚合分支与 handleProviderChat 派发」—— 那是
-  // 「对所有供应商都裁」时期的意图，如今已不成立（也不该成立）。
-  // 现在守的是：**唯一调用点 + 有 provider 判定 + 早于真正转发**。
+  // ⚠️ 2026-10-22 第二次语义变更：上限改成**按账号**（`safetyOverride`），
+  // 而账号要选号之后才知道 ⇒ 裁剪从「选号前」挪到「选号后」。
+  // 原断言要求 `callAt > routeAt`（providerId 确定之后）—— 那在
+  // 「全局按供应商收窄」时期是对的，如今不足够：还必须晚于 `pickCandidate`。
   const fnAt = server.indexOf('export async function handleChatCompletions')
-  const callAt = server.indexOf('trimMessagesByLimit(')
+  // ⚠️ 注意定位的是**调用处**（`rebuildPreparedForLimit(...)`），不是
+  // `trimMessagesByLimit` 的定义位置 —— 后者在函数体内，早于选号。
+  const callAt = server.indexOf('rebuildPreparedForLimit(')
   const routeAt = server.indexOf('const providerId = routed.provider')
+  // 取**最后一次**出现：`pickCandidate` 在函数定义处也出现过一次。
+  const pickAt = server.lastIndexOf('const candidate = await pickCandidate')
   const providerFnAt = server.indexOf('export async function handleProviderChat')
+
   assert.ok(fnAt >= 0 && callAt > fnAt, '裁剪必须在 handleChatCompletions 内')
   assert.ok(callAt > routeAt, '裁剪必须在 providerId 确定之后（否则判不出供应商）')
+  assert.ok(
+    callAt > pickAt,
+    '⚠️ 裁剪必须在**选号之后** —— 上限是按账号的，选号前拿不到该账号的覆盖值',
+  )
   assert.ok(providerFnAt > callAt, 'handleProviderChat 的派发必须拿到裁剪后的 rawBody')
 
   // 🔴 防封措施必须按供应商收窄：裁剪只对 workbuddy 生效。
@@ -361,10 +369,21 @@ test('🔴 裁剪只在 handleChatCompletions 接线一次（本项目吃过「�
   // 理由：上下文裁剪来自封号复盘，它要解决的是「伪装得像官方客户端」。
   // 而 qodercn/cline 等用的是它们自己的官方凭据，本来无需伪装 ——
   // 给它们裁只是白白损坏用户请求（实测 agent 会话 1767 → 301 条）。
-  const trimSeg = server.slice(callAt, callAt + 600)
+  // ⚠️ 判据在 `rebuildPreparedForLimit` **函数体内**（真正的裁剪处），
+  // 不在调用处附近 —— 故要单独定位那个函数体来断言。
+  const rebuildAt = server.indexOf('const rebuildPreparedForLimit')
+  assert.ok(rebuildAt > 0, '应能找到 rebuildPreparedForLimit')
+  const rebuildBody = server.slice(rebuildAt, rebuildAt + 2000)
   assert.ok(
-    /providerId === 'workbuddy'/.test(trimSeg),
+    /provider === 'workbuddy'/.test(rebuildBody),
     '⚠️ 裁剪没有按供应商收窄 —— 会把 qodercn 等自家凭据的对话也腰斩',
+  )
+
+  // 🔴 上限必须按账号取（合并全局 + 覆盖），不能直接用全局值。
+  assert.ok(
+    /acctSafety\.maxContextMessages/.test(server),
+    '裁剪上限必须来自「该账号实际生效」的配置，而不是全局值 —— '
+      + '否则「只给 qodercn 放开」这个需求无法实现',
   )
 
   // 反向：handleProviderChat / prepareChatBody 内部不得再裁一次（重复实现）
@@ -398,7 +417,9 @@ test('裁剪日志只打条数与模型名，绝不打任何消息内容（隐�
   const at = server.indexOf('[context-trim]')
   assert.ok(at > 0, '裁剪时必须打日志')
   const window = server.slice(at, at + 320)
-  for (const need of ['beforeTrim.length', 'trimmed.messages.length', 'trimmed.dropped', 'rawModel', 'maxContextMessages']) {
+  // ⚠️ 上限变量名以 `limit` 为准（2026-10-22 改成按账号后，全局值叫 `maxContextMessages`、
+  // 实际应用的值叫 `limit`；日志打的是后者，因为它才是本次真正生效的）。
+  for (const need of ['beforeTrim.length', 'trimmed.messages.length', 'trimmed.dropped', 'rawModel', 'limit']) {
     assert.ok(window.includes(need), `日志必须包含 ${need}`)
   }
   for (const forbidden of ['.content', 'JSON.stringify', 'messages[0]']) {

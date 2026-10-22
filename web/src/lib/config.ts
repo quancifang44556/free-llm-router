@@ -284,3 +284,83 @@ export function useSetProviderDisabled() {
     onError: (e) => toast.error('操作失败', { description: e.message }),
   })
 }
+
+/**
+ * 单账号的防封覆盖。
+ *
+ * ## 为什么需要它（用户 2026-10-22 要求）
+ *
+ * > 「我希望这个功能放到账号那里，因为我目前只是不想给 qd 限制，
+ * > 防封开关也是，我希望我可以每个账号不同设置」
+ *
+ * 不同上游的风控模型完全不同：`workbuddy` 要伪装（节奏、b3），
+ * `qodercn` 用官方凭据实测 20 并发零损伤。一个全局开关只能让两边互相迁就。
+ *
+ * ## 语义：`null` = 删除该覆盖，回到「沿用全局」
+ *
+ * ⚠️ 不能用「填一个看起来像默认值的数字」来代替删除 ——
+ * 全局默认将来一改，它就静默偏离了。
+ */
+export type SafetyOverride = Partial<{
+  sessionTrace: boolean
+  modelCooldownEnabled: boolean
+  maxContextMessages: number
+  burnRateWindowMs: number
+  burnRateThresholdPct: number
+  rateLimitQps: number
+  rateJitterMs: number
+}>
+
+export interface AccountSafetyResponse {
+  ok: true
+  uid: string
+  realm: string
+  override: SafetyOverride
+  /** 全局值（弹窗里作对照显示） */
+  global?: SafetyConfig
+  /** 合并后**实际生效**的值（面板据此回显「到底受不受限制」） */
+  effective: SafetyConfig
+  /** 越界的字段名（后端如实回报，不静默） */
+  rejected?: string[]
+}
+
+export function useAccountSafety(uid: string | null, realm: string) {
+  return useQuery({
+    queryKey: ['account-safety', realm, uid],
+    enabled: uid !== null && uid !== '',
+    queryFn: () =>
+      api<AccountSafetyResponse>(
+        `/admin/accounts/safety?uid=${encodeURIComponent(uid ?? '')}&realm=${encodeURIComponent(realm)}`,
+      ),
+    staleTime: 0,
+  })
+}
+
+export function useSaveAccountSafety() {
+  const qc = useQueryClient()
+  return useMutation<
+    AccountSafetyResponse,
+    Error,
+    { uid: string; realm: string; patch: Record<string, unknown> }
+  >({
+    // ⚠️ `patch` 里只放**用户真正改过的**字段（或 `null` 表示恢复默认）。
+    // 整体提交会把未改动的字段也固化成当前值，从此全局默认变化影响不到它。
+    mutationFn: (v) =>
+      api<AccountSafetyResponse>('/admin/accounts/safety', {
+        json: { uid: v.uid, realm: v.realm, patch: v.patch },
+      }),
+    onSuccess: (r) => {
+      qc.invalidateQueries({ queryKey: ['account-safety'] })
+      qc.invalidateQueries({ queryKey: ['accounts'] })
+      qc.invalidateQueries({ queryKey: ['pool'] })
+      if (r.rejected !== undefined && r.rejected.length > 0) {
+        toast.warning('部分字段未生效', { description: `越界或类型不对：${r.rejected.join('、')}` })
+      } else {
+        toast.success('该账号的防封设置已保存', {
+          description: '只影响这一个账号，其他账号继续沿用全局设置。',
+        })
+      }
+    },
+    onError: (e) => toast.error('保存失败', { description: e.message }),
+  })
+}

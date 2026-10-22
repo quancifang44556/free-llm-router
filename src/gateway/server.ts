@@ -35,7 +35,7 @@ import { deriveDeviceId, referenceChatHeaders } from '../upstream/headers.js'
 import { deriveIntlConversationId, newTurnRequestId } from '../upstream/conversation.js'
 import { cleanupToolPairing, prepareChatBody, sanitizeChatBody, trimMessagesByLimit } from './payload.js'
 import { BodyTooLargeError, readJsonCapped } from './body.js'
-import { safetyConfigFor } from './safety.js'
+import { resolveSafetyFor, safetyConfigFor } from './safety.js'
 import { throttleUpstream } from './throttle.js'
 import { ERROR_CHECK_FRAMES, ERROR_HINT_PATTERN, aggregateSse, createFrameTranslator, detectErrorFrame, doneFrame, errorFrame, isEmptyAssistantTurn, mayHaveUsage, parseSseLine, sseHeaders, translateFrame } from './stream.js'
 import { jsonError, parseRetryAfterMs } from './http.js'
@@ -59,6 +59,7 @@ import { splitModelName, type ProviderCredential } from '../providers/types.js'
 import type { LoginCredential } from '../upstream/auth.js'
 import type { AccountPoolDO, PickResult } from '../pool/AccountPoolDO.js'
 import { healthyForModel } from '../pool/state.js'
+import type { SafetyOverride } from '../pool/state.js'
 
 /**
  * 账号池后台写入（处罚 / 记账 / 粘性绑定）的错误处理：不打断主流程，但**必须留日志**。
@@ -562,6 +563,19 @@ export function parseResetAt(bodyText: string): number | undefined {
 interface Candidate {
   uid: string
   credential: LoginCredential
+  /**
+   * 该账号的防封覆盖（`AccountState.safetyOverride`，缺省 = 全用全局）。
+   *
+   * ## 为什么从 `pick()` 的结果里带出来
+   *
+   * 按账号配置后，几乎所有"这一跳该不该限制"的判断都要看它。
+   * 若各处再单独读一次账号状态，就多 N 次 DO 往返；
+   * 而 `pick()` **刚刚读过**这条账号并归一化过 —— 顺手带回即可。
+   *
+   * ⚠️ 这是**选号那一刻的快照**：若用户在请求进行中改了面板设置，
+   * 本次请求仍用旧值。这与"配置 10 秒 TTL 缓存"的既有取舍同量级，可接受。
+   */
+  safetyOverride?: SafetyOverride
 }
 
 /** 走账号池选号（**排除已试过的**，跨重试保留）。 */
@@ -706,7 +720,14 @@ async function pickCandidate(
   if (result === undefined) return undefined
   const credential = (await pool.getCredential(result.uid)) as LoginCredential | undefined
   if (credential === undefined || credential.accessToken === '') return undefined
-  return { uid: result.uid, credential }
+  return {
+    uid: result.uid,
+    credential,
+    // ⚠️ `result.state.safetyOverride` 可能为 `undefined`（老数据 / 没设置过）——
+    // 那正是"沿用全局"的语义，不要用 `?? {}` 造一个空对象：
+    // 空对象与 undefined 在合并函数里等价，但会让「有没有设置过」无法区分。
+    ...(result.state?.safetyOverride === undefined ? {} : { safetyOverride: result.state.safetyOverride }),
+  }
 }
 
 /** 账号请求失败时异步解绑会话粘性，防止下次请求死锁在坏账号上。 */
@@ -959,26 +980,22 @@ export async function handleChatCompletions(
    * ⚠️ 位置说明：必须放在 `splitModelName` **之后**（否则拿不到 `providerId`），
    * 且仍在所有真正的转发分支**之前**（buddy 主路径、provider 路径、聚合路径）。
    */
+  /**
+   * 上下文裁剪上限（全局默认值）。
+   *
+   * ## 🔴 为什么裁剪挪到了「选号之后」（2026-10-22，按账号配置）
+   *
+   * 用户要求「每个账号不同设置」⇒ 上限是**按账号**的（`safetyOverride.maxContextMessages`），
+   * 而账号要选号之后才知道。原来在选号**之前**裁一次，就永远只能用全局值。
+   *
+   * 现在：选号后由 `rebuildPreparedForLimit` 按该账号的实际上限重新裁剪。
+   * `maxContextMessages` 仍保留在这里作为**全局默认**（未覆盖的账号直接用它）。
+   *
+   * ⚠️ 裁剪仍然**只对 workbuddy 生效**（下面 `trimAllowed` 判定）：
+   * 它来自封号复盘的「伪装成官方客户端」，而 qodercn 等用自家凭据无需伪装 ——
+   * 给它们裁只会白白损坏请求（实测 agent 会话 1767 → 301 条）。
+   */
   const maxContextMessages = safety.maxContextMessages
-  if (
-    providerId === 'workbuddy'
-    && maxContextMessages > 0
-    && rawBody !== null && typeof rawBody === 'object' && !Array.isArray(rawBody)
-  ) {
-    const withMessages = rawBody as Record<string, unknown>
-    if (Array.isArray(withMessages.messages)) {
-      const beforeTrim = withMessages.messages as unknown[]
-      const trimmed = trimMessagesByLimit(beforeTrim, maxContextMessages)
-      if (trimmed.messages !== beforeTrim) {
-        rawBody = { ...withMessages, messages: trimmed.messages }
-        // ⚠️ 隐私红线：**不打任何消息内容**，只打条数与模型名。
-        console.log(
-          `[context-trim] 消息数超限已压缩：${beforeTrim.length} 条 → ${trimmed.messages.length} 条`
-            + `（省略更早 ${trimmed.dropped} 条）limit=${maxContextMessages} model=${rawModel}`,
-        )
-      }
-    }
-  }
 
   // WorkBuddy 两个渠道的上游模型 id 全是小写（`deepseek-v4.1-flash`、`glm-5.3` …），
   // 客户端手填的 `Workbuddy/DeepSeek-v4.1-Flash` 若原样上送会 11102 ⇒ 被记 6 小时模型冷却。
@@ -1098,12 +1115,70 @@ export async function handleChatCompletions(
     }
   }
 
+  /**
+   * 按某个「上下文上限」重建请求体（用于**按账号**的裁剪上限）。
+   *
+   * ## 🔴 为什么需要它（2026-10-22，按账号配置）
+   *
+   * 裁剪上限现在是**按账号**的，而账号要**选号之后**才知道 ⇒
+   * 同一个请求换号重试时，可能需要用**不同的**裁剪上限重新序列化。
+   *
+   * ⚠️ 只在「该账号的上限**严于**已用的上限」时才重建 —— 否则等于把
+   * 已经裁好的再裁一遍（幂等但白费 CPU），或在放宽时**无法还原**已丢的消息
+   *（裁剪是有损的，放宽只能从原始 `upstreamBody` 重来）。
+   * 故重建时**始终从 `upstreamBody` 出发**，不在上一次结果上叠加。
+   *
+   * @param limit `0` = 不裁剪。
+   * @returns 序列化后的 body；序列化失败返回 `undefined`（调用方按原样继续）。
+   */
+  const rebuildPreparedForLimit = (limit: number, provider: string): string | undefined => {
+    // ⚠️ 裁剪**只对 workbuddy 生效**（与下方 `trimAllowed` 判据同源，勿分叉）。
+    // 其它供应商直接用原始体：它们用自家官方凭据，无需伪装，
+    // 裁剪只会白白损坏请求（实测 agent 会话 1767 → 301 条）。
+    const trimAllowed = provider === 'workbuddy'
+    if (!trimAllowed || limit <= 0) {
+      // 不裁剪：直接用未裁剪的原始体重新序列化（比 `prepared` 更完整）。
+      try {
+        return sanitizeChatBody(prepareChatBody(upstreamBody).body)
+      } catch {
+        return undefined
+      }
+    }
+    if (upstreamBody === null || typeof upstreamBody !== 'object' || Array.isArray(upstreamBody)) {
+      return prepared
+    }
+    const withMessages = upstreamBody as Record<string, unknown>
+    if (!Array.isArray(withMessages.messages)) return prepared
+    const beforeTrim = withMessages.messages as unknown[]
+    const trimmed = trimMessagesByLimit(beforeTrim, limit)
+    if (trimmed.messages === beforeTrim) return prepared
+    try {
+      // ⚠️ 隐私红线：**不打任何消息内容**，只打条数与模型名。
+      console.log(
+        `[context-trim] 按账号上限重新压缩：${beforeTrim.length} 条 → ${trimmed.messages.length} 条`
+          + `（省略更早 ${trimmed.dropped} 条）limit=${limit} model=${rawModel}`,
+      )
+      return sanitizeChatBody(
+        prepareChatBody({ ...withMessages, messages: trimmed.messages }).body,
+      )
+    } catch {
+      return prepared
+    }
+  }
+
   const bases = resolveUpstream(env)
   const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
 
   // ⚠️ `tried` 必须**跨重试保留**，否则会在两个账号之间无限来回
   // （Go 侧 account-pool.ts:905-914 记录过这个缺陷）。
   const tried: string[] = []
+  /**
+   * 已经应用到当前 `prepared` / `effectivePrepared` 上的上下文上限（0 = 未裁剪）。
+   *
+   * ⚠️ 跨重试保留：换号后新账号上限若**不小于**它，就不必重算 ——
+   * 裁剪是单调的（更宽的上限对同一批消息不裁或少裁），重算只会白花 CPU。
+   */
+  let appliedLimit = 0
   // 请求级开始时刻（用于失败用量的 `ms`，见 `recordRequestFailure`）。
   const requestStartedAt = Date.now()
   let lastError: { status: number; message: string; kind: string } | undefined
@@ -1338,6 +1413,40 @@ export async function handleChatCompletions(
     tried.push(candidate.uid)
     console.log(`[pick:buddy] 选中账号 uid=${candidate.uid} nickname=${candidate.credential.nickname || ''} tried=${tried.length}`)
 
+    /**
+     * ── 该账号实际生效的防封配置 ──
+     *
+     * 用户 2026-10-22 要求「每个账号不同设置」。全局值来自面板的「防封」分区，
+     * 账号级覆盖存在 `AccountState.safetyOverride` 里，由 `resolveSafetyFor` 合并。
+     *
+     * ⚠️ 合并**只能有这一个实现** —— 各处自己写 `override.x ?? global.x`
+     * 就变成「同一语义多份判据」，那正是本项目最反复的缺陷类型。
+     */
+    const acctSafety = resolveSafetyFor(safety, candidate.safetyOverride)
+
+    /**
+     * 上下文裁剪：若该账号的上限**严于**全局（或全局为 0 而它有限制），
+     * 就从原始体重新裁剪序列化。
+     *
+     * ⚠️ 裁剪是**有损**的，故重算永远从 `upstreamBody` 出发
+     * （见 `rebuildPreparedForLimit` 的说明），不在已裁过的结果上叠加。
+     * ⚠️ 放宽（账号上限 > 全局）**不重算**：已丢的消息找不回来，
+     * 白跑一遍 prepareChatBody 只是浪费 CPU。
+     */
+    // `prepared` 是**未裁剪**的原始序列化结果（裁剪已挪到这里，选号之后）。
+    // 故只要该账号的上限 > 0 且是 workbuddy，就需要裁一次。
+    // ⚠️ 换号重试时 `appliedLimit` 会记录已用过的上限：若新账号的上限**不小于**
+    // 已用过的，就不必重算（裁剪是单调的，更宽的上限结果与未裁剪等价）。
+    let effectivePrepared = prepared
+    if (acctSafety.maxContextMessages > 0
+      && (appliedLimit === 0 || acctSafety.maxContextMessages < appliedLimit)) {
+      const rebuilt = rebuildPreparedForLimit(acctSafety.maxContextMessages, providerId)
+      if (rebuilt !== undefined) {
+        effectivePrepared = rebuilt
+        appliedLimit = acctSafety.maxContextMessages
+      }
+    }
+
     // ⚠️ `X-Conversation-ID` 按「账号 + 会话」派生：换号**必须**换 id
     //（同一段会话 id 发给两个账号就是跨账号关联键）。
     //
@@ -1396,6 +1505,8 @@ export async function handleChatCompletions(
         undefined,
         undefined,
         DEFAULT_PROVIDER === 'workbuddy' ? 'workbuddy' : 'buddy',
+        // ⚠️ 按账号的限速/抖动参数（用户要求每个账号不同设置）。
+        { qps: acctSafety.rateLimitQps, jitterMs: acctSafety.rateJitterMs },
       )
       upstream = await fetch(`${bases.chat}/v2/chat/completions`, {
         method: 'POST',
@@ -1413,8 +1524,10 @@ export async function handleChatCompletions(
           // ⚠️ 与 `/v3/config` 同源（同一账号 ⇒ 同一台设备），见上面的说明。
           machineId,
           sessionId,
+          // ⚠️ 按账号的会话链（b3 三件套）开关（用户要求每个账号不同设置）。
+          sessionTrace: acctSafety.sessionTrace,
         }),
-        body: prepared,
+        body: effectivePrepared,
         signal: request.signal,
       })
     } catch (error) {
@@ -2466,6 +2579,17 @@ export async function handleProviderChat(input: {
       continue
     }
 
+    /**
+     * 该账号实际生效的防封配置（全局 + 账号级覆盖）。
+     *
+     * ⚠️ 合并走 `resolveSafetyFor` 这**唯一**实现，不在这里手写
+     * `override.x ?? global.x` —— 那会变成同一语义多份判据。
+     */
+    const acctSafety = resolveSafetyFor(
+      await safetyConfigFor(env, pool),
+      picked.state?.safetyOverride,
+    )
+
     const startedAt = Date.now()
     // ⚠️ 续期只试一次（见下方 401 分支的说明）。
     let refreshed = false
@@ -2480,7 +2604,8 @@ export async function handleProviderChat(input: {
     let upstream: Response
     try {
       // 防封：按账号排队 + 抖动 —— **只对 workbuddy 生效**（见 throttle.ts）。
-      await throttleUpstream(picked.uid, undefined, undefined, providerId)
+      await throttleUpstream(picked.uid, undefined, undefined, providerId,
+        { qps: acctSafety.rateLimitQps, jitterMs: acctSafety.rateJitterMs })
       upstream = await provider.chat(credential, {
         model, body, signal: request.signal,
         conversation: { conversationId: providerConversationId, turnRequestId: providerTurnRequestId },
@@ -2502,7 +2627,8 @@ export async function handleProviderChat(input: {
           const fresh = await provider.refresh(credential, AbortSignal.timeout(30_000))
           await pool.putCredential(picked.uid, fresh, Date.now())
           console.warn(`[refresh] ${providerId} 续期成功（catch 分支），已回写凭据`)
-          await throttleUpstream(picked.uid, undefined, undefined, providerId)
+          await throttleUpstream(picked.uid, undefined, undefined, providerId,
+        { qps: acctSafety.rateLimitQps, jitterMs: acctSafety.rateJitterMs })
           const retry = await provider.chat(fresh, {
             model, body, signal: request.signal,
             conversation: { conversationId: providerConversationId, turnRequestId: providerTurnRequestId },
