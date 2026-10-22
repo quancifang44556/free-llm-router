@@ -83,20 +83,56 @@ export async function readJsonCapped(
  * 上游/WAF/强制门户回一个几 MB 的 HTML 时，单次错误就能把几 MB 搬进内存。
  */
 export async function readTextCapped(response: Response, limit: number = 4096): Promise<string> {
-  if (response.body === null) return ''
+  const { text } = await readTextCappedEx(response, limit)
+  return text
+}
+
+/**
+ * 同 {@link readTextCapped}，但**告诉你是否被截断**。
+ *
+ * 🔴 **为什么必须有这个返回值**（2026-10-22 事故复盘）。
+ *
+ * 我在并发专项里把上游响应改成「只读前 4 KiB」，本意是防止 WAF 回几 MB 的
+ * HTML 时整包进内存。但我把这个上限用在了 `callUpstream()` —— 那是**所有
+ * JSON 业务接口**（签到、余额、任务、补偿）的公共出口。
+ *
+ * 后果：余额接口对一个有 21 个积分包的账号返回约 15 KB，
+ * 被截到 4 KiB ⇒ `JSON.parse` 失败 ⇒ `parseEnvelope` 返回 `undefined`
+ * ⇒ `fetchBalance` 拿到空数组 ⇒ **total = 0**
+ * ⇒ `updateBalance` 把真实积分（1976）**覆盖成 0**。
+ *
+ * 用户看到的就是「积分全变 0 了」，而日志写的是「余额刷新完成：成功 8 / 失败 0」——
+ * 因为「解析失败」被当成了「成功且为 0」。
+ *
+ * ⇒ 截断必须**可知**：调用方要么给足预算，要么把「截断」当成错误，绝不当成空数据。
+ */
+export async function readTextCappedEx(
+  response: Response,
+  limit: number = 4096,
+): Promise<{ text: string; truncated: boolean }> {
+  if (response.body === null) return { text: '', truncated: false }
   const reader = response.body.getReader()
   const chunks: Uint8Array[] = []
   let total = 0
+  let truncated = false
   try {
     for (;;) {
       const { done, value } = await reader.read()
       if (done) break
       if (value === undefined) continue
       const room = limit - total
-      if (room <= 0) break
-      chunks.push(value.byteLength <= room ? value : value.subarray(0, room))
-      total += Math.min(value.byteLength, room)
-      if (total >= limit) break
+      if (room <= 0) {
+        truncated = true
+        break
+      }
+      if (value.byteLength > room) {
+        chunks.push(value.subarray(0, room))
+        total += room
+        truncated = true
+        break
+      }
+      chunks.push(value)
+      total += value.byteLength
     }
   } finally {
     // ⚠️ 必须 cancel：否则底层 socket 会把剩余字节继续推进来
@@ -109,5 +145,5 @@ export async function readTextCapped(response: Response, limit: number = 4096): 
     buf.set(c, offset)
     offset += c.byteLength
   }
-  return new TextDecoder().decode(buf)
+  return { text: new TextDecoder().decode(buf), truncated }
 }

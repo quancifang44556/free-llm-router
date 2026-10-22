@@ -17,7 +17,7 @@
  * 2. **12153 单次不算死亡**：连续 3 次才禁用（`state.go:27-40`）。
  */
 
-import { readTextCapped } from '../gateway/body.js'
+import { readTextCappedEx } from '../gateway/body.js'
 import type { HeaderMap } from './headers.js'
 
 /** 上游业务信封（所有端点统一形态）。 */
@@ -687,6 +687,14 @@ export interface UpstreamResponse<T = unknown> {
  * ⚠️ **响应体大小限制**：`raw` 截断到 4KB。上游错误页可能很大，
  * 全量读入会浪费 10ms CPU 预算且对诊断无益。
  */
+/**
+ * 上游 JSON 响应体的读取上限。
+ *
+ * 2 MiB：比任何合法业务 JSON（余额包列表、任务列表、补偿记录）都宽裕，
+ * 同时仍然挡得住「WAF 回几 MB HTML」那类内存放大。
+ */
+const MAX_UPSTREAM_JSON_BYTES = 2 * 1024 * 1024
+
 export async function callUpstream<T = unknown>(options: RequestOptions): Promise<UpstreamResponse<T>> {
   const timeoutMs = options.timeoutMs ?? 30_000
 
@@ -713,9 +721,26 @@ export async function callUpstream<T = unknown>(options: RequestOptions): Promis
     })
   }
 
-  // ⚠️ 只读前 4 KiB：注释说的「截断到 4KB」原先只是**读完之后**才 slice，
-  // 上游回一个几 MB 的错误页时会整包进内存（并发专项实测）。
-  const text = await readTextCapped(response, 4096)
+  /**
+   * 🔴 **上限必须容纳合法 JSON 响应**（2026-10-22 事故复盘）。
+   *
+   * 这里原本是 `readTextCapped(response, 4096)` —— 我把「防 WAF 大 HTML」
+   * 的 4 KiB 上限用在了**所有 JSON 业务接口**上。余额接口对一个有 21 个积分包的
+   * 账号返回约 15 KB，被截断后 `JSON.parse` 失败 ⇒ `envelope` 为 `undefined`
+   * ⇒ `fetchBalance` 把「解析失败」当成「余额 0」⇒ **真实积分 1976 被覆盖成 0**。
+   *
+   * 现在：预算 2 MiB（足够任何合法 JSON），且**截断即报错** ——
+   * 「读不全」绝不能被下游解释成「内容为空」。
+   */
+  const { text, truncated } = await readTextCappedEx(response, MAX_UPSTREAM_JSON_BYTES)
+  if (truncated) {
+    throw new UpstreamError({
+      kind: 'unknown',
+      httpStatus: response.status,
+      message: `上游响应超过 ${Math.round(MAX_UPSTREAM_JSON_BYTES / 1024)} KiB 上限，已截断且无法解析`,
+      detail: text.slice(0, 200),
+    })
+  }
   const raw = text
   const envelope = parseEnvelope(text) as Envelope<T> | undefined
 

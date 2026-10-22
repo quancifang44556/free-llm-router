@@ -50,16 +50,29 @@ export interface BalancePackage {
  * 实测同一响应里两者差异巨大（`TotalDosage=655` 而 IDE 显示 `155.67`），
  * 取错会让人以为余额比实际多。
  */
-export function parseBalance(data: unknown, now: number): BalancePackage[] {
-  if (data === null || typeof data !== 'object') return []
+/**
+ * 解析余额响应。
+ *
+ * 🔴 **必须区分「没有包」与「看不懂」**（2026-10-22 事故复盘）。
+ *
+ * 原来这两件事都返回 `[]`，而调用方把 `[]` 当成「余额 0」写进账号状态。
+ * 于是一次解析失败（当时是响应被 4 KiB 截断）就把真实积分 1976 **覆盖成 0**，
+ * 面板上「积分全变 0」，日志却写「余额刷新完成：成功 8 / 失败 0」。
+ *
+ * ⇒ 返回 `null` 表示**形状不认识**（调用方必须当成错误、保留上次数值）；
+ *   返回 `[]` 才表示「确实一个包都没有」。
+ */
+export function parseBalance(data: unknown, now: number): BalancePackage[] | null {
+  if (data === null || typeof data !== 'object') return null
   const outer = data as Record<string, unknown>
   // 双层信封：data.Response.Data.Accounts
   const response = outer.Response
-  if (response === null || typeof response !== 'object') return []
+  if (response === null || typeof response !== 'object') return null
   const inner = (response as Record<string, unknown>).Data
-  if (inner === null || typeof inner !== 'object') return []
+  if (inner === null || typeof inner !== 'object') return null
   const accounts = (inner as Record<string, unknown>).Accounts
-  if (!Array.isArray(accounts)) return []
+  // ⚠️ 不是数组 ⇒ 形状不认识（不是「空」）。空数组才是真的没有包。
+  if (!Array.isArray(accounts)) return null
 
   const out: BalancePackage[] = []
   for (const raw of accounts) {
@@ -200,6 +213,15 @@ export async function fetchBalance(
   }
 
   const packages = parseBalance(res.envelope?.data, now)
+  // ⚠️ 形状不认识 ⇒ 抛错，绝不返回 0（否则会把真实余额覆盖成 0）
+  if (packages === null) {
+    throw new UpstreamError({
+      kind: 'unknown',
+      httpStatus: res.httpStatus,
+      message: '余额响应形状不认识（缺 Response.Data.Accounts），保留上次数值',
+      detail: res.raw.slice(0, 300),
+    })
+  }
   const live = packages.filter((p) => !p.expired)
   const total = live.reduce((sum, p) => sum + p.cycleRemain, 0)
 

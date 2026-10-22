@@ -168,11 +168,24 @@ test('parseBalance：秒级时间戳会转成毫秒', () => {
   assert.ok((result[0]?.expiresAt ?? 0) > now)
 })
 
-test('parseBalance：畸形输入返回空数组', () => {
-  assert.deepEqual(parseBalance(null, 0), [])
-  assert.deepEqual(parseBalance({}, 0), [])
-  assert.deepEqual(parseBalance({ Response: {} }, 0), [])
-  assert.deepEqual(parseBalance({ Response: { Data: { Accounts: 'x' } } }, 0), [])
+test('🔴 parseBalance：形状不认识必须返回 null（不是 []）', () => {
+  // ## 这条语义在 2026-10-22 被改过，原因是一次真实事故
+  //
+  // 原实现把「形状不认识」和「确实没有包」都返回 `[]`，
+  // 而调用方把 `[]` 当成「余额 0」写进账号状态。
+  // 于是**一次解析失败就把真实积分覆盖成 0**：
+  // 余额接口对一个有 21 个包的账号返回约 15 KB，被 `callUpstream` 的
+  // 4 KiB 上限截断 ⇒ JSON 解析失败 ⇒ 这里返回 `[]` ⇒ total=0 ⇒
+  // `updateBalance` 把 1976 覆盖成 0，面板上「积分全变 0」，
+  // 而日志写的是「余额刷新完成：成功 8 / 失败 0」。
+  //
+  // ⇒ `null` = 看不懂（调用方抛错、保留上次数值）；`[]` = 真的没有包。
+  assert.equal(parseBalance(null, 0), null)
+  assert.equal(parseBalance({}, 0), null)
+  assert.equal(parseBalance({ Response: {} }, 0), null)
+  assert.equal(parseBalance({ Response: { Data: { Accounts: 'x' } } }, 0), null)
+  // 空数组才是「确实没有包」
+  assert.deepEqual(parseBalance({ Response: { Data: { Accounts: [] } } }, 0), [])
 })
 
 // ─────────────── 渠道拦截码（字符串形态） ───────────────
