@@ -895,23 +895,6 @@ export async function handleChatCompletions(
     }
   }
 
-  const maxContextMessages = safety.maxContextMessages
-  if (maxContextMessages > 0 && rawBody !== null && typeof rawBody === 'object' && !Array.isArray(rawBody)) {
-    const withMessages = rawBody as Record<string, unknown>
-    if (Array.isArray(withMessages.messages)) {
-      const beforeTrim = withMessages.messages as unknown[]
-      const trimmed = trimMessagesByLimit(beforeTrim, maxContextMessages)
-      if (trimmed.messages !== beforeTrim) {
-        rawBody = { ...withMessages, messages: trimmed.messages }
-        // ⚠️ 隐私红线：**不打任何消息内容**，只打条数与模型名。
-        console.log(
-          `[context-trim] 消息数超限已压缩：${beforeTrim.length} 条 → ${trimmed.messages.length} 条`
-            + `（省略更早 ${trimmed.dropped} 条）limit=${maxContextMessages} model=${rawModel}`,
-        )
-      }
-    }
-  }
-
   // ── 聚合 provider 分支 ──
   //
   // ## 🔴 **必须在这里手写剥前缀**（不能靠 `splitModelName`）
@@ -950,6 +933,53 @@ export async function handleChatCompletions(
   const routed = splitModelName(rawModel, providerIds(), DEFAULT_PROVIDER)
 
   const providerId = routed.provider
+  /**
+   * ── 消息数裁剪：**只对 WorkBuddy 国际版（workbuddy）生效**──
+   *
+   * ## 🔴 为什么必须是 workbuddy 专属（2026-10-22 修正）
+   *
+   * 这项来自封号复盘 P2「上下文治理」，它的目的是**伪装**：让我们的请求
+   * 看起来像官方客户端的行为（复盘结论是「超大上下文 + 高频连发」会被并入
+   * 机器行为画像）。**伪装只对需要伪装的上游有意义。**
+   *
+   * `workbuddy`（国际版）是我们用一个「非官方客户端」的身份去冒充桌面端，
+   * 风控判据在那儿。而 `qodercn` / `qoder` / `cline` 等是我们**用它们自己的
+   * 官方凭据/协议**在跑 —— 本来就没有「像不像官方客户端」的问题，
+   * 给它们裁消息只是**白白损坏用户请求**。
+   *
+   * 原实现放在所有分支之前（那是为了「改一次全覆盖」），副作用是
+   * **把防封措施套到了全部供应商头上**。实测后果：agent 会话
+   * `1767 条 → 301 条`，一次丢掉 1466 条历史（系统提示 + 早期工具结果），
+   * 模型于是重复调工具、基于不存在的上下文编造 —— 表现为「上游异常」，
+   * 真因在我们自己把对话腰斩了。
+   *
+   * ⚠️ **消息归一（`cleanupToolPairing`）不在此列**，它必须对所有供应商生效：
+   * 那是**协议适配**（上游只认 system/user/assistant/tool），不是防封。
+   *
+   * ⚠️ 位置说明：必须放在 `splitModelName` **之后**（否则拿不到 `providerId`），
+   * 且仍在所有真正的转发分支**之前**（buddy 主路径、provider 路径、聚合路径）。
+   */
+  const maxContextMessages = safety.maxContextMessages
+  if (
+    providerId === 'workbuddy'
+    && maxContextMessages > 0
+    && rawBody !== null && typeof rawBody === 'object' && !Array.isArray(rawBody)
+  ) {
+    const withMessages = rawBody as Record<string, unknown>
+    if (Array.isArray(withMessages.messages)) {
+      const beforeTrim = withMessages.messages as unknown[]
+      const trimmed = trimMessagesByLimit(beforeTrim, maxContextMessages)
+      if (trimmed.messages !== beforeTrim) {
+        rawBody = { ...withMessages, messages: trimmed.messages }
+        // ⚠️ 隐私红线：**不打任何消息内容**，只打条数与模型名。
+        console.log(
+          `[context-trim] 消息数超限已压缩：${beforeTrim.length} 条 → ${trimmed.messages.length} 条`
+            + `（省略更早 ${trimmed.dropped} 条）limit=${maxContextMessages} model=${rawModel}`,
+        )
+      }
+    }
+  }
+
   // WorkBuddy 两个渠道的上游模型 id 全是小写（`deepseek-v4.1-flash`、`glm-5.3` …），
   // 客户端手填的 `Workbuddy/DeepSeek-v4.1-Flash` 若原样上送会 11102 ⇒ 被记 6 小时模型冷却。
   // 其他供应商的 id 可能区分大小写，不动。
@@ -1354,7 +1384,13 @@ export async function handleChatCompletions(
        * ⇒ 用户打开「防封节奏」以为在保护账号，实际只有带前缀模型生效。
        * 这是本项目「配置只在一处生效」模式的又一次复现。
        */
-      await throttleUpstream(candidate.uid)
+      // ⚠️ 只对 workbuddy（国际版）加节奏 —— 那是需要伪装的上游，见 throttle.ts 的说明。
+      await throttleUpstream(
+        candidate.uid,
+        undefined,
+        undefined,
+        DEFAULT_PROVIDER === 'workbuddy' ? 'workbuddy' : 'buddy',
+      )
       upstream = await fetch(`${bases.chat}/v2/chat/completions`, {
         method: 'POST',
         // ⚠️ 与 provider 路径用**同一套**参考实现口径的头（见 referenceChatHeaders）。
@@ -2437,8 +2473,8 @@ export async function handleProviderChat(input: {
     let refreshFailure = ''
     let upstream: Response
     try {
-      // 防封：按账号排队 + 抖动（默认关闭，开关在面板「防封」分区）。
-      await throttleUpstream(picked.uid)
+      // 防封：按账号排队 + 抖动 —— **只对 workbuddy 生效**（见 throttle.ts）。
+      await throttleUpstream(picked.uid, undefined, undefined, providerId)
       upstream = await provider.chat(credential, {
         model, body, signal: request.signal,
         conversation: { conversationId: providerConversationId, turnRequestId: providerTurnRequestId },
@@ -2460,7 +2496,7 @@ export async function handleProviderChat(input: {
           const fresh = await provider.refresh(credential, AbortSignal.timeout(30_000))
           await pool.putCredential(picked.uid, fresh, Date.now())
           console.warn(`[refresh] ${providerId} 续期成功（catch 分支），已回写凭据`)
-          await throttleUpstream(picked.uid)
+          await throttleUpstream(picked.uid, undefined, undefined, providerId)
           const retry = await provider.chat(fresh, {
             model, body, signal: request.signal,
             conversation: { conversationId: providerConversationId, turnRequestId: providerTurnRequestId },

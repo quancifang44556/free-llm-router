@@ -59,7 +59,7 @@ test('🔴 12 个并发请求必须被拉开间隔，不能同一毫秒一起放
     waits.push(ms)
     return clock.sleep(ms)
   }
-  const tasks = Array.from({ length: 12 }, () => throttleUpstream('uid-A', sleep, clock.now))
+  const tasks = Array.from({ length: 12 }, () => throttleUpstream('uid-A', sleep, clock.now, 'workbuddy'))
   await clock.drain()
   await Promise.all(tasks)
 
@@ -77,8 +77,8 @@ test('不同 uid 互不影响（限速是按账号的，不是全局的）', asy
   configureThrottle({ qps: 5, jitterMs: 0 })
   const at: number[] = []
   await Promise.all([
-    throttleUpstream('uid-B', clock.sleep, clock.now).then(() => at.push(clock.now())),
-    throttleUpstream('uid-C', clock.sleep, clock.now).then(() => at.push(clock.now())),
+    throttleUpstream('uid-B', clock.sleep, clock.now, 'workbuddy').then(() => at.push(clock.now())),
+    throttleUpstream('uid-C', clock.sleep, clock.now, 'workbuddy').then(() => at.push(clock.now())),
   ])
   await clock.drain()
   assert.deepEqual(at, [0, 0], '两个不同账号应当各自立即放行')
@@ -92,7 +92,7 @@ test('抖动会并入预约时刻：相邻槽位间隔恒 ≥ 最小间隔', asy
     waits.push(ms)
     return clock.sleep(ms)
   }
-  const tasks = Array.from({ length: 6 }, () => throttleUpstream('uid-D', sleep, clock.now))
+  const tasks = Array.from({ length: 6 }, () => throttleUpstream('uid-D', sleep, clock.now, 'workbuddy'))
   await clock.drain()
   await Promise.all(tasks)
   waits.sort((a, b) => a - b)

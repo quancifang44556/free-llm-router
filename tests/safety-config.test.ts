@@ -73,7 +73,7 @@ test('未存过配置 ⇒ 默认值来自环境变量而不是硬编码', async 
     const pool = rt.env.ACCOUNT_POOL.get(rt.env.ACCOUNT_POOL.idFromName('cn'))
     const cfg = await pool.getSafetyConfig()
     assert.equal(cfg.sessionTrace, true, '会话链默认开启')
-    assert.equal(cfg.maxContextMessages, 300, '默认 300（不是复盘建议的 100）')
+    assert.equal(cfg.maxContextMessages, 0, '默认 0 = 不截断（2026-10-22 变更，理由见 env.ts）')
     assert.equal(cfg.burnRateWindowMs, 3_600_000, '熔断窗口默认 1 小时')
     assert.equal(cfg.burnRateThresholdPct, 20)
     assert.equal(cfg.rateLimitQps, 0, '限速默认关闭')
@@ -191,7 +191,7 @@ test('🔴 关掉会话链只删 b3：会话头族是**必需头**，关掉会�
 test('限速关闭时立即返回：一次 sleep 都不该发生', async () => {
   resetThrottle()
   const calls: number[] = []
-  await throttleUpstream('u1', async (ms) => { calls.push(ms) })
+  await throttleUpstream('u1', async (ms) => { calls.push(ms) }, undefined, 'workbuddy')
   assert.deepEqual(calls, [], '默认关闭 ⇒ 零等待')
 })
 
@@ -202,14 +202,14 @@ test('开启 QPS 后同一账号被排队，不同账号互不影响', async () 
   const sleeps: number[] = []
   const sleep = async (ms: number) => { sleeps.push(ms); clock += ms }
 
-  await throttleUpstream('acc-a', sleep, () => clock) // 首次：无历史，不等待
+  await throttleUpstream('acc-a', sleep, () => clock, 'workbuddy') // 首次：无历史，不等待
   assert.deepEqual(sleeps, [])
 
-  await throttleUpstream('acc-a', sleep, () => clock) // 立刻再来：应等满 500ms
+  await throttleUpstream('acc-a', sleep, () => clock, 'workbuddy') // 立刻再来：应等满 500ms
   assert.equal(sleeps.length, 1)
   assert.equal(sleeps[0], 500)
 
-  await throttleUpstream('acc-b', sleep, () => clock) // 另一个账号：不受影响
+  await throttleUpstream('acc-b', sleep, () => clock, 'workbuddy') // 另一个账号：不受影响
   assert.equal(sleeps.length, 1, '不同账号各算各的')
 
   resetThrottle()
@@ -220,7 +220,7 @@ test('抖动是**额外**延迟，且落在 [0, 上限) 内', async () => {
   configureThrottle({ qps: 0, jitterMs: 100 })
   const sleeps: number[] = []
   for (let i = 0; i < 20; i += 1) {
-    await throttleUpstream('acc', async (ms) => { sleeps.push(ms) })
+    await throttleUpstream('acc', async (ms) => { sleeps.push(ms) }, undefined, 'workbuddy')
   }
   assert.equal(sleeps.length, 20, '每次都抖')
   for (const ms of sleeps) {
@@ -419,4 +419,40 @@ test('🔴 11140(request_illegal) **不换号**：换号会连坐更多账号', 
 
 test('11128(channel_blocked) 仍不换号：渠道指纹与账号无关', () => {
   assert.equal(shouldRotate('channel_blocked'), false)
+})
+
+test('🔴 防封节奏只对 workbuddy 生效：其它供应商必须零延迟', async () => {
+  // ## 为什么（2026-10-22，用户实测反证）
+  //
+  // 限速/抖动来自封号复盘 P2，目的是**伪装**：让「机器连发」看起来像「真人操作」。
+  // **伪装只对需要伪装的上游有意义。**
+  //
+  // `workbuddy`（国际版）是我们冒充桌面客户端去打的上游，风控判据在那儿；
+  // 而 `qodercn` / `qoder` / `cline` 等用的是**它们自己的官方凭据**，
+  // 本来就没有「像不像官方客户端」的问题 —— 给它们加人为延迟只是白等，
+  // 还会把用户的并发能力压下去。
+  //
+  // 实测依据（`src/gateway/throttle.ts` 文件头那张表）：
+  // qodercn 20 并发（流式/非流式两轮）**全部成功、账号零损伤**。
+  configureThrottle({ qps: 5, jitterMs: 300 })
+  try {
+    for (const pid of ['qodercn', 'qoder', 'cline', 'buddy', undefined]) {
+      const sleeps: number[] = []
+      // 连发两次：若是 workbuddy，第二次必然要排队
+      await throttleUpstream('warm', async (ms) => { sleeps.push(ms) }, undefined, pid)
+      await throttleUpstream('warm', async (ms) => { sleeps.push(ms) }, undefined, pid)
+      assert.deepEqual(
+        sleeps,
+        [],
+        `⚠️ ${pid ?? '(未指定)'} 被加了防封延迟 —— 它不需要伪装，加了只是白等`,
+      )
+    }
+    // 对照：workbuddy 必须真的排队（否则「防封开关」是空的）
+    const wb: number[] = []
+    await throttleUpstream('wb-acct', async (ms) => { wb.push(ms) }, undefined, 'workbuddy')
+    await throttleUpstream('wb-acct', async (ms) => { wb.push(ms) }, undefined, 'workbuddy')
+    assert.ok(wb.length > 0, '⚠️ workbuddy 没被限速 —— 防封开关失效')
+  } finally {
+    configureThrottle({ qps: 0, jitterMs: 0 })
+  }
 })

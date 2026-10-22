@@ -90,7 +90,27 @@ export async function throttleUpstream(
   key: string,
   sleep: Sleeper = realSleep,
   now: () => number = Date.now,
+  /**
+   * 该请求要打的上游供应商 id。
+   *
+   * ## 🔴 为什么必须按供应商收窄（2026-10-22 修正）
+   *
+   * 限速与抖动来自封号复盘 P2「限速与抖动」—— 它的目的是**伪装**：
+   * 让「机器连发」看起来像「真人操作有停顿」。**伪装只对需要伪装的上游有意义。**
+   *
+   * `workbuddy`（国际版）是我们冒充桌面客户端去打的上游，风控判据在那儿。
+   * 而 `qodercn` / `qoder` / `cline` 等用的是**它们自己的官方凭据/协议**，
+   * 本来就没有「像不像官方客户端」的问题 —— 给它们加人为延迟只是白等，
+   * 还会把用户的并发能力压下去（而 `qodercn` 已实测 20 并发零损伤，
+   * 见文件头那张压测表）。
+   *
+   * ⚠️ 传 `undefined` 时**不放行也不拦**：按「非 workbuddy」处理（不加延迟）。
+   * 这是有意的失败方向 —— 漏加延迟只是少一层伪装，误加延迟会实打实拖慢
+   * 一条本来正常的链路。
+   */
+  providerId?: string,
 ): Promise<void> {
+  if (providerId !== 'workbuddy') return
   if (qps <= 0 && jitterMs <= 0) return
 
   /**

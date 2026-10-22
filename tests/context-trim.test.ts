@@ -285,12 +285,22 @@ test('`limit` 定义的是「保留的最近条数」：最终条数上限为 li
 
 // ───────────────────── ⑦ 配置解析（`||` 陷阱） ─────────────────────
 
-test('MAX_CONTEXT_MESSAGES 未设置 / 空串 ⇒ 默认 300', () => {
+test('MAX_CONTEXT_MESSAGES 未设置 / 空串 ⇒ 默认 0（不截断）', () => {
   assert.equal(parseMaxContextMessages(undefined), DEFAULT_MAX_CONTEXT_MESSAGES)
   assert.equal(parseMaxContextMessages(''), DEFAULT_MAX_CONTEXT_MESSAGES)
   assert.equal(parseMaxContextMessages('   '), DEFAULT_MAX_CONTEXT_MESSAGES)
-  // 300：低于封禁样本最小值 434，同时不把正常长会话砍到 100（见 env.ts 注释）
-  assert.equal(DEFAULT_MAX_CONTEXT_MESSAGES, 300)
+  /**
+   * ⚠️ 默认值 2026-10-22 由 `300` 改为 `0`。
+   *
+   * 原来的 300 出自封号复盘（「大上下文」被列为嫌疑），但实测反证：
+   * 同账号用官方客户端 50 并发正常，官方同样发大上下文 ⇒「大」不是判据，
+   * 请求**形态不完整**才是（设备指纹/会话链，已在本轮补齐）。
+   *
+   * 而截断是**静默改写用户请求**：agent 会话实测 `1767 条 → 301 条`，
+   * 一次丢掉 1466 条历史（系统提示与早期工具结果），模型会重复调工具、
+   * 基于不存在的上下文编造 —— 表现为「上游异常」，真因在我们自己。
+   */
+  assert.equal(DEFAULT_MAX_CONTEXT_MESSAGES, 0)
 })
 
 test("MAX_CONTEXT_MESSAGES='0' ⇒ 0（不限制），不是默认值", () => {
@@ -331,15 +341,31 @@ test('🔴 裁剪只在 handleChatCompletions 接线一次（本项目吃过「�
   const server = stripComments(readFileSync('src/gateway/server.ts', 'utf8'))
   assert.equal([...server.matchAll(/trimMessagesByLimit\s*\(/g)].length, 1, 'server.ts 里必须只有一处调用')
 
-  // 位置：在 handleChatCompletions 内，且**早于**聚合分支与 handleProviderChat 的派发 —— 
-  // 否则 provider / 聚合两条路径会拿到未裁剪的 rawBody（=等于没修）。
+  // 位置：在 handleChatCompletions 内。
+  //
+  // ⚠️ 2026-10-22 语义变更：裁剪改为 **workbuddy 专属**（见下方断言），
+  // 因此它必须放在 `splitModelName` **之后**才能拿到 `providerId`。
+  // 原断言要求它「早于聚合分支与 handleProviderChat 派发」—— 那是
+  // 「对所有供应商都裁」时期的意图，如今已不成立（也不该成立）。
+  // 现在守的是：**唯一调用点 + 有 provider 判定 + 早于真正转发**。
   const fnAt = server.indexOf('export async function handleChatCompletions')
   const callAt = server.indexOf('trimMessagesByLimit(')
-  const aggAt = server.indexOf('handleAggregateChat({')
+  const routeAt = server.indexOf('const providerId = routed.provider')
   const providerFnAt = server.indexOf('export async function handleProviderChat')
   assert.ok(fnAt >= 0 && callAt > fnAt, '裁剪必须在 handleChatCompletions 内')
-  assert.ok(aggAt > callAt, '聚合分支必须拿到裁剪后的 rawBody')
+  assert.ok(callAt > routeAt, '裁剪必须在 providerId 确定之后（否则判不出供应商）')
   assert.ok(providerFnAt > callAt, 'handleProviderChat 的派发必须拿到裁剪后的 rawBody')
+
+  // 🔴 防封措施必须按供应商收窄：裁剪只对 workbuddy 生效。
+  //
+  // 理由：上下文裁剪来自封号复盘，它要解决的是「伪装得像官方客户端」。
+  // 而 qodercn/cline 等用的是它们自己的官方凭据，本来无需伪装 ——
+  // 给它们裁只是白白损坏用户请求（实测 agent 会话 1767 → 301 条）。
+  const trimSeg = server.slice(callAt, callAt + 600)
+  assert.ok(
+    /providerId === 'workbuddy'/.test(trimSeg),
+    '⚠️ 裁剪没有按供应商收窄 —— 会把 qodercn 等自家凭据的对话也腰斩',
+  )
 
   // 反向：handleProviderChat / prepareChatBody 内部不得再裁一次（重复实现）
   assert.ok(!/trimMessagesByLimit/.test(server.slice(providerFnAt)), 'handleProviderChat 内不得重复裁剪')
