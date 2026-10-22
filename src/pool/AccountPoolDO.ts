@@ -1076,6 +1076,24 @@ export class AccountPoolDO extends DurableObject<Env> {
     let disabled = 0
     let cooling = 0
     let exempt = 0
+    /**
+     * ⚠️ 开关关闭时，`modelExempt` 必须恒为 0
+     *（2026-10-22，我自己在这个功能的第一次实现里漏掉的一致性）。
+     *
+     * ## 缺陷
+     * 我只改了 `pick()`（放行）与 `applyFailure`（不写入），**没改 `counts()`**。
+     * 于是关掉开关后，池里那些**旧**冷却条目仍然让面板显示「模型限流」，
+     * 而 `pick()` 已经能把请求派给这个账号 ——
+     * 用户看到「模型限流」会以为不可用、去点「清除冷却」，而其实早就能用了。
+     *
+     * 这就是本项目最反复的那一类：改动落在**一个消费点**上，
+     * 其余读同一个状态的地方全部漂掉。
+     *
+     * ⚠️ 注意 `pick()` 那边是「不看冷却条目」而不是「删掉条目」：
+     * 保留条目是有意的（用户随时可以重新打开开关，那时不该从零开始学），
+     * 所以这里也必须**按开关解释状态**，而不是依赖条目已被清空。
+     */
+    const modelCooldownEnabled = (await this.getSafetyConfig()).modelCooldownEnabled
 
     for (const raw of raws) {
       const state = normalizeAccountState(JSON.parse(raw))
@@ -1096,7 +1114,10 @@ export class AccountPoolDO extends DurableObject<Env> {
       // 若先判 healthy，模型限流就永远统计不到（面板恒为 0）。
       //
       // 语义上正确：该账号对**部分模型**不可用，不该算「完全健康」。
-      if (modelExempt(state, now)) {
+      //
+      // ⚠️ `modelCooldownEnabled` 必须参与判断（见上方声明处的说明）：
+      // 关掉开关后模型冷却不拦请求，面板就不能再说它「模型限流」。
+      if (modelCooldownEnabled && modelExempt(state, now)) {
         exempt += 1
       } else if (healthy(state, now)) {
         healthyCount += 1

@@ -206,3 +206,45 @@ test('设置 modelCooldownEnabled 不许把其他字段一起重置', async () =
 
   runtime.db.close()
 })
+
+test('🔴 关闭开关后，面板计数必须与 pick() 一致（不许显示「模型限流」却已放行）', async () => {
+  // ## 这条测试的来历：我自己在这个功能的**第一次实现**里就漏了
+  //
+  // 加开关时只改了 `pick()`（放行）与 `applyFailure()`（不写入），
+  // **忘了 `counts()`** —— 那是第三个读同一份状态的消费点。
+  // 后果：关掉开关后池里旧条目仍让面板显示「模型限流」，
+  // 而请求其实已经能派给这个账号 ⇒ 用户看面板以为不可用，去点「清除冷却」，
+  // 而其实早就好了。
+  //
+  // 这正是本项目最反复的一类：改动落在**一个消费点**上，其余读同一状态的地方漂掉。
+  // ⇒ 一个「开关」至少要覆盖三个地方：写入、拦截、**展示**。
+  const { runtime } = freshRuntime('counts-consistency')
+  const pool = poolOf(runtime.env)
+  const now = Date.now()
+  await seedAccount(pool, 'u1', (s) => {
+    s.modelCooldowns[MODEL] = {
+      until: now + 5 * 3600_000,
+      resetAt: 0,
+      reason: 'x',
+      hits: 2,
+      confirmed: 2,
+      cause: 'busy',
+      auditOnly: false,
+    }
+  })
+  await pool.setSafetyConfig({ modelCooldownEnabled: false })
+
+  const counts = await pool.counts(REALM, Date.now())
+  const picked = await pool.pick({ realm: REALM, provider: PROVIDER, model: MODEL, exclude: [], now: Date.now() })
+
+  assert.ok(picked !== undefined, 'pick() 应放行（模型冷却已关闭）')
+  assert.equal(
+    counts.modelExempt,
+    0,
+    'pick() 已放行，面板就不能把它统计成「模型限流」—— '
+      + `否则用户看面板以为不可用。实际 counts=${JSON.stringify(counts)}`,
+  )
+  assert.equal(counts.healthy, 1, '关闭开关后它就是一个完全健康的账号')
+
+  runtime.db.close()
+})
