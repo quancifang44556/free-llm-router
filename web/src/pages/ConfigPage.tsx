@@ -446,6 +446,12 @@ function SafetyCard() {
               checked={form.sessionTrace}
               onChange={(v) => set('sessionTrace', v)}
             />
+            <ToggleRow
+              title="模型级冷却（某个模型失败后暂时拉黑它）"
+              desc="关掉后失败的请求照样报错、照样换号，但不再把「这个账号 + 这个模型」的组合锁上几分钟到几小时。实测上游的 429 / 排队多为瞬时，锁起来经常变成「明明还能用却选不到号」。账号级冷却（熔断、余额耗尽、上游封号）不受此开关影响。"
+              checked={form.modelCooldownEnabled}
+              onChange={(v) => set('modelCooldownEnabled', v)}
+            />
           </div>
 
           <div className="grid gap-4 sm:grid-cols-2">

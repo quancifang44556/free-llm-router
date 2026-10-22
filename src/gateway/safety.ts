@@ -107,6 +107,11 @@ function envFallback(env: Env): SafetyConfig {
   const burn = resolveBurnRate(env)
   return {
     sessionTrace: true,
+    // ⚠️ 与环境变量无关的字段：默认值写在这里，且必须与
+    // `AccountPoolDO.getSafetyConfig()` 的回落值**逐字一致** ——
+    // 两处不一致会让「读不到配置时的行为」（本函数）与「读到配置时的行为」
+    // 不同，表现是「有时生效有时不生效」。
+    modelCooldownEnabled: true,
     maxContextMessages: resolveMaxContextMessages(env),
     burnRateWindowMs: burn.windowMs,
     burnRateThresholdPct: burn.thresholdPct,

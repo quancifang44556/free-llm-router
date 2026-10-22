@@ -453,6 +453,37 @@ export interface SafetyConfig {
   rateLimitQps: number
   /** 每次上游请求前的随机抖动上限（ms）。**`0` = 不抖动**（默认）。 */
   rateJitterMs: number
+  /**
+   * 是否启用**模型级冷却**。默认 `true`（保持既有行为）。
+   *
+   * ## 为什么要这个开关（用户 2026-10-22 明确要求）
+   *
+   * 用户原话：「为啥又冷却，不能加个开关让我把冷却关了吗，实际上完全没有冷却」。
+   *
+   * 这个判断是对的，而且我方确实在**过度锁模型**：实测面板上 3 个 workbuddy 账号
+   * 同时挂着 `deepseek-v4.1-flash` 的 **5 小时**模型级冷却（上游 `6004` 说
+   * 「19:34 重置」，我们就照锁到 19:34），而 qodercn 那个 `dfmodel` 冷却期内
+   * **直接打上游 3/3 全 200** —— 冷却与被冷却对象的真实可用性**完全脱钩**。
+   *
+   * 根因不是某条判据写错，而是**惩罚粒度选错了**：
+   * - 模型级冷却把「一次请求失败」放大成「这个 (账号,模型) 组合在 N 小时内不可用」；
+   * - `absent` 阶梯一升就是 2min → 30min → 2h → 6h → 24h；
+   * - 400 系列带上游墙钟时更狠（上游给的是**最坏**恢复时刻，我们当成了**必然**）；
+   * - 而实测这些 429 / 10605 大多是**瞬时排队**，几秒后同一请求就能成功。
+   *
+   * ⇒ 关掉后：失败的请求照样如实报错、照样换号、照样记日志，
+   * **只是不再把模型锁起来**。
+   *
+   * ⚠️ 关掉的代价（不能只讲好处）：那个模型会在**每次**请求里重新尝试。
+   * 上游持续失败时，用户每次都要等一次失败往返，而不是立刻拿到「稍后重试」。
+   * 对单账号池这正是用户想要的（多试几次往往就通了）；
+   * 对多账号池，`breaker` / `until` 这些**账号级**维度仍然生效，不会失控。
+   *
+   * ⚠️ **只影响 `model` 维度**。`until` / `breakerUntil` / `degradeUntil` /
+   * `restrictedUntil` / `session_dead` 一概不受影响 —— 那些是「账号真的有问题」，
+   * 与「某个模型这一瞬间排队」是两回事。
+   */
+  modelCooldownEnabled: boolean
 }
 
 /**
@@ -632,6 +663,10 @@ export class AccountPoolDO extends DurableObject<Env> {
     //（参考实现的纪律：回落会绕过锁、照样烧永久积分，使锁形同虚设）。
     const permLocks = await this.getPermanentLocks()
     let permLockSkipped = 0
+    // ⚠️ 在读账号**之前**取（`getSafetyConfig` 有缓存，代价可忽略），
+    // 避免循环里每条账号都 await 一次。
+    // 见 `SafetyConfig.modelCooldownEnabled`：关掉后模型级冷却既不写入也不拦截。
+    const modelCooldownEnabled = (await this.getSafetyConfig()).modelCooldownEnabled
 
     // ── 指定账号 ──
     //
@@ -665,7 +700,12 @@ export class AccountPoolDO extends DurableObject<Env> {
         continue
       }
       pruneExpired(state, now, MODEL_COST_TTL_MS)
-      if (!healthyForModel(state, now, model)) {
+      // ⚠️ 模型冷却关闭时，**已存在的**旧冷却条目也必须一并忽略
+      //（用户关开关的那一刻，池里已经挂着 5 小时的条目；只挡新写入不够）。
+      // 判据：`modelCooldownEnabled ? healthyForModel(...) : healthy(...)` ——
+      // 即「账号级 5 维照旧，模型级 1 维跳过」。
+      const usable = modelCooldownEnabled ? healthyForModel(state, now, model) : healthy(state, now)
+      if (!usable) {
         if (isPin) pinReason = unavailableReason(state, now, model, { excluded: false, permLocked: false })
         continue
       }
@@ -924,6 +964,9 @@ export class AccountPoolDO extends DurableObject<Env> {
     const config: SafetyConfig = {
       // ⚠️ 只认显式 `false` 才算关；`undefined` / 非法值都保持开启。
       sessionTrace: raw?.sessionTrace !== false,
+      // 同上：只认显式 `false`。默认开启以保持既有行为不变
+      //（升级后突然「全部冷却消失」会让持续 429 的场景每次请求都白打一次）。
+      modelCooldownEnabled: raw?.modelCooldownEnabled !== false,
       maxContextMessages: num(raw?.maxContextMessages, 0, 100_000) ?? envMax,
       burnRateWindowMs: num(raw?.burnRateWindowMs, 0, 86_400_000) ?? envBurn.windowMs,
       burnRateThresholdPct: num(raw?.burnRateThresholdPct, 0, 100) ?? envBurn.thresholdPct,
@@ -982,9 +1025,18 @@ export class AccountPoolDO extends DurableObject<Env> {
       typeof v === 'number' && Number.isFinite(v) && v >= min && v <= max ? v : undefined
     const rejected: string[] = []
 
-    if (input.sessionTrace !== undefined) {
-      if (typeof input.sessionTrace === 'boolean') next.sessionTrace = input.sessionTrace
-      else rejected.push('sessionTrace')
+    // ⚠️ 布尔字段统一走这张表。
+    //
+    // ## 为什么必须抽成表（2026-10-22，我自己刚踩）
+    // 加 `modelCooldownEnabled` 时若只加到 `getSafetyConfig()`（读侧）就完事，
+    // 写侧这里是一条条 `if (input.sessionTrace !== undefined)` 手写的 ——
+    // 新字段**会被静默丢弃**：`POST /admin/config/safety` 回 `ok:true`、
+    // GET 回显还是旧值，而用户以为「已经关了」。
+    // ⇒ 这正是本项目最反复的一类缺陷（同一语义两处判据）。故此表是**唯一**入口。
+    for (const key of ['sessionTrace', 'modelCooldownEnabled'] as const) {
+      if (input[key] === undefined) continue
+      if (typeof input[key] === 'boolean') next[key] = input[key]
+      else rejected.push(key)
     }
     for (const [key, min, max] of [
       ['maxContextMessages', 0, 100_000],
@@ -1257,6 +1309,20 @@ export class AccountPoolDO extends DurableObject<Env> {
       case 'model': {
         const model = input.model ?? ''
         if (model === '') break
+        /**
+         * 🔴 **模型级冷却总开关**（用户 2026-10-22 要求：「实际上完全没有冷却」）。
+         *
+         * 关掉时**什么都不写**：不建条目、不动 `modelConfirm`。
+         *
+         * ⚠️ 为什么连 `modelConfirm` 也不涨：那是「这个模型确实不存在」的
+         * **坐实计数**，只在冷却阶梯里有意义。冷却关了还继续累加，等到某天
+         * 用户重新打开开关，这些陈年计数会让第一次失败直接吃到封顶 24 小时 ——
+         * 也就是"关开关期间的表现"污染了"开开关之后的行为"。
+         */
+        if (!(await this.getSafetyConfig()).modelCooldownEnabled) {
+          console.log(`[punish] 模型冷却已关闭，跳过记账 uid=${input.uid} model=${model}`)
+          break
+        }
         // ⚠️ 先剪枝再读 `hits`：否则一个**已自然到期**的旧冷却会让本次新失败
         // 从上次的陈旧 `hits` 继续往上叠（11102 路径 6h→12h→24h），使一次新
         // 失败直接吃到封顶退避。`state.ts` 明确要求 `hits` 从新鲜基数重新学习。

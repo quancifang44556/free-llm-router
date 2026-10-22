@@ -47,6 +47,8 @@ export function useSaveRouting() {
  */
 export interface SafetyConfig {
   sessionTrace: boolean
+  /** 模型级冷却总开关。关掉 = 既不写入也不拦截模型级冷却（账号级维度不受影响）。 */
+  modelCooldownEnabled: boolean
   maxContextMessages: number
   burnRateWindowMs: number
   burnRateThresholdPct: number
