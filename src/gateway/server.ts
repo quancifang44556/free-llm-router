@@ -1324,7 +1324,13 @@ export async function handleChatCompletions(
       return {
         response: jsonError(
           503,
-          '没有可用账号（请先登录/导入凭据；若已导入，检查是否全部处于冷却或禁用状态）',
+          // ⚠️ **必须与 provider 路径同源**（2026-10-22 实测）。
+          // 原来这里是一句写死的「请先登录/导入凭据；检查是否全部处于冷却或禁用状态」，
+          // 与 `describeNoAccount` 构成**两份判据**，且这一份把
+          // 「只是某个模型在冷却」也说成「没账号」，比 provider 路径那句更误导
+          // （用户会去重新导入一份完全有效的凭据）。
+          // ⇒ 同一个语义只能有一份实现。
+          await describeNoAccount(env, realm, DEFAULT_PROVIDER, model),
           'no_available_account',
         ),
       }
@@ -3339,7 +3345,10 @@ export async function handleProviderChat(input: {
         // ⚠️ 区分「真的没账号」与「有账号但全在冷却/熔断」。
         // 实测踩到：账号因连续失败进了熔断，报的却是「请先导入凭据」——
         // 用户会去重新导入一份好凭据，而真实原因是**等几分钟就好**。
-        ? (await describeNoAccount(env, activeRealm, providerId))
+        // ⚠️ 必须把 `model` 一起传进去（2026-10-22）：不传就只能报笼统的
+        // 「暂时没有可用账号」，而真实原因常常是**这一个模型**在冷却
+        // —— 用户看到那句话会去翻面板，却只看到一个健康的号。
+        ? (await describeNoAccount(env, activeRealm, providerId, model))
         : `供应商「${provider.name}」请求失败：${lastError.message}`,
       'provider_error',
     ),
@@ -3376,32 +3385,106 @@ export async function handleProviderChat(input: {
  * ⚠️ 不能一律说「请先导入凭据」（实测踩到的误导）：
  * 账号可能只是**在冷却/熔断**里（`until` / `breakerUntil` / `degradeUntil`），
  * 等几分钟自己就好了。让用户去重新导入凭据是纯粹的浪费时间。
+ *
+ * ## 🔴 判据必须直接复用 `healthyForModel()`，绝不自己再列一遍维度
+ *（2026-10-22 实测事故，用户截图）
+ *
+ * 现场：5 个并行子代理请求 `qodercn/dfmodel`，全部得到
+ * `503 供应商「qodercn」暂时没有可用账号（请稍后重试或查看面板状态）`。
+ * 而面板上那个账号 `disabled=false`、`credits=4562`、四个账号级冷却**全为 0**，
+ * 唯一的异常是 `modelCooldowns['dfmodel']`（上游排队 10605 打上的模型级冷却）。
+ *
+ * 根因：本函数手抄了一份「这号为什么不可用」的判据，且**抄漏了两个维度**：
+ *
+ * | 维度 | `pick()`（`healthyForModel`） | 本函数（旧） |
+ * |---|---|---|
+ * | `disabled` | ✅ | ✅ |
+ * | `until` / `breakerUntil` / `degradeUntil` | ✅ | ✅ |
+ * | **`restrictedUntil`**（11140 上游限制） | ✅ | ❌ 漏 |
+ * | **`modelCooldowns[model]`**（模型级冷却） | ✅ | ❌ 漏 |
+ *
+ * ⇒ 只因模型级冷却（或上游限制）不可用时，全部落进最后的兜底文案。
+ * 那句「暂时没有可用账号」对用户是**误导**：账号根本没坏，等冷却过去
+ * 或**换个模型**就行；而「查看面板状态」只会看到一个健康的号，无从下手。
+ *
+ * ⚠️ 这与 `modelExempt` 漏 `restrictedUntil`、`shouldPunish` 与
+ * `mapErrorToPunishment` 漂移是**同一类缺陷**（本项目最反复的一类）：
+ * 同一个判据写了两份，改一份漏一份。
+ * ⇒ 故这里**直接调用共享判据**，物理上不可能再漂。
+ *
+ * @param model 请求的模型名。只有传了它才能说清「是这个模型被冷却」——
+ *              不传则退化为只判账号级维度（仍比手抄准确）。
  */
 export async function describeNoAccount(
   env: Env,
   realm: string,
   provider: string,
+  model = '',
 ): Promise<string> {
   const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
-  const accounts = (await pool.listAccounts(realm, Date.now())).filter(
+  const now = Date.now()
+  // ⚠️ 用 `listAccounts(realm, now)`：它在内部会 `pruneExpired`，
+  // 否则已自然到期的模型冷却会让下面误报「还在冷却」。
+  const accounts = (await pool.listAccounts(realm, now)).filter(
     (a) => (a.provider ?? 'workbuddy') === provider,
   )
   if (accounts.length === 0) {
     return `供应商「${provider}」没有账号（请先在面板导入该供应商的凭据）`
   }
-  const now = Date.now()
-  const cooling = accounts.filter((a) => a.until > now || a.breakerUntil > now || a.degradeUntil > now)
-  if (cooling.length > 0) {
-    // 取最长的剩余时间（用户关心的是「还要等多久」）
-    const waits = cooling.map((a) => Math.max(a.until, a.breakerUntil, a.degradeUntil) - now)
-    const maxWait = Math.max(...waits)
-    const mins = Math.max(1, Math.round(maxWait / 60_000))
-    return `供应商「${provider}」的 ${accounts.length} 个账号都在冷却中（因连续失败触发退避），约 ${mins} 分钟后自动恢复`
-  }
+
+  // ⚠️ 顺序很重要：先说「最具体」的原因，再说笼统的。
+  // 用户看到「被上游限制」能立刻明白重试无用、要换号；
+  // 看到「模型冷却」能立刻换模型；看到「没有可用账号」则完全无从下手
+  // —— 故它必须是**最后**才可能出现的一句话。
+
   const disabled = accounts.filter((a) => a.disabled)
   if (disabled.length === accounts.length) {
     return `供应商「${provider}」的账号都被手动禁用了（请在面板启用）`
   }
+
+  // 上游明确标记的账号级限制（11140）：与「我们自己怀疑它不行」的冷却分开说，
+  // 因为处置不同（这个只能等或换号，重试无用）。
+  const restricted = accounts.filter((a) => a.restrictedUntil > now)
+  if (restricted.length === accounts.length) {
+    const waits = restricted.map((a) => a.restrictedUntil - now)
+    const mins = Math.max(1, Math.round(Math.max(...waits) / 60_000))
+    return `供应商「${provider}」的账号被上游判定为异常行为并限制使用（11140），约 ${mins} 分钟后到期。`
+      + '这不是本地配置问题，重试不会恢复；如需立即使用请换供应商或换号。'
+  }
+
+  // 账号级冷却（soft / hard / breaker / degrade）。
+  const cooling = accounts.filter(
+    (a) => a.until > now || a.breakerUntil > now || a.degradeUntil > now,
+  )
+  if (cooling.length === accounts.length) {
+    const waits = cooling.map((a) => Math.max(a.until, a.breakerUntil, a.degradeUntil) - now)
+    const mins = Math.max(1, Math.round(Math.max(...waits) / 60_000))
+    return `供应商「${provider}」的 ${accounts.length} 个账号都在冷却中（因连续失败触发退避），约 ${mins} 分钟后自动恢复`
+  }
+
+  // ── 模型级冷却：最常见、也最容易被误报成「没账号」的一维 ──
+  //
+  // ⚠️ 判据复用 `healthyForModel`（与 `pick()` **同一份**），不再手写维度。
+  if (model !== '') {
+    const healthyForIt = accounts.filter((a) => healthyForModel(a, now, model))
+    if (healthyForIt.length === 0) {
+      // 全部账号对该模型都在冷却。取**最短**的剩余时间：
+      // 用户关心的是「最快什么时候能用」，不是「最坏要等多久」。
+      const waits = accounts
+        .map((a) => {
+          const mc = a.modelCooldowns[model]
+          return mc === undefined ? 0 : mc.until - now
+        })
+        .filter((w) => w > 0)
+      if (waits.length > 0) {
+        const mins = Math.max(1, Math.round(Math.min(...waits) / 60_000))
+        return `供应商「${provider}」的 ${accounts.length} 个账号对模型「${model}」都在冷却中`
+          + `（上游限流/排队或该后端无此模型），最快约 ${mins} 分钟后恢复。`
+          + '换一个模型通常立刻可用 —— 账号本身是好的。'
+      }
+    }
+  }
+
   return `供应商「${provider}」暂时没有可用账号（请稍后重试或查看面板状态）`
 }
 
