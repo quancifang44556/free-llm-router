@@ -61,7 +61,7 @@ import type {
   ProviderModel,
 } from './types.js'
 import { md5Hex } from './md5.js'
-import { prepareQoderInfer, type QoderInferMessage, type QoderInferTool } from './qoder-wasm.js'
+import { prepareQoderInfer, resetQoderWasm, type QoderInferMessage, type QoderInferTool } from './qoder-wasm.js'
 
 // ─────────────────────────── 产品配置 ───────────────────────────
 
@@ -1509,13 +1509,41 @@ async function chat(
       // ⚠️ 只有「超时/中止」才归为繁忙；其它传输层错误仍按可重试的网络问题处理。
       const timedOut = /timeout|timed out|abort/i.test(message)
         || (error instanceof Error && error.name === 'TimeoutError')
+      /**
+       * 🔴 **WASM 签名模块的 panic 必须单独报**（2026-10-22 线上故障）。
+       *
+       * 用户看到的原文是：
+       * ```
+       * 供应商「Qoder (中国版)」请求失败：unknown: Qoder 请求失败：unreachable
+       * ```
+       * 这句 `unreachable` 是 **Rust 的 panic 文本**（wasm 以 `panic=abort` 编译），
+       * 不是网络错误、更不是账号问题 —— 用户因此以为是"号坏了"或"网关坏了"，
+       * 而他自己用官方客户端明明正常。
+       *
+       * 真实成因：WASM 实例是**模块级单例**，内存/栈指针/对象堆全共享，
+       * 并发请求会交错（详见 `qoder-wasm.ts` 的 `withWasmLock` 注释）。
+       * 现在已用互斥锁串行化；这条文案负责在**万一还发生**时说清是引擎问题。
+       */
+      const wasmPanic = /^unreachable$/i.test(message.trim())
+        || /unreachable/i.test(message)
+      /**
+       * ⚠️ 检出 wasm 层错误就**丢弃实例**（自愈）。见 `resetQoderWasm` 的说明：
+       * 单例若已损坏，不重置的话**之后每条请求都会撞同一个坏实例**，
+       * 表现为「一直失败、重试无用，只能重启进程」。
+       */
+      if (wasmPanic) resetQoderWasm()
       throw new ProviderError({
         provider: product.id,
         retryable: true,
         message: timedOut
           ? `Qoder 单次请求超过 ${Math.round(INFER_TIMEOUT_MS / 1000)} 秒没有返回首帧`
             + `（上游繁忙或排队）。请稍后重试 —— 这是上游问题，不是账号或配置问题。`
-          : `Qoder 请求失败：${message}`,
+          : wasmPanic
+            ? 'Qoder 的**签名模块**执行失败（Rust WASM panic: unreachable）。'
+              + '这不是账号、凭据或上游的问题 —— 你的账号是正常的（官方客户端可用）。'
+              + '成因是签名用的 WASM 实例被并发请求交错复用；已加互斥锁串行化，'
+              + '若仍出现请重试一次。'
+            : `Qoder 请求失败：${message}`,
       })
     }
 
