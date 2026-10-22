@@ -506,68 +506,154 @@ export function classify(httpStatus: number, bodyText: string): { kind: ErrorKin
 }
 
 /** 该错误类别是否「值得换号重试」。 */
+/**
+ * 该错误类别是否值得**换号重试**。
+ *
+ * 🔴 **唯一判据是 `mapErrorToPunishment()`**（2026-10-21 审查补，重复实现专项）。
+ *
+ * 这里原来是一份**手写的 switch**，与 `gateway/server.ts` 里的
+ * `mapErrorToPunishment()` 平行维护 —— 然后已经漂了：
+ * `shouldPunish('channel_blocked')` 返回 `true`（罚账号），
+ * 而活路径的 `mapErrorToPunishment('channel_blocked').punish` 是 `false`
+ *（渠道指纹被拒**不罚号**，罚了会误伤健康账号并误报「IP 被拦」）。
+ *
+ * 死代码不影响运行，但它是一份**看起来权威的相反结论**：
+ * 下次有人按它「修」一处分支，就会把已修好的缺陷重新引回来。
+ * ⇒ 改为委托，物理上不可能再漂。
+ */
 export function shouldRotate(kind: ErrorKind): boolean {
+  return mapErrorToPunishment(kind).rotate
+}
+
+/**
+ * `11140`（账号被限制）默认**不换号**，与 workbuddy2api-hub #422/#425 口径一致。
+ *
+ * 设 `RESTRICTED_ROTATE_MAX` 为正数可恢复旧行为（同一请求内换号继续），仅供排查 ——
+ * 旧行为会把池子里的号逐个拖进上游的**设备级**限制（社区实测 7 号一次任务全封），
+ * 生产环境**不要**开。
+ */
+function restrictRotateAllowed(): boolean {
+  const raw = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env?.[
+    'RESTRICTED_ROTATE_MAX'
+  ]
+  if (raw === undefined || raw.trim() === '') return false
+  const n = Number(raw)
+  return Number.isFinite(n) && n > 0
+}
+
+export function mapErrorToPunishment(kind: ErrorKind): {
+  punish: boolean
+  dimension: 'soft' | 'hard' | 'breaker' | 'degrade' | 'session_dead' | 'model' | 'restricted'
+  /** 该错误是否值得**换号重试**。 */
+  rotate: boolean
+} {
   switch (kind) {
+    // 限流：可能是账号级（14017）或模型级（6004）—— 调用方用错误码进一步区分
     case 'rate_limited':
+      return { punish: true, dimension: 'soft', rotate: true }
+    // 该后端无此模型：模型级负缓存，换号**可能**有用（不同号挂不同后端）
     case 'model_unavailable':
-    // 11158 档位不支持 ⇒ 换到别的档位账号可能可用
+      return { punish: true, dimension: 'model', rotate: true }
+    // 11158「模型存在但账号档位不支持」：也是模型维度负缓存。
+    // 换号**有意义**——不同账号档位不同（付费号能用免费号用不了的模型）。
+    // ⚠️ 与 `model_unavailable` 分开成一类，是为了让冷却策略拿到不同的证据强度：
+    // 档位拒绝属于确定性拒绝，而 11102 的文案极易由「模型名前缀拼错」触发。
     case 'model_denied':
+      return { punish: true, dimension: 'model', rotate: true }
+    // 余额耗尽：硬冷却到次日 04:00，换号有用
     case 'credit_exhausted':
-    case 'server':
-    case 'auth_error':
-    case 'session_dead':
+      return { punish: true, dimension: 'hard', rotate: true }
+    // WAF（HTTP 403 无信封）：账号级软冷却；但可能是 IP 级（详见 AGENTS.md §2.6），换号无用
     case 'waf_blocked':
-      return true
-    // ⚠️ `request_illegal`（11140）**不换号** —— 与 `mapErrorToPunishment` 同一口径。
-    // 依据 workbuddy2api-hub #422/#425：11140 是**设备/出口维度**的账号标记，
-    // 换号不改变被盯上的设备，只会把更多无辜账号送进同一个标记
-    // （社区实测：一个请求遍历整池，7 个号一次任务全被封）。
-    // 下一次**独立**请求自然会落到别的号，不需要在同一请求里硬换。
-    // ⚠️ 参数类错误**不换号**：换号重试会重放同样的非法请求，放大风控。
+      return { punish: true, dimension: 'soft', rotate: false }
+    // ⚠️ 渠道指纹被拒（业务码 11128）：**不罚账号、不换号、不触发 IP 判定**。
+    //
+    // ## 为什么连软冷却都不该做（实测缺陷，用户报两处 503）
+    //
+    // `11128 "unapproved channel"` 说的是**这个请求的渠道指纹**不被认可。
+    // 它有两种可能来源：
+    //   A. 我们的指纹本身有问题（版本 / 头部不对）⇒ **所有账号都会命中**，
+    //      罚任何一个账号都毫无意义（换个号还是同样指纹）；
+    //   B. 上游对某个账号的风控升级 ⇒ 那才该罚该账号。
+    //
+    // ⚠️ A 是最可能的情形，而旧实现（把它当 `waf_blocked` / `request_illegal`）
+    // 会**惩罚本来健康的账号**，制造两个假故障：
+    //   ① 账号逐个进软冷却 ⇒ 客户端看到「1 个账号都在冷却中，约 30 分钟后恢复」；
+    //   ② 每次命中都被记成「IP 级 403」⇒ 凑够 `WAF_IP_THRESHOLD = 2`
+    //      就**误报「出口 IP 被 WAF 拦截」并全局停服**
+    //      （用户报「两个都是正常的，但显示 IP 被拦」）。
+    //
+    // ⇒ 正确处置：**如实把错误返回给客户端**，同时**不再轮转**
+    //（换号无用，只会把同样的渠道判定打给更多账号）。
+    // 这也解释了用户说的「有的软件能用、有的不能」——
+    // 差别在**请求指纹**，不在账号。
+    case 'channel_blocked':
+      return { punish: false, dimension: 'soft', rotate: false }
+    // 请求非法（上游 11140）：**账号级封禁，换号有用**。
+    //
+    // ⚠️⚠️ 这里此前判 `rotate: false`，理由是「换号无用（同样的非法请求）」——
+    // 但那是把 11140 与 11128 混为一谈。2026-10-21 抓到上游原文，两者语义完全不同：
+    //
+    //   code 11140 / HTTP 403 →
+    //     {"msg":"request illegal",
+    //      "displayMsg":{"zh":"账号存在异常行为，已被限制使用",
+    //                    "en":"Your account has been restricted due to unusual activity"},
+    //      "displayTips":{"zh":"系统检测到该账号存在异常使用行为，如需申诉请提交反馈"}}
+    //
+    // 上游说的是 **this account has been restricted** —— 罚的是**这一个账号**，
+    // 与请求内容、与其它账号都无关。`rotate: false` 的后果是：
+    // 一个被封的号会把整个 provider 拖死（每次都只撞它，好号永远轮不到），
+    // 实测就出现过「三个 WB 号里只有 z 被封，另两个完好却全线不可用」。
+    //
+    // ⇒ 罚该号（breaker），但**绝不换号继续打**。
+    //
+    // ⚠️⚠️ **2026-10-21 修正**：此前这里判 `rotate: true`，依据是「罚的是单号、
+    // 所以换号有用」。换号**确实能绕过**这个坏号，但那正是上游风控要抓的行为：
+    //
+    //   workbuddy2api-hub #422/#425 实测 —— 在 11140 上「冷却该号后立刻换下一个号
+    //   继续同一请求」，一个请求最多遍历整个池子，**用户 7 个号在一次任务里全被封**。
+    //   社区复盘（Zhengyuuuui/workbuddy2api 事件复盘）的红线原文是：
+    //   「看到 11140 立即停手，解封前严禁换号继续打同一设备 —— 设备指纹会连坐」。
+    //
+    // 机制：11140 是**设备/出口维度**的账号标记（同一台"设备"上的其它号会被连带
+    // 判定），所以「换号」不改变被盯上的设备，只会把更多无辜账号送进同一个标记里。
+    // 本项目实测的「三个 WB 号里只有 z 被封、另两个完好」是**封禁前**的状态；
+    // 一旦开始轮转，完好的号也会被逐个拖进去（这正是连坐）。
+    //
+    // ⇒ 正确处置：罚该号 + **不换号**，把限制原因如实交给客户端。
+    //    下一次**独立**请求自然会落到别的号（上游已给它记上 `restrictedUntil`，
+    //    见 AccountPoolDO 的持久化），不需要在同一个请求里硬换。
+    //    要把旧行为调回来的运维口子见 `RESTRICTED_ROTATE_MAX`。
+    case 'request_illegal':
+      return { punish: true, dimension: 'restricted', rotate: restrictRotateAllowed() }
+    // session 死亡：连续 3 次才禁用；换号有用
+    case 'session_dead':
+      return { punish: true, dimension: 'session_dead', rotate: true }
+    // 5xx：喂熔断；换号有用
+    case 'server':
+      return { punish: true, dimension: 'breaker', rotate: true }
+    // 鉴权失败：续期凭据后重试，**不罚号**（换号可能有用）
+    case 'auth_error':
+      return { punish: false, dimension: 'soft', rotate: true }
+    // 参数类：**不换号**（换号会重放同样的非法请求，放大风控）
     case 'context_exceeded':
     case 'image_invalid':
     case 'bad_request':
-    // ⚠️ 11140 是**账号级封禁**（上游原文 `Your account has been restricted`），
-    // 换号有用 —— 见 `clientStatusFor` 上方注释里抓到的完整响应体。
-    // 只有 11128（渠道指纹）才是「换号无用」。
-    case 'channel_blocked':
-    // 11140 与 11128 一样不换号，但理由不同：
-    // 11128 换的是「请求指纹」不成立，11140 换的是「设备」不成立。
-    case 'request_illegal':
+      return { punish: false, dimension: 'soft', rotate: false }
+    // 网络层：抖动量，不构成「这个号坏了」的证据；也不该立刻换号（可能是本地出口抖动）
     case 'network':
+      return { punish: false, dimension: 'soft', rotate: false }
     case 'not_found':
     case 'already_done':
     case 'unsupported':
     case 'unknown':
-      return false
+      return { punish: false, dimension: 'soft', rotate: false }
   }
 }
 
-/** 该错误类别是否应当「罚账号」（改变持久化惩罚状态）。 */
+/** 该错误类别是否应当「罚账号」（改变持久化惩罚状态）。语义同 {@link shouldRotate}。 */
 export function shouldPunish(kind: ErrorKind): boolean {
-  switch (kind) {
-    case 'rate_limited':
-    case 'model_unavailable':
-    case 'model_denied':
-    case 'credit_exhausted':
-    case 'waf_blocked':
-    case 'session_dead':
-    case 'request_illegal':
-    case 'server':
-    // ⚠️ 渠道拦截：**软冷却**（短退避），不是熔断 —— 它不说明账号坏了。
-    case 'channel_blocked':
-      return true
-    case 'network':
-    case 'auth_error':
-    case 'not_found':
-    case 'context_exceeded':
-    case 'image_invalid':
-    case 'bad_request':
-    case 'already_done':
-    case 'unsupported':
-    case 'unknown':
-      return false
-  }
+  return mapErrorToPunishment(kind).punish
 }
 
 /** 一次上游调用的选项。 */

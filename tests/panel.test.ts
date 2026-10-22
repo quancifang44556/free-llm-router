@@ -531,3 +531,21 @@ test('⚠️ /v1/models 的每个条目都应有 name（aggregate 曾是整列�
   assert.ok(/name:\s*v\.name\s*\|\|\s*v\.key/.test(seg),
     '⚠️ 虚拟模型必须有 name（并兜底到 key，避免空单元格）')
 })
+
+test('🔴 面板状态徽章必须识别「降权中」（degradeUntil）', () => {
+  // 2026-10-21 审查（重复实现专项）：后端 `healthy()` 把 `degradeUntil`
+  // 当成「不可用」，而前端 `statusOf()` 只看 disabled/restricted/breaker/until/model
+  // ⇒ 降权中的号在面板上显示**「正常」**，用户点了却一直失败。
+  //（F2 当时只修了后端 `diagnose` 的理由文案，前端这一半漏了。）
+  const files = readdirSync('src/panel/web/assets').filter((f) => /^index-.*\.js\.txt$/.test(f))
+  assert.ok(files.length > 0, '应能找到面板主包')
+  const src = readFileSync(path.join('src/panel/web/assets', files[0]!), 'utf8')
+  assert.ok(
+    /degradeUntil>t\?`degraded`/.test(src),
+    '⚠️ statusOf() 未识别 degradeUntil —— 降权号会显示「正常」',
+  )
+  assert.ok(/degraded:\{label:`降权中`/.test(src), '必须给 degraded 一个可读标签')
+  // 筛选与「解除限制」菜单也要跟上，否则新状态是「孤儿」：看得到、点不了
+  assert.ok(/n!==`degraded`/.test(src), '「有问题」筛选必须包含 degraded')
+  assert.ok(/t===`degraded`/.test(src), '「解除限制」菜单必须对 degraded 可用')
+})

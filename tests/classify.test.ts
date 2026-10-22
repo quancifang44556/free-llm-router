@@ -17,7 +17,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { classify, isWafBlocked, parseEnvelope, shouldPunish, shouldRotate, CHANNEL_BLOCKED_CODE } from '../src/upstream/client.ts'
+import { classify, isWafBlocked, mapErrorToPunishment, parseEnvelope, shouldPunish, shouldRotate, CHANNEL_BLOCKED_CODE } from '../src/upstream/client.ts'
 import { refineModelScoped } from '../src/gateway/server.js'
 
 /** 真实抓到的 401 HTML（APISIX / openresty）。 */
@@ -336,4 +336,19 @@ test('🔴 qoder 排队耗尽（10605 + 503）不得判成 server/breaker', () =
   // 且必须是**模型级**（排队挤的是某个模型，不是账号坏了）
   const scoped = refineModelScoped(r.kind, msg)
   assert.equal(scoped.dimension, 'model', '10605 应归模型级冷却')
+})
+
+test('🔴 shouldPunish/shouldRotate 必须与活判据同源（不得再漂）', () => {
+  // 2026-10-21 审查（重复实现专项）：这两个函数曾是**手写 switch**，
+  // 与 gateway/server.ts 的 mapErrorToPunishment 平行维护，然后已经漂了 ——
+  // shouldPunish('channel_blocked') 返回 true（罚账号），
+  // 而活路径是 false（渠道指纹被拒**不罚号**，罚了会误伤健康账号）。
+  // 死代码不影响运行，但它是一份「看起来权威的相反结论」。
+  for (const kind of ['channel_blocked', 'rate_limited', 'credit_exhausted', 'model_unavailable', 'unknown'] as const) {
+    const mapped = mapErrorToPunishment(kind)
+    assert.equal(shouldPunish(kind), mapped.punish, `${kind}: shouldPunish 与 mapErrorToPunishment 不一致`)
+    assert.equal(shouldRotate(kind), mapped.rotate, `${kind}: shouldRotate 与 mapErrorToPunishment 不一致`)
+  }
+  // 钉住那个曾经漂掉的具体结论
+  assert.equal(shouldPunish('channel_blocked'), false, '渠道指纹被拒不得罚账号')
 })

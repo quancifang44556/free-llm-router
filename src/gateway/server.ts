@@ -27,7 +27,10 @@
 import type { UsageRecord } from '../store/usage.js'
 import { resolveUpstream, type Env } from '../env.js'
 import { settleSubkeyUsage } from './authz.js'
-import { classify, type ErrorKind } from '../upstream/client.js'
+// ⚠️ 判据本体已迁到 `upstream/client.ts`（与 `shouldRotate`/`shouldPunish` 同源，
+// 避免两份实现再次漂移）。这里再导出，保持既有引用路径可用。
+export { mapErrorToPunishment }
+import { classify, mapErrorToPunishment, type ErrorKind } from '../upstream/client.js'
 import { deriveDeviceId, referenceChatHeaders } from '../upstream/headers.js'
 import { deriveIntlConversationId, newTurnRequestId } from '../upstream/conversation.js'
 import { cleanupToolPairing, prepareChatBody, sanitizeChatBody, trimMessagesByLimit } from './payload.js'
@@ -139,22 +142,6 @@ export async function maxRotateFor(pool: DurableObjectStub<AccountPoolDO>, now =
   return value
 }
 
-/**
- * `11140`（账号被限制）默认**不换号**，与 workbuddy2api-hub #422/#425 口径一致。
- *
- * 设 `RESTRICTED_ROTATE_MAX` 为正数可恢复旧行为（同一请求内换号继续），仅供排查 ——
- * 旧行为会把池子里的号逐个拖进上游的**设备级**限制（社区实测 7 号一次任务全封），
- * 生产环境**不要**开。
- */
-function restrictRotateAllowed(): boolean {
-  const raw = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env?.[
-    'RESTRICTED_ROTATE_MAX'
-  ]
-  if (raw === undefined || raw.trim() === '') return false
-  const n = Number(raw)
-  return Number.isFinite(n) && n > 0
-}
-
 /** 上游错误类别 → 账号池的惩罚维度。 */
 /**
  * 把错误类别翻译成「模型级冷却的成因」，供 `applyFailure({ modelCause })` 使用。
@@ -214,115 +201,6 @@ async function settleBlame(
   )
 }
 
-export function mapErrorToPunishment(kind: ErrorKind): {
-  punish: boolean
-  dimension: 'soft' | 'hard' | 'breaker' | 'degrade' | 'session_dead' | 'model' | 'restricted'
-  /** 该错误是否值得**换号重试**。 */
-  rotate: boolean
-} {
-  switch (kind) {
-    // 限流：可能是账号级（14017）或模型级（6004）—— 调用方用错误码进一步区分
-    case 'rate_limited':
-      return { punish: true, dimension: 'soft', rotate: true }
-    // 该后端无此模型：模型级负缓存，换号**可能**有用（不同号挂不同后端）
-    case 'model_unavailable':
-      return { punish: true, dimension: 'model', rotate: true }
-    // 11158「模型存在但账号档位不支持」：也是模型维度负缓存。
-    // 换号**有意义**——不同账号档位不同（付费号能用免费号用不了的模型）。
-    // ⚠️ 与 `model_unavailable` 分开成一类，是为了让冷却策略拿到不同的证据强度：
-    // 档位拒绝属于确定性拒绝，而 11102 的文案极易由「模型名前缀拼错」触发。
-    case 'model_denied':
-      return { punish: true, dimension: 'model', rotate: true }
-    // 余额耗尽：硬冷却到次日 04:00，换号有用
-    case 'credit_exhausted':
-      return { punish: true, dimension: 'hard', rotate: true }
-    // WAF（HTTP 403 无信封）：账号级软冷却；但可能是 IP 级（详见 AGENTS.md §2.6），换号无用
-    case 'waf_blocked':
-      return { punish: true, dimension: 'soft', rotate: false }
-    // ⚠️ 渠道指纹被拒（业务码 11128）：**不罚账号、不换号、不触发 IP 判定**。
-    //
-    // ## 为什么连软冷却都不该做（实测缺陷，用户报两处 503）
-    //
-    // `11128 "unapproved channel"` 说的是**这个请求的渠道指纹**不被认可。
-    // 它有两种可能来源：
-    //   A. 我们的指纹本身有问题（版本 / 头部不对）⇒ **所有账号都会命中**，
-    //      罚任何一个账号都毫无意义（换个号还是同样指纹）；
-    //   B. 上游对某个账号的风控升级 ⇒ 那才该罚该账号。
-    //
-    // ⚠️ A 是最可能的情形，而旧实现（把它当 `waf_blocked` / `request_illegal`）
-    // 会**惩罚本来健康的账号**，制造两个假故障：
-    //   ① 账号逐个进软冷却 ⇒ 客户端看到「1 个账号都在冷却中，约 30 分钟后恢复」；
-    //   ② 每次命中都被记成「IP 级 403」⇒ 凑够 `WAF_IP_THRESHOLD = 2`
-    //      就**误报「出口 IP 被 WAF 拦截」并全局停服**
-    //      （用户报「两个都是正常的，但显示 IP 被拦」）。
-    //
-    // ⇒ 正确处置：**如实把错误返回给客户端**，同时**不再轮转**
-    //（换号无用，只会把同样的渠道判定打给更多账号）。
-    // 这也解释了用户说的「有的软件能用、有的不能」——
-    // 差别在**请求指纹**，不在账号。
-    case 'channel_blocked':
-      return { punish: false, dimension: 'soft', rotate: false }
-    // 请求非法（上游 11140）：**账号级封禁，换号有用**。
-    //
-    // ⚠️⚠️ 这里此前判 `rotate: false`，理由是「换号无用（同样的非法请求）」——
-    // 但那是把 11140 与 11128 混为一谈。2026-10-21 抓到上游原文，两者语义完全不同：
-    //
-    //   code 11140 / HTTP 403 →
-    //     {"msg":"request illegal",
-    //      "displayMsg":{"zh":"账号存在异常行为，已被限制使用",
-    //                    "en":"Your account has been restricted due to unusual activity"},
-    //      "displayTips":{"zh":"系统检测到该账号存在异常使用行为，如需申诉请提交反馈"}}
-    //
-    // 上游说的是 **this account has been restricted** —— 罚的是**这一个账号**，
-    // 与请求内容、与其它账号都无关。`rotate: false` 的后果是：
-    // 一个被封的号会把整个 provider 拖死（每次都只撞它，好号永远轮不到），
-    // 实测就出现过「三个 WB 号里只有 z 被封，另两个完好却全线不可用」。
-    //
-    // ⇒ 罚该号（breaker），但**绝不换号继续打**。
-    //
-    // ⚠️⚠️ **2026-10-21 修正**：此前这里判 `rotate: true`，依据是「罚的是单号、
-    // 所以换号有用」。换号**确实能绕过**这个坏号，但那正是上游风控要抓的行为：
-    //
-    //   workbuddy2api-hub #422/#425 实测 —— 在 11140 上「冷却该号后立刻换下一个号
-    //   继续同一请求」，一个请求最多遍历整个池子，**用户 7 个号在一次任务里全被封**。
-    //   社区复盘（Zhengyuuuui/workbuddy2api 事件复盘）的红线原文是：
-    //   「看到 11140 立即停手，解封前严禁换号继续打同一设备 —— 设备指纹会连坐」。
-    //
-    // 机制：11140 是**设备/出口维度**的账号标记（同一台"设备"上的其它号会被连带
-    // 判定），所以「换号」不改变被盯上的设备，只会把更多无辜账号送进同一个标记里。
-    // 本项目实测的「三个 WB 号里只有 z 被封、另两个完好」是**封禁前**的状态；
-    // 一旦开始轮转，完好的号也会被逐个拖进去（这正是连坐）。
-    //
-    // ⇒ 正确处置：罚该号 + **不换号**，把限制原因如实交给客户端。
-    //    下一次**独立**请求自然会落到别的号（上游已给它记上 `restrictedUntil`，
-    //    见 AccountPoolDO 的持久化），不需要在同一个请求里硬换。
-    //    要把旧行为调回来的运维口子见 `RESTRICTED_ROTATE_MAX`。
-    case 'request_illegal':
-      return { punish: true, dimension: 'restricted', rotate: restrictRotateAllowed() }
-    // session 死亡：连续 3 次才禁用；换号有用
-    case 'session_dead':
-      return { punish: true, dimension: 'session_dead', rotate: true }
-    // 5xx：喂熔断；换号有用
-    case 'server':
-      return { punish: true, dimension: 'breaker', rotate: true }
-    // 鉴权失败：续期凭据后重试，**不罚号**（换号可能有用）
-    case 'auth_error':
-      return { punish: false, dimension: 'soft', rotate: true }
-    // 参数类：**不换号**（换号会重放同样的非法请求，放大风控）
-    case 'context_exceeded':
-    case 'image_invalid':
-    case 'bad_request':
-      return { punish: false, dimension: 'soft', rotate: false }
-    // 网络层：抖动量，不构成「这个号坏了」的证据；也不该立刻换号（可能是本地出口抖动）
-    case 'network':
-      return { punish: false, dimension: 'soft', rotate: false }
-    case 'not_found':
-    case 'already_done':
-    case 'unsupported':
-    case 'unknown':
-      return { punish: false, dimension: 'soft', rotate: false }
-  }
-}
 
 /**
  * 上游错误 → **返回给客户端的** HTTP 状态码。
@@ -3589,7 +3467,7 @@ async function handleAggregateChat(input: {
 }): Promise<GatewayResult> {
   const { model, rawBody, request, env, realm, ctx, sessionKey } = input
 
-  const virtuals = await loadAggregateCatalog(env, realm)
+  const virtuals = await loadAggregateCatalog(env, realm, { signal: request.signal })
   if (virtuals.length === 0) {
     return {
       response: jsonError(
@@ -3751,14 +3629,47 @@ async function handleAggregateChat(input: {
  * ⚠️ 单家失败**只跳过它**（记日志），不让整个聚合不可用 ——
  * 一家凭据过期不该让「用哪家更划算」这件事整个失效。
  */
-async function loadAggregateCatalog(env: Env, realm: string): Promise<ReturnType<typeof buildVirtualModels>> {
+/**
+ * 聚合目录的**总预算**。
+ *
+ * 🔴 为什么必须有（2026-10-21 审查补，并发专项）：
+ * 这里原本**逐家串行**、每家 `AbortSignal.timeout(20_000)`，
+ * 而 `providerIds()` 有 14 家 ⇒ 最坏 **280 秒**才吐出第一个 token，
+ * 期间既不接客户端取消、也没有总超时 —— 客户端早就断了，
+ * 我们还在替它排队打上游（既烧配额也烧 CPU）。
+ *
+ * 给 12 秒总预算：正常情况（每家 1~3 秒、且多数家没账号直接返回空）
+ * 远小于它；真有一家卡住时，宁可让聚合目录**少几家**，
+ * 也不能让用户等 4 分钟。缺席的家在下次请求会自动补上（无缓存副作用）。
+ */
+const AGGREGATE_CATALOG_BUDGET_MS = 12_000
+
+async function loadAggregateCatalog(
+  env: Env,
+  realm: string,
+  options: { signal?: AbortSignal } = {},
+): Promise<ReturnType<typeof buildVirtualModels>> {
   const catalogs: ProviderCatalog[] = []
+  const startedAt = Date.now()
+  const skipped: string[] = []
+
   for (const providerId of providerIds()) {
     if (providerId === AGGREGATE_PROVIDER_ID) continue
     const provider = findProvider(providerId)
     if (provider === undefined || !provider.capabilities.listModels) continue
+
+    // ⚠️ 客户端已经断开就别再打上游了 —— 继续排队只会白烧配额
+    if (options.signal?.aborted === true) {
+      skipped.push(`${providerId}(客户端已取消)`)
+      break
+    }
+    if (Date.now() - startedAt > AGGREGATE_CATALOG_BUDGET_MS) {
+      skipped.push(providerId)
+      continue
+    }
+
     try {
-      const models = await listModelsForProvider(env, realm, providerId)
+      const models = await listModelsForProvider(env, realm, providerId, options.signal)
       if (models.length > 0) catalogs.push({ provider: providerId, models })
     } catch (error) {
       console.warn(
@@ -3766,6 +3677,12 @@ async function loadAggregateCatalog(env: Env, realm: string): Promise<ReturnType
         error instanceof Error ? error.message : String(error),
       )
     }
+  }
+
+  if (skipped.length > 0) {
+    console.warn(
+      `[aggregate] 目录预算 ${AGGREGATE_CATALOG_BUDGET_MS}ms 用尽或请求已取消，本次跳过：${skipped.join(', ')}`,
+    )
   }
   return buildVirtualModels(catalogs)
 }
@@ -3781,6 +3698,7 @@ async function listModelsForProvider(
   env: Env,
   realm: string,
   providerId: string,
+  outerSignal?: AbortSignal,
 ): Promise<import('../providers/types.js').ProviderModel[]> {
   // ⚠️ 分片消歧：国际版在 global 分片，优先走其规范分片
   const targetRealm = providerId === 'workbuddy' ? 'global' : realm
@@ -3813,8 +3731,15 @@ async function listModelsForProvider(
   if (credential === undefined) return []
 
   const bound = providerId === DEFAULT_PROVIDER ? bindBuddy(env) : provider
+  // ⚠️ 单家 20s 上限 + **外层取消**：两者任一触发都要停（否则客户端走了我们还在等）
+  const timeoutSignal = AbortSignal.timeout(20_000)
+  const signal = outerSignal === undefined
+    ? timeoutSignal
+    : (typeof AbortSignal.any === 'function'
+        ? AbortSignal.any([timeoutSignal, outerSignal])
+        : timeoutSignal)
   try {
-    return await bound.listModels(credential, AbortSignal.timeout(20_000))
+    return await bound.listModels(credential, signal)
   } catch (error) {
     // ⚠️ 目录拉取失败时**不在这里续期**：续期需要 `putCredential` 回写，
     // 而那套逻辑在 `index.ts` 的 `withRefreshRetry` 里（私有的）。
